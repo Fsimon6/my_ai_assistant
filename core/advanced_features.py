@@ -9,7 +9,7 @@
 
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
-from character import AICharacter, AdvancedAICharacterq
+from character import AICharacter, AdvancedAICharacter
 from core import character
 
 
