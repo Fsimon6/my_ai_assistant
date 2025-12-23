@@ -173,7 +173,7 @@ class AICharacter:
 
         # 如果没有匹配到关键词，使用默认回复
         if ai_response is None:
-            ai_response = f'{self.name}:我还在学习中，不太明白{text}的意思，你可以问我天气，名字，或者打招呼哦。'
+            ai_response = f'{self.name}:我是你爹，不太明白{text}的意思，你可以问我天气，名字，或者打招呼哦。'
 
         # 创建一个对话记录字典
         conversation_record = {
