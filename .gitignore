@@ -1,0 +1,44 @@
+# Python缓存
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.pyc
+*$py.class
+.Python
+
+# 环境变量文件
+.env
+
+# 虚拟环境
+.venv/
+venv/
+
+node_modules/
+
+# 数据库文件
+my_ai_assistant.db
+*.db
+
+# PyCharm
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 向量数据库
+data/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+
+# uploads
+uploads/
+
+
