@@ -1,0 +1,87 @@
+# 预提交钩子配置
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=10240']
+      - id: check-merge-conflicts
+      - id: detect-private-key
+
+  # Python代码格式化
+  - repo: https://github.com/psf/black
+    rev: 23.12.1
+    hooks:
+      - id: black
+        language_version: python3.10
+
+  # Python导入排序
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ['--profile", "black']
+
+  # Python代码检查
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.0.0
+    hooks:
+      - id: flake8
+        args: ['--max-line-length=127', '--extend-ignore=E203,W503']
+
+  # Python类型检查
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        args: [--ignore-missing-imports, --show-error-codes]
+        exclude: ^tests/
+
+  # 前端代码检查
+  - repo: local
+    hooks:
+      - id: eslint-frontend
+        name: ESLint Frontend
+        entry: bash -c 'cd frontend && npm run lint'
+        language: system
+        pass_filenames: false
+        files: ^frontend/.*\.(vue|ts)$
+
+      - id: prettier-frontend
+        name: Prettier Frontend
+        entry: bash -c 'cd frontend && npm run format:check'
+        language: system
+        pass_filenames: false
+        files: ^frontend/.*\.(vue|ts|json|css)$
+
+  # 测试检查
+  - repo: local
+    hooks:
+      - id: pytest-backend
+        name: PyTest Backend
+        entry: bash -c 'cd backend && python -m pytest tests/unit/ -v --tb=short'
+        language: system
+        pass_filenames: false
+        files: ^backend/.*\.py$
+
+  # 安全扫描
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.7
+    hooks:
+      - id: bandit
+        args: ["-c", "pyproject.toml"]
+        exclude: ^tests/
+
+  # 提交消息检查
+  - repo: https://github.com/jorisroovers/gitlint
+    rev: v0.19.1
+    hooks:
+      - id: gitlint
+        stages: [commit-msg]
+
+# 配置选项
+default_language_version:
+  python: python3.10
