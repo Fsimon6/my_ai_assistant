@@ -1,0 +1,36 @@
+# ===== Secrets / Env =====
+.env
+.env.*
+!.env.example
+
+# ===== Python =====
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+*.db-wal
+*.db-shm
+backend/*.log
+backend_e2e*.log
+
+# ===== Node / Frontend =====
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+
+# ===== 运行时数据（通过 volume 持久化，不进镜像） =====
+data/
+cache/
+logs/
+coverage/
+
+# ===== 测试 / 文档 / 工具 =====
+test/
+tests/
+test-reports/
+docs/
+*.log
+*.ps1
+.git/

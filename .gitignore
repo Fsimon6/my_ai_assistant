@@ -1,0 +1,108 @@
+# ============================================================
+# 环境变量与密钥（切勿提交真实密钥）
+# 说明：`.env` 规则在任意层级都生效（含 backend/.env、frontend/.env）
+# ============================================================
+.env
+.env.local
+.env.*.local
+!.env.example
+*.pem
+*.key
+*.p12
+*credentials*.json
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+*_venv/
+.stage1_venv/
+.python-version
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+
+# ============================================================
+# Node / 前端
+# ============================================================
+node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
+frontend/.eslintcache
+frontend/coverage/
+*.tsbuildinfo
+
+# ============================================================
+# 运行时数据（**含真实业务数据**：Excel 原件、解析产物、向量库、SQLite）
+# 这些内容属于用户数据，禁止入库
+# ============================================================
+data/
+logs/
+cache/
+uploads/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.xlsx
+*.xls
+*.xlsm
+
+# ============================================================
+# 日志与临时产物
+# ============================================================
+*.log
+*.err
+*.pid
+*.tmp
+*.bak
+*.bak_*
+coverage/
+test-reports/
+
+# ============================================================
+# 本地开发残留：根目录下以 `_` 开头的临时脚本/报告（验证脚本、进度文件等）
+# 仅作用于仓库根目录，不会误伤 tests/__init__.py 之类的包文件
+# ============================================================
+/_*
+# 根目录下遗留的临时调试脚本与浏览器 E2E 产物
+/verify*.py
+/diag*.py
+/repro*.py
+/dbg_log.py
+/cleanup_e2e.py
+/e2e_*.py
+/e2e_*.json
+/probe_*
+/start_*.ps1
+/chars.yaml
+/chat.yaml
+/login.yaml
+*.jsonl
+
+# ============================================================
+# 编辑器 / IDE / 工具产生的本地状态
+# ============================================================
+.idea/
+.vscode/
+.playwright-cli/
+.workbuddy/
+.codebuddy/
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,28 @@
+# ============================================================
+# 开发 / 测试依赖（不进入生产运行环境）
+# ============================================================
+
+# --- 测试 ---
+pytest
+pytest-asyncio
+pytest-cov
+pytest-mock
+httpx
+# 测试代码（tests/fixtures/test_users.py 等）直接 import jwt
+PyJWT
+# fastapi 0.104.1 的 starlette TestClient 使用 httpx.Client(app=...)，
+# httpx>=0.28 移除了 app= 参数，故锁定 <0.28 以兼容现有测试
+httpx<0.28
+
+# --- 代码质量 ---
+black
+isort
+flake8
+mypy
+
+# ============================================================
+# 说明：
+# - pandas / numpy / matplotlib 等数据分析工具已从原 dev 移除：
+#   numpy 因 embeddings 启动链需要，已移入 requirements.txt（也可由 sentence-transformers 带入）；
+#   pandas / matplotlib 仅被未接入的 backend/document_loaders/ 使用，非运行/测试必需。
+# ============================================================

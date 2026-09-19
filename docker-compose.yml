@@ -1,0 +1,47 @@
+# 最小生产编排：backend(uvicorn) + frontend(nginx 静态 + /api 反代)
+# 数据持久化：backend_data 卷挂载到 /app/data（SQLite + Chroma 向量库）。
+# 密钥：通过 host 环境变量 / .env 注入，绝不以明文写入本文件或镜像。
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      # 占位默认值；真实部署请用环境变量/.env 覆盖（不要提交真实密钥）
+      ENVIRONMENT: production
+      # JWT_SECRET 不设弱默认：缺失时应用启动即失败（安全失败），由 host 环境变量/.env 注入
+      JWT_SECRET: ${JWT_SECRET:-}
+      # ALLOWED_HOSTS 生产必填，不允许 '*'；缺失时启动安全失败
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost}
+      DEBUG: "false"
+      LLM_PROVIDER: ${LLM_PROVIDER:-dashscope}
+      API_KEY: ${API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v3}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3.7-text-embedding}
+      DATABASE_URL: sqlite:////app/data/my_ai_assistant.db
+      VECTOR_DB_PATH: /app/data/chroma_db
+      BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost}
+      LOG_LEVEL: INFO
+    volumes:
+      - backend_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  backend_data:

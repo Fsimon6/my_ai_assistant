@@ -1,0 +1,76 @@
+# ============================================================
+# 应用运行依赖（生产）
+# 仅包含应用启动链真正 import 的依赖
+# 开发/测试依赖见 requirements-dev.txt
+# ============================================================
+
+# --- Web 框架 ---
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+# pydantic 需 >=2.7.4 以兼容 langchain-classic / chromadb（不再死锁旧版）
+pydantic>=2.7.4
+pydantic-settings>=2.1.0
+python-dotenv==1.0.0
+
+# --- 数据库 / ORM ---
+SQLAlchemy==1.4.54
+alembic==1.13.1
+
+# --- 认证 / 安全 ---
+# 注意：passlib 已于第七阶段从密码哈希路径移除（security.py / init_db.py 均直接使用 bcrypt），
+# 此处不再声明 passlib，避免误导为运行依赖。
+python-jose==3.3.0
+bcrypt==4.0.1
+cryptography==46.0.3
+
+# --- HTTP 客户端（OpenAI 兼容接口调用）---
+openai
+
+# --- 向量数据库 ---
+chromadb
+
+# --- LangChain（仅项目真实 import 的包）---
+# langchain-classic 核心已自带 langchain-core / langchain-text-splitters / numpy 等
+langchain-classic
+# 代码直接 import：langchain_community.document_loaders / langchain_community.embeddings
+langchain-community
+# Docx2txtLoader 依赖（document_service 使用其解析 .docx）；纯 Python，无 torch/PyMuPDF
+docx2txt
+# 代码直接 import：langchain_text_splitters.RecursiveCharacterTextSplitter
+langchain-text-splitters
+
+# --- Markdown 加载（document_service 使用 UnstructuredMarkdownLoader 处理 .md/.markdown）---
+unstructured
+# UnstructuredMarkdownLoader 的 .md 分区器在运行时 import markdown 包，需显式声明
+markdown
+
+# --- Excel / 表格解析（Phase 1A：Unified Table Representation）---
+# backend/excel/parser.py 直接 import：
+#   openpyxl -> .xlsx/.xlsm；xlrd -> 旧版 .xls（BIFF）；.csv/.tsv 使用标准库 csv
+# 说明：不使用 pandas（本阶段无需 DataFrame，避免引入大型依赖），
+#       也不引入 PyMuPDF / torch。
+openpyxl==3.1.5
+xlrd==2.0.2
+
+# --- Phase 2：精确查询 / 筛选执行引擎 ---
+# backend/excel/duck.py：把 representation 物化到内存 DuckDB，执行 Python 构造的受控 SQL。
+# 说明：
+#   * 只用于 SELECT 精确筛选（WHERE / LIMIT / OFFSET），不引入 pandas / pyarrow；
+#   * 连接固定 ':memory:' 且 enable_external_access=false（禁止 ATTACH / COPY / 读外部文件）；
+#   * 物化阶段为性能考虑使用字面量批量写入（SQL 标准 '' 转义），
+#     查询阶段所有筛选值一律使用 ? 绑定参数。
+duckdb>=1.5,<2.0
+
+# ============================================================
+# 已确认不列入运行依赖的项及理由：
+# 1. torch / sentence-transformers / numpy(显式)
+#    - 仅 backend/embeddings/local_embeddings.py（LocalEmbeddings，sentence_transformers）
+#      与 vector_service 回退路径（HuggingFaceEmbeddings）使用；
+#      该 embeddings 包不在启动链顶层 import（main.py 仅惰性 import vector_service，
+#      且在 lifespan 内），故 import backend.main / uvicorn 启动不触发 torch。
+#    - 用户明确不需要 PyTorch；如需启用本地嵌入，再按需安装：
+#        pip install torch sentence-transformers   （GPU 版从 pytorch CUDA 源）
+# 2. PyMuPDF(fitz) / Pillow(PIL) / pytesseract / pandas / python-docx / chardet
+#    - 仅被未接入启动链的 backend/document_loaders/ 引用；当前运行不需要。
+# ============================================================
