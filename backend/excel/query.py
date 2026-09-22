@@ -53,13 +53,19 @@ OPERATOR_GTE = 'gte'
 OPERATOR_LT = 'lt'
 OPERATOR_LTE = 'lte'
 OPERATOR_CONTAINS = 'contains'
+#: 2A-P0：日期区间（value 为 [起始, 结束] 两个 ISO 日期字符串）。
+#: 仅由 Python 依"日期表达式 + 真实日期列"生成，LLM 不会直接产出该 operator。
+OPERATOR_DATE_BETWEEN = 'date_between'
 
 #: 数值范围类操作符
 RANGE_OPERATORS: Tuple[str, ...] = (OPERATOR_GT, OPERATOR_GTE, OPERATOR_LT, OPERATOR_LTE)
 
+#: 日期类操作符
+DATE_OPERATORS: Tuple[str, ...] = (OPERATOR_DATE_BETWEEN,)
+
 SUPPORTED_OPERATORS: Tuple[str, ...] = (
     OPERATOR_EQ, OPERATOR_NEQ, OPERATOR_GT, OPERATOR_GTE, OPERATOR_LT, OPERATOR_LTE,
-    OPERATOR_CONTAINS,
+    OPERATOR_CONTAINS, OPERATOR_DATE_BETWEEN,
 )
 
 MATCH_MODE_AND = 'and'
@@ -275,6 +281,16 @@ def parse_request(payload: Dict[str, Any], document_id: str, user_id: Optional[i
                     ERR_INVALID_PARAM,
                     f'filters[{i}]: {operator} 的 value 必须是数值，收到 {value!r}',
                 )
+        elif operator in DATE_OPERATORS:
+            # 2A-P0：日期区间 —— 值必须是 [起始, 结束] 两个 YYYY-MM-DD 且起始不晚于结束
+            coerced = coerce_date_range(value)
+            if coerced is None:
+                raise ExcelQueryError(
+                    ERR_INVALID_PARAM,
+                    f'filters[{i}]: date_between 的 value 必须是 [起始, 结束] 两个 '
+                    f'YYYY-MM-DD 日期，且起始不晚于结束；收到 {value!r}',
+                )
+            value = coerced
         filters.append(FilterCondition(column=column, operator=operator, value=value))
 
     limit = DEFAULT_LIMIT if payload.get('limit') is None else _as_int(payload.get('limit'), 'limit')
@@ -504,6 +520,43 @@ def range_match(cell: Any, operator: str, value: Any) -> bool:
     return False  # pragma: no cover
 
 
+def coerce_date_range(value: Any) -> Optional[List[str]]:
+    """把 date_between 的值规约为 [起始, 结束] 两个 ISO 日期；非法返回 None。
+
+    纯字符串/日期运算，不依赖任何外部库；供 query / duck 两条执行路径共用。
+    """
+    from datetime import date as _date
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    out: List[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        try:
+            out.append(_date.fromisoformat(item.strip()).isoformat())
+        except ValueError:
+            return None
+    return out if out[0] <= out[1] else None
+
+
+def date_between_match(cell: Any, value: Any) -> bool:
+    """日期区间匹配（Python 参考实现，语义与 DuckDB 侧 try_strptime 一致）。
+
+    - 单元格无法按日期白名单解析 -> False（该行不匹配，**绝不当作 0 或空**）；
+    - 区间端点非法 -> False。
+    """
+    from datetime import date as _date
+
+    from backend.excel.representation import parse_date_value
+    coerced = coerce_date_range(value)
+    if coerced is None:
+        return False
+    day = parse_date_value(cell)
+    if day is None:
+        return False
+    return _date.fromisoformat(coerced[0]) <= day <= _date.fromisoformat(coerced[1])
+
+
 def match_cell(cell: Any, operator: str, value: Any) -> bool:
     """单条件匹配分派（Python 参考实现）。"""
     if operator == OPERATOR_EQ:
@@ -514,6 +567,8 @@ def match_cell(cell: Any, operator: str, value: Any) -> bool:
         return contains_match(cell, value)
     if operator in RANGE_OPERATORS:
         return range_match(cell, operator, value)
+    if operator in DATE_OPERATORS:
+        return date_between_match(cell, value)
     raise ExcelQueryError(ERR_INVALID_OPERATOR, f'不支持的 operator：{operator!r}')
 
 

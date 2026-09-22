@@ -1,6 +1,12 @@
+from pathlib import Path
 from typing import Literal
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: .env 固定指向**项目根目录**下的 .env。
+#: 原来 env_file=".env" 是相对路径，取决于进程启动时的工作目录；
+#: 一旦从 backend/ 等子目录启动就读不到 .env（JWT_SECRET 缺失 → 启动直接失败）。
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
@@ -53,7 +59,7 @@ class Settings(BaseSettings):
     LOG_FILE: str | None = None
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_PROJECT_ROOT / '.env'),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",

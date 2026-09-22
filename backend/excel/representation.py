@@ -25,6 +25,7 @@ WorkbookRepresentation
 
 import re
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 SCHEMA_VERSION = '1.0'
@@ -48,6 +49,69 @@ SEMANTIC_DATE = 'date'
 SEMANTIC_BOOLEAN = 'boolean'
 SEMANTIC_EMPTY = 'empty'
 SEMANTIC_MIXED = 'mixed'
+
+# ---------------------------------------------------------------------------
+# 2A-P0：日期形态识别（按真实单元格值判定，仅"绝对日期"，不含相对时间）
+# ---------------------------------------------------------------------------
+# 背景：解析器把日期单元格转成了字符串落盘（dtype='string'、semantic_type='text'），
+# 因此「8月份的订单」既拿不到 dtype='date'，也无法用数值区间表达 —— 历史上被
+# 退化成 `Created Time contains "8"`（19/19 行假命中，静默错误）。
+# 这里只做两件事：按真实值判断"某列是不是日期列"，以及它的解析格式。
+DATE_FORMAT_WHITELIST: Sequence[str] = (
+    '%m/%d/%Y %I:%M:%S %p',
+    '%m/%d/%Y %H:%M:%S',
+    '%m/%d/%Y',
+    '%Y-%m-%d %H:%M:%S',
+    '%Y-%m-%d',
+    '%Y/%m/%d',
+)
+#: 非空值中能按同一格式解析的最低占比
+_DATE_LIKE_RATIO = 0.6
+#: 单值长度上限（日期字符串不可能更长；超长直接放弃，避免无意义解析）
+_DATE_VALUE_MAX_LEN = 40
+
+
+def parse_date_value(value: Any) -> Optional[date]:
+    """按白名单格式把单元格值解析为日期；无法解析返回 None（纯函数，不抛异常）。"""
+    if value is None or isinstance(value, bool):
+        return None
+    raw = str(value).strip()
+    if not raw or len(raw) > _DATE_VALUE_MAX_LEN:
+        return None
+    for fmt in DATE_FORMAT_WHITELIST:
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def detect_date_format(values: Sequence[Any]) -> Optional[str]:
+    """按真实值判定该列是否为日期列，是则返回其格式（白名单内），否则 None。
+
+    判定：存在非空值，且能按**同一格式**解析的比例 >= ``_DATE_LIKE_RATIO``。
+    """
+    non_empty = [str(v).strip() for v in values
+                 if v is not None and str(v).strip() != '']
+    if not non_empty:
+        return None
+    need = _DATE_LIKE_RATIO * len(non_empty)
+    for fmt in DATE_FORMAT_WHITELIST:
+        ok = 0
+        for raw in non_empty:
+            try:
+                datetime.strptime(raw, fmt)
+                ok += 1
+            except (ValueError, TypeError):
+                continue
+        if ok and ok >= need:
+            return fmt
+    return None
+
+
+def is_date_like_values(values: Sequence[Any]) -> bool:
+    """该列取值是否"日期形态"（供 contains 危险模式拦截使用）。"""
+    return detect_date_format(values) is not None
 
 #: 列名里像业务主键的关键词（**只作为辅助条件**，必须同时满足"值几乎全是数字串"）
 _ID_NAME_RE = re.compile(

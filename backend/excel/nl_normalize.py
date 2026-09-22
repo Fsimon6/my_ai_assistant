@@ -182,12 +182,30 @@ ORDER_DESC_RE = re.compile(r'从高到低|从多到少|由大到小|由多到少
 ORDER_ANY_RE = re.compile(r'排序|排列|排名|排行|靠前|从高到低|从低到高|升序|降序')
 #: TOP-N：数字可以是阿拉伯数字或中文数字
 _NUM_TOKEN = r'(?:\d+|[零〇一二两三四五六七八九十百千万]+)'
+#: 2A-P0：中文"名次/排行"写法（排名前N / 排行前N / 排名第N / 第N名 / 前N名）。
+#: 这些写法此前完全不被识别，导致「查看排名前三订单」丢失整句语义。
+_RANK_NUM_TOKEN = _NUM_TOKEN
 TOPN_RE = re.compile(
-    rf'(?:前\s*({_NUM_TOKEN})\s*(?:个|条|名|组|位|只|项|款|种|的)?'
+    rf'(?:排名\s*前\s*({_RANK_NUM_TOKEN})'
+    rf'|排行\s*前\s*({_RANK_NUM_TOKEN})'
+    rf'|排名\s*第\s*({_RANK_NUM_TOKEN})'
+    rf'|排行\s*第\s*({_RANK_NUM_TOKEN})'
+    rf'|第\s*({_RANK_NUM_TOKEN})\s*(?:名|位)'
+    rf'|前\s*({_RANK_NUM_TOKEN})\s*(?:名|位)'
+    rf'|前\s*({_NUM_TOKEN})\s*(?:个|条|名|组|位|只|项|款|种|的)?'
     rf'|top\s*({_NUM_TOKEN})'
     r'|(?:最高|最大|最多|最低|最小|最少)\s*的?\s*(' + _NUM_TOKEN + r')\s*(?:个|条|名|组|位|款|种)'
     rf'|({_NUM_TOKEN})\s*(?:个|条|名|组|位|款|种)\s*(?:最高|最大|最多|最低|最小|最少))',
     re.IGNORECASE,
+)
+#: 2A-P0：**显式名次**语义（「排名 / 排行 / 第N名」）——要求有明确排序依据，
+#: 否则必须澄清；与「前N名」（只是截取前 N 个）区分开。
+EXPLICIT_RANK_RE = re.compile(
+    rf'排名|排行|第\s*{_RANK_NUM_TOKEN}\s*(?:名|位)'
+)
+#: 2A-P0：「前N名 / 前N位」（**不含**"排名/排行/第"）—— 视为"取前 N 个"的行级截取。
+FIRST_N_RANK_RE = re.compile(
+    rf'前\s*{_RANK_NUM_TOKEN}\s*(?:名|位)'
 )
 #: 逐行计算（每笔/每行）
 ROW_CALC_CUE_RE = re.compile(r'每笔|每行|每一单|每一个订单|单笔|逐笔|逐行')
@@ -685,6 +703,89 @@ def resolvable_columns(
             if name is not None and not cands and name not in out:
                 out.append(name)
     return out
+
+
+# ---------------------------------------------------------------------------
+# 6.5) 日期表达式解析（2A-P0：仅"绝对日期"最小集合）
+# ---------------------------------------------------------------------------
+#: 明确的相对时间说法：**明确不支持**（必须澄清，绝不静默退化）。
+RELATIVE_TIME_RE = re.compile(
+    r'最近|上周|上星期|上个月|上月|本月|这个月|当月|本周|这周|本周内|昨天|今天|明天'
+    r'|前天|后天|去年|今年|明年|下个月|下月|本季度|上季度|下季度|年初|月初|月末|年底|周末'
+)
+#: 日期区间连接符
+_DATE_RANGE_SEP = r'(?:到|至|~|～|-|—|–)'
+_D4 = r'(\d{4})'
+_D12 = r'(\d{1,2})'
+_DATE_RANGE_RE = re.compile(
+    rf'(?:{_D4}\s*年)?\s*{_D12}\s*月\s*{_D12}\s*[日号]?\s*{_DATE_RANGE_SEP}\s*'
+    rf'(?:{_D4}\s*年)?\s*{_D12}\s*月\s*{_D12}\s*[日号]?'
+)
+_DATE_DAY_RE = re.compile(rf'(?:{_D4}\s*年)?\s*{_D12}\s*月\s*{_D12}\s*[日号]')
+_DATE_MONTH_RE = re.compile(rf'(?:{_D4}\s*年)?\s*{_D12}\s*月(?:份)?')
+_DATE_YEAR_RE = re.compile(rf'{_D4}\s*年')
+
+
+def _valid_date(year: Optional[int], month: int, day: int) -> bool:
+    if not (1 <= month <= 12) or not (1 <= day <= 31):
+        return False
+    if year is not None and not (1900 <= year <= 2999):
+        return False
+    return True
+
+
+def parse_date_expression(message: Any) -> Optional[Dict[str, Any]]:
+    """解析**绝对日期**表达式，返回结构化片段；无法解析返回 None。
+
+    支持（最小集合）：
+        2026年                   -> {'kind': 'year',  'year': 2026}
+        8月 / 8月份               -> {'kind': 'month', 'year': None, 'month': 8}
+        8月20日                   -> {'kind': 'day',   'year': None, 'month': 8, 'day': 20}
+        2026年8月20日             -> {'kind': 'day',   'year': 2026, 'month': 8, 'day': 20}
+        8月1日到8月15日            -> {'kind': 'range', 'year': None, 'start': (8, 1), 'end': (8, 15)}
+
+    **不支持**相对时间（昨天 / 最近7天 / 上个月 / 本周 …）—— 一律返回 None，
+    由上层给出明确澄清（见 ``RELATIVE_TIME_RE``）。
+    中文数字（八 / 二十）经 ``cn_to_arabic`` 归一后同样可解析。
+    """
+    norm = cn_to_arabic(to_halfwidth(message))
+    if not norm:
+        return None
+
+    def g(m: Any, i: int) -> Optional[int]:
+        raw = m.group(i)
+        return int(raw) if raw else None
+
+    m = _DATE_RANGE_RE.search(norm)
+    if m:
+        y1, mo1, d1, y2, mo2, d2 = (g(m, 1), g(m, 2), g(m, 3), g(m, 4), g(m, 5), g(m, 6))
+        if y1 is not None and y2 is not None and y1 != y2:
+            return None
+        if _valid_date(y1 or y2, mo1, d1) and _valid_date(y1 or y2, mo2, d2):
+            return {
+                'kind': 'range', 'year': y1 or y2,
+                'start': (mo1, d1), 'end': (mo2, d2),
+            }
+
+    m = _DATE_DAY_RE.search(norm)
+    if m:
+        y, mo, d = g(m, 1), g(m, 2), g(m, 3)
+        if _valid_date(y, mo, d):
+            return {'kind': 'day', 'year': y, 'month': mo, 'day': d}
+
+    m = _DATE_MONTH_RE.search(norm)
+    if m:
+        y, mo = g(m, 1), g(m, 2)
+        if _valid_date(y, mo, 1):
+            return {'kind': 'month', 'year': y, 'month': mo}
+
+    m = _DATE_YEAR_RE.search(norm)
+    if m:
+        y = g(m, 1)
+        if _valid_date(y, 1, 1):
+            return {'kind': 'year', 'year': y}
+
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -1,11 +1,15 @@
 """认证依赖和工具"""
-from typing import Optional
+from datetime import timedelta
+from typing import Any, Dict, Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt
 from sqlalchemy.orm import Session
 
-from backend.utils.security import verify_token
+from backend.utils.security import (
+    create_access_token as _security_create_access_token,
+    verify_token,
+)
 from backend.database.base import get_db
 from backend.models.user import User
 
@@ -54,7 +58,7 @@ async def get_current_active_user(current_user: Optional[User] = Depends(get_cur
         )
     return current_user
 
-async def get_current_active_superuser(current_user: User = Depends(get_current_active_user())):
+async def get_current_active_superuser(current_user: User = Depends(get_current_active_user)):
     """获取当前超级用户"""
     if not current_user.is_superuser:
         raise HTTPException(
@@ -63,5 +67,13 @@ async def get_current_active_superuser(current_user: User = Depends(get_current_
         )
     return current_user
 
-async def create_access_token():
-    pass
+def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
+    """创建访问令牌（委托给 backend.utils.security.create_access_token，保持单一实现）
+
+    历史遗留：此处原为 `async def create_access_token(): pass` 的空占位，
+    既无法接收参数、也不会返回令牌（实际返回 None）。唯一调用方
+    tests/fixtures/test_users.py 以 data / expires_delta 同步调用并期望字符串令牌，
+    故该占位属明确缺陷。现改为同步委托，不复制 JWT 逻辑，
+    行为与 security.create_access_token 完全一致。
+    """
+    return _security_create_access_token(data=data, expires_delta=expires_delta)

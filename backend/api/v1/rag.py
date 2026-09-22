@@ -7,7 +7,11 @@ import os
 import logging
 from datetime import datetime
 
+from backend.config.settings import settings
 from backend.services.rag_service import get_rag_service
+from backend.services.conversation_service import (
+    conversation_service, SOURCE_RAG, SOURCE_EXCEL,
+)
 from backend.services.document_service import save_uploaded_file
 from backend.excel import store as excel_store
 from backend.utils.auth import get_current_active_user
@@ -224,6 +228,29 @@ async def query_document(
         )
 
 
+def _resolve_rag_conversation_id(character_id: Optional[str], user_id: int) -> Optional[int]:
+    """RAG 链路定位（或创建）当前对话 id，供聊天记录持久化复用。
+
+    与 ``main.py:/speak/stream`` 使用同一个 conversation_service，不复制业务逻辑。
+    - ``character_id`` 缺失（None / 空串）→ 返回 None：调用方跳过持久化，
+      保持本端点原有的“无副作用”行为，向后兼容直接调用 API 的场景。
+    - ``character_id`` 非法（非整数）→ 返回 None，不抛错。
+    - 数据库侧异常 → 记日志后返回 None（保存失败绝不能影响本次查询响应）。
+    """
+    if not character_id:
+        return None
+    try:
+        character_id_int = int(character_id)
+    except (TypeError, ValueError):
+        logger.warning('RAG 对话记录：character_id 非法，跳过持久化：%r', character_id)
+        return None
+    try:
+        return conversation_service.get_or_create_conversation_id(user_id, character_id_int)
+    except Exception as e:
+        logger.warning('RAG 对话记录初始化失败（忽略）：%s', e)
+        return None
+
+
 @router.post('/query-with-history')
 async def query_with_history(
         req: QueryWithHistoryRequest,
@@ -243,31 +270,66 @@ async def query_with_history(
             char_model = character.model
             char_api_key = character.api_key
 
+        # ===== 对话历史持久化（与 main.py:/speak/stream 同一策略）=====
+        # 背景：本端点是「启用知识库」后的聊天入口，此前完全没有落库逻辑，
+        # 导致开启知识库后聊天记录无法保存。此处只复用 conversation_service：
+        #   * 流式开始前写入 user 消息；
+        #   * 流式完整结束后写入一次 assistant 消息（不按 chunk 写库）；
+        #   * 异常时补写失败占位，保持 user/assistant 对称。
+        # character_id 缺失时 conv_id 为 None → 全部跳过，保持旧行为（向后兼容）。
+        # 不改变任何请求/响应契约；持久化失败只记日志，绝不影响查询响应。
+        conv_id = _resolve_rag_conversation_id(req.character_id, current_user.id)
+        effective_model = char_model if (char_model and char_api_key) else settings.LLM_MODEL
+
+        def _persist_message(role: str, content: str) -> None:
+            """写入一条对话记录（来源标记 = 知识库）；
+            任何失败只记日志，绝不冒泡影响本次查询。"""
+            if conv_id is None or not content:
+                return
+            try:
+                conversation_service.append_message(
+                    conv_id, role, content, effective_model,
+                    meta_info={'source': SOURCE_RAG},
+                )
+            except Exception as pe:
+                logger.warning('保存 RAG 对话记录失败（忽略）：%s', pe)
+
         if req.stream:
             async def generate():
                 full_response = ''
-                async for chunk in rag_service.query_with_history(
-                    query=req.query,
-                    history=req.history,
-                    context_count=req.context_count,
-                    user_id=current_user.id,
-                    model=char_model,
-                    api_key=char_api_key,
-                    document_id=req.document_id
-                ):
-                    full_response += chunk
+                # 流式开始前先落库用户消息
+                _persist_message('user', req.query)
+                try:
+                    async for chunk in rag_service.query_with_history(
+                        query=req.query,
+                        history=req.history,
+                        context_count=req.context_count,
+                        user_id=current_user.id,
+                        model=char_model,
+                        api_key=char_api_key,
+                        document_id=req.document_id
+                    ):
+                        full_response += chunk
+                        yield json.dumps({
+                            'type': 'chunk',
+                            'content': chunk,
+                            'timestamp': datetime.now().isoformat()
+                        }) + '\n'
+
+                    # 流式完整结束后写一次 AI 回复（不按 chunk 写库）
+                    _persist_message('assistant', full_response)
+
+                    # 与普通 Chat 流式协议保持一致：末尾补 complete 帧（携带完整内容）
                     yield json.dumps({
-                        'type': 'chunk',
-                        'content': chunk,
+                        'type': 'complete',
+                        'content': full_response,
                         'timestamp': datetime.now().isoformat()
                     }) + '\n'
-
-                # 与普通 Chat 流式协议保持一致：末尾补 complete 帧（携带完整内容）
-                yield json.dumps({
-                    'type': 'complete',
-                    'content': full_response,
-                    'timestamp': datetime.now().isoformat()
-                }) + '\n'
+                except Exception as se:
+                    logger.error(f'RAG 流式查询失败：{se}')
+                    # 与 /speak/stream 一致：异常时补一条失败助手消息，保持历史对称
+                    _persist_message('assistant', '（内容生成失败，请重试）')
+                    raise
 
             return StreamingResponse(
                 generate(),
@@ -279,16 +341,23 @@ async def query_with_history(
             )
         else:
             response_text = ''
-            async for chunk in rag_service.query_with_history(
-                query=req.query,
-                history=req.history,
-                context_count=req.context_count,
-                user_id=current_user.id,
-                model=char_model,
-                api_key=char_api_key,
-                document_id=req.document_id
-            ):
-                response_text += chunk
+            _persist_message('user', req.query)
+            try:
+                async for chunk in rag_service.query_with_history(
+                    query=req.query,
+                    history=req.history,
+                    context_count=req.context_count,
+                    user_id=current_user.id,
+                    model=char_model,
+                    api_key=char_api_key,
+                    document_id=req.document_id
+                ):
+                    response_text += chunk
+                _persist_message('assistant', response_text)
+            except Exception:
+                # 异常同样补失败占位（与外层 500 处理各司其职：这里只补历史对称）
+                _persist_message('assistant', '（内容生成失败，请重试）')
+                raise
 
             return {
                 'success': True,
@@ -770,6 +839,36 @@ async def excel_nl_query(
             store.mark_other_turn(current_user.id, session_key)
             agg_store.mark_other_turn(current_user.id, session_key)
             analysis_store.mark_other_turn(current_user.id, session_key)
+
+        # ===== 对话历史持久化（表格查询模式）=====
+        # 背景：本端点此前完全没有落库逻辑。前端 sendMessage 中「表格查询」优先级最高且
+        # 直接 return，所以「知识库 + 表格查询」同时开启时也会走这里，导致聊天记录无法保存。
+        # 保存规则（避免与前端回退链路重复写入）：
+        #   * status == 'not_excel' **不保存** —— 前端会回收占位并回退到 RAG / 普通聊天链路，
+        #     由那条链路保存；此处若也保存会造成同一轮写两遍。
+        #   * 其余状态（用户确实看到了回复）保存一轮 user + assistant。
+        #   * assistant 侧保存后端已生成的结构化查询摘要（outcome['message']）。
+        # 复用与 /query-with-history 相同的 conversation_service，不复制业务逻辑；
+        # character_id 缺失时跳过（向后兼容）；落库失败只记日志，绝不影响查询响应。
+        if status != 'not_excel':
+            conv_id = _resolve_rag_conversation_id(req.character_id, current_user.id)
+
+            def _persist_excel_turn(role: str, content: str) -> None:
+                """写入一条表格查询对话记录（来源标记 = excel）；
+                任何失败只记日志，绝不冒泡。
+                该标记使普通聊天链路可通过 exclude_sources 整轮丢弃表格轮次。"""
+                if conv_id is None or not content:
+                    return
+                try:
+                    conversation_service.append_message(
+                        conv_id, role, content, effective_model,
+                        meta_info={'source': SOURCE_EXCEL},
+                    )
+                except Exception as pe:
+                    logger.warning('保存表格查询对话记录失败（忽略）：%s', pe)
+
+            _persist_excel_turn('user', message)
+            _persist_excel_turn('assistant', outcome.get('message') or '（表格查询完成）')
 
         return {
             'success': True,

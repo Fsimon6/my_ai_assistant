@@ -235,7 +235,9 @@ async def speak_to_character_stream(
     # 延迟导入，避免循环依赖（与 main.py 中其它 service 调用风格一致）
     from backend.services.llm_service import get_llm, LLMFactory, LLMConfig
     from backend.services.character_service import character_service
-    from backend.services.conversation_service import conversation_service
+    from backend.services.conversation_service import (
+        conversation_service, SOURCE_CHAT, SOURCE_EXCEL,
+    )
 
     # 归属查询（防 IDOR）：角色不存在 / 不属于当前用户（含已删除）→ 404
     character = character_service.get_character(character_id, user_id=current_user.id)
@@ -286,10 +288,17 @@ async def speak_to_character_stream(
                 # 同一对话的并发流式串行化：避免 user/assistant 历史交错或上下文串线
                 lock = conv_locks.setdefault(conv_id, asyncio.Lock())
                 await lock.acquire()
-                # 先落库用户消息
-                conversation_service.append_message(conv_id, 'user', request.message, effective_model)
-                # 加载历史（已含刚写入的用户消息），注入 LLM 多轮上下文
-                history = conversation_service.get_history(conv_id)
+                # 先落库用户消息（来源标记 = 普通聊天）
+                conversation_service.append_message(
+                    conv_id, 'user', request.message, effective_model,
+                    meta_info={'source': SOURCE_CHAT},
+                )
+                # 加载历史（已含刚写入的用户消息），注入 LLM 多轮上下文。
+                # 来源隔离：Excel 表格查询属独立工具能力，其整轮（user + assistant）
+                # 一律不进入普通聊天上下文，避免历史表格结果污染其他聊天模式。
+                history = conversation_service.get_history(
+                    conv_id, exclude_sources=[SOURCE_EXCEL],
+                )
             else:
                 history = []
 
@@ -305,7 +314,10 @@ async def speak_to_character_stream(
 
             # AI 回复在完整流式结束后写入一次（不按 chunk 写库）
             if conv_id is not None and full_response:
-                conversation_service.append_message(conv_id, 'assistant', full_response, effective_model)
+                conversation_service.append_message(
+                    conv_id, 'assistant', full_response, effective_model,
+                    meta_info={'source': SOURCE_CHAT},
+                )
 
             yield json.dumps({
                 "type": "complete",
@@ -319,7 +331,8 @@ async def speak_to_character_stream(
             if conv_id is not None:
                 try:
                     conversation_service.append_message(
-                        conv_id, 'assistant', '（内容生成失败，请重试）', effective_model
+                        conv_id, 'assistant', '（内容生成失败，请重试）', effective_model,
+                        meta_info={'source': SOURCE_CHAT},
                     )
                 except Exception:
                     pass

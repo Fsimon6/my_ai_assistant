@@ -107,9 +107,16 @@ class OpenAILikeLLM(BaseLLM):
                 )
 
                 async for chunk in response:
-                    delta = chunk.choices[0].delta.content
-                    if delta:
-                        yield delta
+                    # 部分 OpenAI 兼容接口（如 DashScope）会在流末尾追加一个
+                    # 仅用于 usage 统计的结束帧，其 choices 为空列表；
+                    # 若直接取 choices[0] 会抛 IndexError: list index out of range。
+                    choices = getattr(chunk, 'choices', None)
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], 'delta', None)
+                    content = getattr(delta, 'content', None)
+                    if content:
+                        yield content
             else:
                 response = await self.client.chat.completions.create(
                     model=self.config.model,
@@ -117,7 +124,14 @@ class OpenAILikeLLM(BaseLLM):
                     temperature=temp,
                     max_tokens=self.config.max_tokens,
                 )
-                yield response.choices[0].message.content
+                # 非流式：choices 缺失/为空时返回安全结果，不抛异常
+                choices = getattr(response, 'choices', None)
+                if not choices:
+                    logger.warning('LLM 非流式响应缺少 choices，返回空内容')
+                    yield ''
+                    return
+                message = getattr(choices[0], 'message', None)
+                yield getattr(message, 'content', None) or ''
 
         except Exception as e:
             logger.error(f'OpenAI调用失败：{e}')

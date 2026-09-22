@@ -123,6 +123,9 @@ class PlanFilter:
     value: Any
     resolved_column: str
     column_letter: str
+    #: 2A-P0：仅 date_between 使用 —— 由 Python 从真实列值检测出的
+    #: 日期格式（必须来自 representation.DATE_FORMAT_WHITELIST，绝不来自用户输入）。
+    date_format: str = ''
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -198,6 +201,18 @@ def build_plan_filters(
                     f'筛选条件 {col.name!r} contains 需要非空字符串',
                     {'column': col.name, 'value': value},
                 )
+        date_format = ''
+        if op == excel_query.OPERATOR_DATE_BETWEEN:
+            # 2A-P0：日期格式必须从**真实列值**检测得到（且只能来自白名单）。
+            # 检测不到 => 该列不是日期列 => 明确报错（上层会转成澄清），绝不静默放过。
+            from backend.excel.representation import detect_date_format
+            date_format = detect_date_format(sheet.column_values(col.index)) or ''
+            if not date_format:
+                raise excel_query.ExcelQueryError(
+                    excel_query.ERR_INVALID_PARAM,
+                    f'列 {col.name!r} 不是可识别的日期列，无法执行日期区间筛选',
+                    {'column': col.name},
+                )
         plan_filters.append(PlanFilter(
             column_index=col.index,
             phys=phys_col(col.index),
@@ -205,6 +220,7 @@ def build_plan_filters(
             value=value,
             resolved_column=col.name,
             column_letter=col.excel_column_letter,
+            date_format=date_format,
         ))
     return plan_filters
 
@@ -309,6 +325,13 @@ _SQL_RANGE = {
     excel_query.OPERATOR_LT: 'TRY_CAST({c} AS DOUBLE) < TRY_CAST(? AS DOUBLE)',
     excel_query.OPERATOR_LTE: 'TRY_CAST({c} AS DOUBLE) <= TRY_CAST(? AS DOUBLE)',
 }
+#: 2A-P0：日期区间。{fmt} 只能来自 representation.DATE_FORMAT_WHITELIST（Python 常量，
+#: 非用户输入，且校验其中不含单引号），区间两个端点一律 ? 参数绑定。
+#: 单元格无法按该格式解析时 try_strptime 返回 NULL，COALESCE 收敛为 FALSE（该行不匹配）。
+_SQL_DATE_BETWEEN = (
+    'COALESCE(CAST(try_strptime(CAST({c} AS VARCHAR), {fmt}) AS DATE) '
+    'BETWEEN CAST(? AS DATE) AND CAST(? AS DATE), FALSE)'
+)
 
 
 def render_where(plan: QueryPlan) -> Tuple[str, List[Any]]:
@@ -355,6 +378,29 @@ def render_where_filters(filters: Sequence[PlanFilter]) -> Tuple[str, List[Any]]
         elif op in _SQL_RANGE:
             clauses.append(_SQL_RANGE[op].format(c=col))
             params.append(float(value))
+
+        elif op in excel_query.DATE_OPERATORS:
+            # 2A-P0：日期区间。格式必须来自白名单（Python 常量），端点 ? 绑定。
+            from backend.excel.representation import DATE_FORMAT_WHITELIST
+            fmt = getattr(f, 'date_format', '') or ''
+            if fmt not in DATE_FORMAT_WHITELIST or "'" in fmt:
+                raise excel_query.ExcelQueryError(
+                    excel_query.ERR_INVALID_PARAM,
+                    f'筛选条件 {f.resolved_column!r} 的日期格式非法（必须来自白名单）',
+                    {'column': f.resolved_column},
+                )
+            bounds = excel_query.coerce_date_range(value)
+            if bounds is None:
+                raise excel_query.ExcelQueryError(
+                    excel_query.ERR_INVALID_PARAM,
+                    f'筛选条件 {f.resolved_column!r} 的日期区间非法：{value!r}',
+                    {'column': f.resolved_column, 'value': value},
+                )
+            clauses.append(
+                f'({col} IS NOT NULL AND '
+                f'{_SQL_DATE_BETWEEN.format(c=col, fmt=repr(fmt))})'
+            )
+            params.extend([bounds[0], bounds[1]])
 
         else:  # pragma: no cover - build_plan 已拦截
             raise excel_query.ExcelQueryError(

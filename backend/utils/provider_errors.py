@@ -170,6 +170,38 @@ def classify_parse_error(exc: Any) -> ClassifiedError:
         400, 'parser', detail)
 
 
+#: 本地文件「格式/内容不合法」类异常的类型名
+_PARSE_ERROR_NAMES = (
+    'BadZipFile', 'InvalidFileException', 'XLRDError', 'UnicodeDecodeError',
+    'EmptyDataError', 'ParserError', 'JSONDecodeError',
+)
+
+
+def is_file_format_error(exc: Any) -> bool:
+    """异常是否表示「上传文件本身格式/内容不合法」（应为 400，而不是 500）。
+
+    覆盖三类此前会被误判成 INTERNAL_ERROR/500 的情况：
+    - ``zipfile.BadZipFile`` / openpyxl ``InvalidFileException``：xlsx 不是 zip 或结构不对；
+    - openpyxl 读取归档结构缺失的工作簿时抛的 ``KeyError``
+      （如 "There is no item named '[Content_Types].xml' in the archive"）；
+    - 标准库 csv 读取二进制内容时抛的 ``_csv.Error``（"line contains NUL"），
+      其 ``type().__name__`` 仅为 ``'Error'``，必须按 ``__module__ == '_csv'`` 判定，
+      避免误伤其它同名的 Error 异常。
+    """
+    name = type(exc).__name__
+    module = getattr(type(exc), '__module__', '') or ''
+    if name in _PARSE_ERROR_NAMES:
+        return True
+    if isinstance(exc, KeyError):
+        # 仅收敛到「归档结构缺失」这一类，避免把其它 KeyError 误判为解析失败
+        msg = str(exc).lower()
+        if 'in the archive' in msg or 'no item named' in msg:
+            return True
+    if module == '_csv':
+        return True
+    return False
+
+
 def classify_upload_error(exc: Any) -> ClassifiedError:
     """上传链路的统一分类入口：解析类 / provider 类 / 其它内部错误。"""
     from backend.excel import query as excel_query
@@ -177,9 +209,7 @@ def classify_upload_error(exc: Any) -> ClassifiedError:
     if isinstance(exc, excel_query.ExcelQueryError):
         return classify_parse_error(exc)
 
-    name = type(exc).__name__
-    if name in ('BadZipFile', 'InvalidFileException', 'XLRDError', 'UnicodeDecodeError',
-                'EmptyDataError', 'ParserError', 'JSONDecodeError'):
+    if is_file_format_error(exc):
         return classify_parse_error(exc)
 
     text = sanitize_secret_text(exc).lower()

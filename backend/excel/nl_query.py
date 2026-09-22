@@ -568,6 +568,7 @@ def build_validated_query(
                     f'筛选条件「{col} 包含 ...」缺少有效的文本值',
                     {'column': col, 'value': value},
                 )
+            guard_contains_unsafe(sheet, col, value)
         elif operator in excel_query.RANGE_OPERATORS:
             # gt/gte/lt/lte 必须是数值（允许 LLM 写成字符串 "100"）
             num = excel_query.to_number(value)
@@ -1499,11 +1500,16 @@ _STAT_COUNT_RE = re.compile(r'有多少|几单|几笔|几条|几个|多少条|�
 _STAT_GROUP_RE = re.compile(r'每个|各个|各|分别|每种|每类|按.{0,12}(?:统计|分组|汇总|汇总|求和)|分组')
 #: 排序语义
 _STAT_ORDER_RE = re.compile(r'从高到低|从低到高|由大到小|由小到大|升序|降序|排序|排列|排名|排行')
-#: TOP-N 语义
+#: TOP-N 语义（2A-P0：补充中文"名次/排行"写法）
 _STAT_TOPN_RE = re.compile(
-    r'前\s*\d+\s*(?:个|条|名|组|位|只|项|款|种|的)?'
+    r'(?:排名|排行)\s*前\s*\d+'
+    r'|(?:排名|排行)\s*第\s*\d+'
+    r'|第\s*\d+\s*(?:名|位)'
+    r'|前\s*\d+\s*(?:名|位)'
+    r'|前\s*\d+\s*(?:个|条|名|组|位|只|项|款|种|的)?'
     r'|top\s*\d+'
-    r'|最高的\s*\d+\s*个|最低的\s*\d+\s*个'
+    r'|最高的\s*\d+\s*个|最低的\s*\d+\s*个',
+    re.IGNORECASE,
 )
 
 #: 明显的"普通列表查询 / 分页"说法：出现这些时**不做**统计兜底
@@ -2133,6 +2139,7 @@ def resolve_filters_nl(
                     'filter_value_invalid', f'筛选条件「{col} 包含 ...」缺少有效的文本值',
                     {'column': col, 'value': value},
                 )
+            guard_contains_unsafe(sheet, col, value)
         elif operator in excel_query.RANGE_OPERATORS:
             num = excel_query.to_number(value)
             if num is None:
@@ -2144,6 +2151,372 @@ def resolve_filters_nl(
             value = num
         resolved.append({'column': col, 'operator': operator, 'value': value})
     return resolved
+
+
+# ============================================================================
+# 2A-P0-A) 时间语义（仅绝对日期）+ contains 危险模式拦截
+# ============================================================================
+#: 「纯数字短文本」判据：1~4 位数字（如 "8" / "2026"）。
+#: 这类值 + 文本列做 contains 几乎必然全表命中（真实故障：Created Time contains "8" -> 19/19）。
+_SHORT_NUMERIC_VALUE_RE = re.compile(r'^\d{1,4}$')
+
+
+def _find_column(sheet: 'SheetRepresentation', col_name: str):
+    return next((c for c in sheet.columns if c.name == col_name), None)
+
+
+def _column_values(sheet: 'SheetRepresentation', col_name: str) -> Sequence[Any]:
+    col = _find_column(sheet, col_name)
+    return sheet.column_values(col.index) if col is not None else []
+
+
+def _column_is_numeric(sheet: 'SheetRepresentation', col_name: str) -> bool:
+    """与统计层一致的"可数值化"判定（Order Amount 存的是文本型数字）。"""
+    non_empty = [v for v in _column_values(sheet, col_name)
+                 if v is not None and str(v).strip() != '']
+    numeric = [v for v in non_empty if excel_aggregate.aggregate_to_number(v) is not None]
+    return bool(numeric) and len(numeric) * 2 >= len(non_empty)
+
+
+def guard_contains_unsafe(sheet: 'SheetRepresentation', col_name: str, value: Any) -> None:
+    """2A-P0：拦截**危险的 contains**（静默假命中的主要来源）。
+
+    只在两类情况下拒绝，其余一律放行（保证「物流商 SF / SKU / 订单号 / 商品编码 /
+    用户明确要求文本包含」不受影响）：
+      A. 目标列是**日期列**（按真实值判定）—— 时间条件绝不允许退化为子串匹配；
+      B. 目标列是**文本语义列且非业务标识列**，而 value 是**纯数字短文本**（1~4 位）
+         —— 「Created Time contains "8"」这类必然全表命中的写法。
+    """
+    from backend.excel.representation import SEMANTIC_TEXT, is_date_like_values
+
+    values = _column_values(sheet, col_name)
+
+    # A. 日期列：任何 contains 一律禁止 -> 明确澄清（引导使用年/月/日或区间）
+    if is_date_like_values(values):
+        raise NlQueryError(
+            'filter_contains_unsafe_date',
+            f'「{col_name}」是日期列，不支持"包含"匹配。请给出明确的年 / 月 / 日或日期区间，'
+            f'例如「8月19日的订单」「8月1日到8月15日的订单」。',
+            {'column': col_name, 'value': value, 'candidates': [col_name]},
+        )
+
+    # B. 纯数字短文本 + 文本列（非标识列）
+    if not isinstance(value, str) or not _SHORT_NUMERIC_VALUE_RE.match(value.strip()):
+        return
+    col = _find_column(sheet, col_name)
+    if col is None or col.semantic_type != SEMANTIC_TEXT:
+        return
+    if is_identifier_column(col, values):
+        return          # 订单号 / SKU / 商品编码等：用户明确要求"包含"时保持可用
+    raise NlQueryError(
+        'filter_contains_unsafe_numeric',
+        f'「{col_name}」是文本列，用数字片段「{value}」做"包含"匹配会命中几乎所有行；'
+        f'请给出明确取值或范围。',
+        {'column': col_name, 'value': value},
+    )
+
+
+def _iter_date_columns(sheet: 'SheetRepresentation') -> List[str]:
+    """按真实值找出该 Sheet 的日期列（白名单格式）。"""
+    from backend.excel.representation import is_date_like_values
+
+    return [c.name for c in sheet.columns
+            if is_date_like_values(sheet.column_values(c.index))]
+
+
+def _infer_year(sheet: 'SheetRepresentation', col_name: str) -> Tuple[Optional[int], set]:
+    """从真实值推断年份：返回 (唯一年份或 None, 出现过的年份集合)。"""
+    from backend.excel.representation import parse_date_value
+
+    years = set()
+    for v in _column_values(sheet, col_name):
+        d = parse_date_value(v)
+        if d is not None:
+            years.add(d.year)
+    if len(years) == 1:
+        return next(iter(years)), years
+    return None, years
+
+
+def _expr_to_range(expr: Dict[str, Any], year: int):
+    """把日期表达式 + 年份换算成 (start_date, end_date)；非法返回 None。"""
+    import calendar
+    from datetime import date as _date
+
+    try:
+        if expr['kind'] == 'year':
+            start, end = _date(year, 1, 1), _date(year, 12, 31)
+        elif expr['kind'] == 'month':
+            m = expr['month']
+            start, end = _date(year, m, 1), _date(year, m, calendar.monthrange(year, m)[1])
+        elif expr['kind'] == 'day':
+            start = end = _date(year, expr['month'], expr['day'])
+        else:  # range
+            (m1, d1), (m2, d2) = expr['start'], expr['end']
+            start, end = _date(year, m1, d1), _date(year, m2, d2)
+    except (ValueError, KeyError, TypeError):
+        return None
+    if start > end:
+        start, end = end, start
+    return start, end
+
+
+def _count_in_range(sheet: 'SheetRepresentation', col_name: str, start, end) -> int:
+    """按 Python 参考实现统计该列在 [start, end] 内的行数（用于多日期列一致性判定）。"""
+    bounds = [start.isoformat(), end.isoformat()]
+    return sum(1 for v in _column_values(sheet, col_name)
+               if excel_query.date_between_match(v, bounds))
+
+
+def _temporal_filter_for_message(
+    message: str,
+    sheet: 'SheetRepresentation',
+    preferred: Optional[Sequence[str]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """2A-P0：把**绝对日期**表达式映射成 date_between 条件。
+
+    ``preferred``：本轮意图里**已经指向**的列（通常来自 LLM）。命中其中的日期列时
+    直接采用它 —— 这样「8月19日的订单」不会因为表里存在多个日期列
+    （Created Time / Paid Time / RTS Time / Shipped Time）而被迫澄清。
+
+    返回 (filter, clarify)：
+      - (filter, None)   -> 成功生成日期区间条件
+      - (None, clarify)  -> 必须澄清（相对时间 / 无日期列 / 多日期列无法确定 / 年份不明）
+      - (None, None)     -> 文本里没有时间语义（保持原路径）
+    """
+    text = nl_norm.to_halfwidth(message)
+    if not text:
+        return None, None
+    expr = nl_norm.parse_date_expression(text)
+    if expr is None:
+        # 相对时间（最近7天/上个月/本周…）：明确不支持 -> 澄清，绝不静默退化
+        if nl_norm.RELATIVE_TIME_RE.search(text):
+            return None, _clarify(
+                '暂不支持相对时间（如"最近7天 / 上个月 / 本周"）。请给出明确的年 / 月 / 日'
+                '或日期区间，例如「8月19日的订单」「2026年8月1日到8月15日的订单」。',
+                stage='date',
+            )
+        return None, None
+
+    date_cols = _iter_date_columns(sheet)
+    if not date_cols:
+        return None, _clarify(
+            '没有找到可识别的日期列，无法按日期筛选。请指明具体列，或改用其他条件。',
+            sheet.column_names[:30], stage='date',
+        )
+    pref = [c for c in (preferred or []) if c in date_cols]
+    if len(pref) == 1:
+        col_name = pref[0]                      # 本轮意图已指向唯一日期列 -> 直接采用
+    elif len(date_cols) == 1:
+        col_name = date_cols[0]
+    else:
+        # 多日期列、且本轮未指向任何一列：仅当**所有日期列的命中数完全一致**时
+        # 才无歧义（例如 8月21日在任何时间列里都没有记录 -> 一致为 0 行）；
+        # 只要有一列结果不同，就必须由用户指明按哪一列筛选（绝不猜）。
+        counts: Dict[str, int] = {}
+        for c in date_cols:
+            y_c = expr.get('year') or _infer_year(sheet, c)[0]
+            if y_c is None:
+                return None, _clarify(
+                    '表格中有多个日期列且年份不一致，请指明具体年份与日期列，'
+                    '例如「2026年8月按 Created Time 统计」。',
+                    date_cols[:30], stage='date',
+                )
+            rng_c = _expr_to_range(expr, y_c)
+            if rng_c is None:
+                return None, _clarify(
+                    '无法解析该日期表达式，请给出有效的年 / 月 / 日或日期区间。', stage='date',
+                )
+            counts[c] = _count_in_range(sheet, c, rng_c[0], rng_c[1])
+        if len(set(counts.values())) != 1:
+            detail = '、'.join(f'{c}={counts[c]}' for c in date_cols[:4])
+            return None, _clarify(
+                f'该表格有多个日期列（{"、".join(date_cols[:5])}），各列结果不同'
+                f'（{detail}），请指明按哪一列筛选。',
+                date_cols[:30], stage='date',
+            )
+        col_name = date_cols[0]                 # 各日期列结果一致 -> 无歧义
+
+    # 年份推断：未显式给出时，要求该列只有唯一年份，否则澄清
+    year = expr.get('year')
+    if year is None:
+        year, years = _infer_year(sheet, col_name)
+        if year is None:
+            shown = '、'.join(str(y) for y in sorted(years)[:8]) or '未知'
+            return None, _clarify(
+                f'「{col_name}」包含多个年份（{shown}），请指明具体年份，'
+                f'例如「2026年8月的订单」。',
+                stage='date',
+            )
+
+    rng = _expr_to_range(expr, year)
+    if rng is None:
+        return None, _clarify(
+            '无法解析该日期表达式，请给出有效的年 / 月 / 日或日期区间。', stage='date',
+        )
+    start, end = rng
+    return {
+        'column': col_name,
+        'operator': excel_query.OPERATOR_DATE_BETWEEN,
+        'value': [start.isoformat(), end.isoformat()],
+    }, None
+
+
+# ============================================================================
+# 2A-P0-B) 中文名次语义守卫（排名前N / 排行前N / 第N名 / 前N名）
+# ============================================================================
+def _guard_rank_semantics(
+    turn: Optional[TurnIntent],
+    message: str,
+    catalog: List[Dict[str, Any]],
+    signals: Optional['nl_norm.IntentSignals'],
+) -> Tuple[Optional[TurnIntent], List[str], Optional[Dict[str, Any]]]:
+    """守卫中文名次语义，**绝不允许静默降级为全表 COUNT**。
+
+    返回 (turn, notes, clarify)：
+
+    1. **显式名次**（「排名 / 排行 / 第N名」）：
+       - 分组维度可确定性解析 -> 分组排行（有度量列用度量，否则 COUNT）+ TOP-N；
+       - 有度量列 -> 按聚合值排行 + TOP-N；
+       - 都没有 -> **澄清**（并给出可排名的数值列候选）。
+    2. **仅「前N名 / 前N位」**（无"排名/排行/第"）：
+       - 视为"取前 N 个"的行级截取 -> 普通查询 limit=N（不要求排序依据）。
+    """
+    text = nl_norm.to_halfwidth(message)
+    if not text or signals is None or turn is None:
+        return turn, [], None
+    explicit = bool(nl_norm.EXPLICIT_RANK_RE.search(text))
+    first_n = bool(nl_norm.FIRST_N_RANK_RE.search(text))
+    if not (explicit or first_n) or signals.top_n is None:
+        return turn, [], None
+
+    agg = turn.aggregate if turn.action == ACTION_AGGREGATE else None
+
+    # ---------- 2) 仅「前N名 / 前N位」：行级截取前 N 行 ----------
+    if first_n and not explicit:
+        n = max(1, min(signals.top_n, MAX_NL_LIMIT))
+        payload = {
+            'query_type': INTENT_STRUCTURED,
+            'document': getattr(agg, 'document', None),
+            'sheet': getattr(agg, 'sheet', None),
+            'filters': list(getattr(agg, 'filters', None) or []),
+            'limit': n,
+        }
+        new_intent = intent_from_dict(payload)
+        new_intent.limit_explicit = True
+        ranked = TurnIntent(action=ACTION_NEW_QUERY, intent=new_intent,
+                            source='deterministic_rank_first_n', raw=payload)
+        return ranked, [f'名次语义(前N名) -> 行级截取 limit={n}'], None
+
+    # ---------- 1) 显式名次：必须有排序依据 ----------
+    if agg is None:
+        # LLM 直接要求澄清，但文本里是**显式名次**：给出可操作的"需要排序依据"澄清，
+        # 而不是泛泛的"信息不足" —— 也避免后续路径把它当普通查询而静默 COUNT。
+        # 文档/Sheet 无法唯一确定时保留原有澄清（不掩盖文件歧义）。
+        _r0, _s0 = _resolve_sheet_for_message(_EmptyIntent(), catalog)
+        if _s0 is None:
+            return turn, [], None
+        cands0 = [c.name for c in _s0.columns if _column_is_numeric(_s0, c.name)][:30]
+        return turn, [], _clarify(
+            '需要明确按什么字段排名（例如「按订单金额排名前三的订单」「订单最多的前3个物流商」）。',
+            cands0, stage='order',
+        )
+
+    notes: List[str] = []
+    # 分组维度判定**不依赖 schema**：只看文本里是否出现已知的维度别名
+    # （物流商 / SKU / 商品 / 城市 …）。这样即使文档未唯一确定，也能做出正确决策
+    # ——「查看排名前三订单」里的「订单」并不是可用的分组维度别名。
+    norm_text = nl_norm.normalize_name(text)
+    group_hint = None
+    for key in sorted(COLUMN_ALIASES, key=len, reverse=True):
+        k = nl_norm.normalize_name(key)
+        if k and k in norm_text:
+            group_hint = COLUMN_ALIASES[key]
+            break
+    if group_hint is not None:
+        _rep, sheet = _resolve_sheet_for_message(agg, catalog)
+        if sheet is not None:
+            gh = nl_norm.longest_resolvable_column(text, sheet.column_names, COLUMN_ALIASES)
+            if gh is not None and not _column_is_numeric(sheet, gh):
+                agg.group_by = agg.group_by or [gh]
+            elif gh is None:
+                group_hint = None
+        if group_hint is not None:
+            # 分组排行：有度量列用度量，否则用 COUNT（「排名前三的物流商」保持原能力）
+            if not agg.column and not agg.calculation \
+                    and agg.operation in excel_aggregate.NUMERIC_OPERATIONS:
+                agg.operation = excel_aggregate.OPERATION_COUNT
+                agg.calculation = None
+                notes.append('名次语义：无度量列 -> COUNT')
+            agg.order_by = excel_aggregate.ORDER_BY_AGGREGATE
+            agg.order_dir = agg.order_dir or 'desc'
+            agg.top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
+            notes.append(f'名次语义 -> 分组排行 TOP-{agg.top_n}')
+            return turn, notes, None
+
+    # 度量列必须由**文本显式给出**才算"明确排序指标"：
+    # LLM 自行填的列（例如「查看排名前三订单」被填成 Order Amount）不算 ——
+    # 否则就是拿一个用户从未说过的口径去排名，此时应当澄清。
+    metric_explicit = bool(signals.any_stat)
+    if not metric_explicit and (agg.column or agg.calculation):
+        for key, target in COLUMN_ALIASES.items():
+            k = nl_norm.normalize_name(key)
+            if k and k in norm_text and target == agg.column:
+                metric_explicit = True
+                break
+    if (agg.column or agg.calculation) and metric_explicit:
+        agg.order_by = excel_aggregate.ORDER_BY_AGGREGATE
+        agg.order_dir = agg.order_dir or 'desc'
+        agg.top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
+        notes.append(f'名次语义 -> 指标排行 TOP-{agg.top_n}')
+        return turn, notes, None
+
+    # 无分组维度、无度量列 -> **澄清**（禁止降级为无排序的全表 COUNT）
+    cands: List[str] = []
+    _rep2, sheet2 = _resolve_sheet_for_message(agg, catalog)
+    if sheet2 is not None:
+        cands = [c.name for c in sheet2.columns if _column_is_numeric(sheet2, c.name)][:30]
+    return turn, notes, _clarify(
+        '需要明确按什么字段排名（例如「按订单金额排名前三的订单」「订单最多的前3个物流商」）。',
+        cands, stage='order',
+    )
+
+
+def _apply_temporal_repair(
+    turn: Optional[TurnIntent], message: str, catalog: List[Dict[str, Any]]
+) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+    """2A-P0：把**绝对日期**表达式落成 ``date_between`` 条件；必要时返回澄清。
+
+    - 生成前会丢弃 LLM 可能已产出的、指向同一列的旧条件（尤其是 ``contains``），
+      避免「time 条件 + 子串条件」叠加；
+    - 文本没有时间语义时什么都不做（保持原路径）。
+    """
+    if turn is None:
+        return [], None
+    if turn.action == ACTION_AGGREGATE and turn.aggregate is not None:
+        holder, hint = turn.aggregate, turn.aggregate
+    elif turn.action == ACTION_NEW_QUERY and turn.intent is not None:
+        holder, hint = turn.intent, turn.intent
+    else:
+        return [], None
+    _rep, sheet = _resolve_sheet_for_message(hint, catalog)
+    if sheet is None:
+        return [], None
+
+    # 本轮意图已指向的列（LLM 在 baseline 通常会给出 Created Time）
+    preferred = [f.get('column') for f in (getattr(holder, 'filters', None) or [])
+                 if isinstance(f, dict) and f.get('column')]
+    filt, clarify = _temporal_filter_for_message(message, sheet, preferred)
+    if clarify is not None:
+        return [], clarify
+    if filt is None:
+        return [], None
+
+    kept = [f for f in (getattr(holder, 'filters', None) or [])
+            if (f or {}).get('column') != filt['column']]
+    kept.append(filt)
+    holder.filters = kept
+    return [f"时间条件 -> {filt['column']} {filt['value'][0]} ~ {filt['value'][1]}"], None
 
 
 def _execute_aggregate_with_prefix_relaxation(
@@ -3515,6 +3888,28 @@ async def _run_nl_query_impl(
             document_override=document_override,
             user_message=user_message,
         )
+
+    # ---------- 2.45) 2A-P0 守卫：时间语义 + 中文名次语义 ----------
+    # 必须放在【统计守卫 / 分析升级】之后：这些守卫会再次调用 LLM 并把 NEW_QUERY
+    # 重新路由成 AGGREGATE（例如「查看排名前三订单」被判为统计）——若前置执行，
+    # 2A-P0 的判定会被随后的重路由绕过（实测故障）。
+    # 铁律：宁可澄清，绝不静默出错 ——
+    #   ① 时间条件不得退化为 contains（否则「8月19日」会变成 0 行或全表假命中）；
+    #   ② 名次语义不得静默降级为无排序的全表 COUNT。
+    time_notes, time_clarify = _apply_temporal_repair(turn, user_message, catalog)
+    if time_clarify is not None:
+        return time_clarify
+    if time_notes:
+        logger.info('[nl] 时间条件（2A-P0）：%s', '; '.join(time_notes))
+        repairs.extend(time_notes)
+
+    turn, rank_notes, rank_clarify = _guard_rank_semantics(
+        turn, user_message, catalog, signals)
+    if rank_notes:
+        logger.info('[nl] 名次语义（2A-P0）：%s', '; '.join(rank_notes))
+        repairs.extend(rank_notes)
+    if rank_clarify is not None:
+        return rank_clarify
 
     # ---------- 2.5) 统计动作（Phase 3A）：与分页上下文完全隔离 ----------
     if turn.action == ACTION_AGGREGATE:
