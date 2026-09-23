@@ -2387,7 +2387,12 @@ def _guard_rank_semantics(
         return turn, [], None
     explicit = bool(nl_norm.EXPLICIT_RANK_RE.search(text))
     first_n = bool(nl_norm.FIRST_N_RANK_RE.search(text))
-    if not (explicit or first_n) or signals.top_n is None:
+    if not (explicit or first_n):
+        return turn, [], None
+    # O2 收口（证据：实测「哪几个订单排名最高」→ 被 LLM 猜出 Order Amount 后直接执行）：
+    # **显式名次语义本身**就必须受本守卫约束，不要求文本一定带"前N/第N"这种显式 N。
+    # 只有「前N名/前N位」这一支（行级截取）必须有可解析的 N，否则不构造。
+    if first_n and not explicit and signals.top_n is None:
         return turn, [], None
 
     agg = turn.aggregate if turn.action == ACTION_AGGREGATE else None
@@ -2450,15 +2455,20 @@ def _guard_rank_semantics(
                 notes.append('名次语义：无度量列 -> COUNT')
             agg.order_by = excel_aggregate.ORDER_BY_AGGREGATE
             agg.order_dir = agg.order_dir or 'desc'
-            agg.top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
-            notes.append(f'名次语义 -> 分组排行 TOP-{agg.top_n}')
+            if signals.top_n is not None:
+                agg.top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
+                notes.append(f'名次语义 -> 分组排行 TOP-{agg.top_n}')
+            else:
+                notes.append(f'名次语义 -> 分组排行（沿用原 top_n={agg.top_n}）')
             return turn, notes, None
 
     # 度量列必须由**文本显式给出**才算"明确排序指标"：
-    # LLM 自行填的列（例如「查看排名前三订单」被填成 Order Amount）不算 ——
-    # 否则就是拿一个用户从未说过的口径去排名，此时应当澄清。
-    metric_explicit = bool(signals.any_stat)
-    if not metric_explicit and (agg.column or agg.calculation):
+    #   * LLM 自行填的列（「查看排名前三订单」被填成 Order Amount）不算 ——
+    #     否则就是拿一个用户从未说过的口径去排名；
+    #   * 仅出现"几个/多少/几笔"这类**数量词**也不算（那是计数，不是指标列）
+    #     —— 实测反例：「哪几个订单排名最高」曾被 signals.count 判成"有统计词"。
+    metric_explicit = False
+    if agg.column or agg.calculation:
         for key, target in COLUMN_ALIASES.items():
             k = nl_norm.normalize_name(key)
             if k and k in norm_text and target == agg.column:
@@ -2467,8 +2477,11 @@ def _guard_rank_semantics(
     if (agg.column or agg.calculation) and metric_explicit:
         agg.order_by = excel_aggregate.ORDER_BY_AGGREGATE
         agg.order_dir = agg.order_dir or 'desc'
-        agg.top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
-        notes.append(f'名次语义 -> 指标排行 TOP-{agg.top_n}')
+        if signals.top_n is not None:
+            agg.top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
+            notes.append(f'名次语义 -> 指标排行 TOP-{agg.top_n}')
+        else:
+            notes.append(f'名次语义 -> 指标排行（沿用原 top_n={agg.top_n}）')
         return turn, notes, None
 
     # 无分组维度、无度量列 -> **澄清**（禁止降级为无排序的全表 COUNT）
