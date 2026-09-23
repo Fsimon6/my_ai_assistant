@@ -3846,19 +3846,34 @@ async def _run_nl_query_impl(
             guard_turn = TurnIntent(
                 action=ACTION_AGGREGATE, aggregate=guard_agg, source='statistical_guard',
             )
-            guard_outcome = _run_aggregate_turn(
-                guard_turn, catalog,
-                context=context,
-                aggregate_context=aggregate_context,
-                user_id=user_id,
-                session_key=session_key,
-                document_override=document_override,
-            )
-            if guard_outcome.get('status') == STATUS_OK:
-                guard_outcome['statistical_guard'] = True
-                return guard_outcome
-            logger.info('[nl] 统计兜底未成功（status=%s），回退原路径：%s',
-                        guard_outcome.get('status'), guard_outcome.get('message'))
+            # 2A-P0（O2 修复）：统计守卫的 LLM 结果**同样必须**过名次守卫。
+            # 否则「查看排名前三订单」会在这里被补出指标（Order Amount）后直接执行成
+            # TOP-3，绕过 2.45 的名次语义规则（实测根因：本路径会 return，不再往下走）。
+            guard_turn, _gnotes, _gclarify = _guard_rank_semantics(
+                guard_turn, user_message, catalog, signals)
+            if _gnotes:
+                logger.info('[nl] 名次语义（统计守卫路径 2A-P0）：%s', '; '.join(_gnotes))
+            if _gclarify is not None:
+                return _gclarify
+            if guard_turn.action != ACTION_AGGREGATE:
+                # 名次守卫把统计兜底改写成了别的动作（如「前N名」-> 行级截取）：
+                # 放弃本条统计兜底，交给后续统一分派（2.45 会对原 turn 再判一次，幂等）。
+                logger.info('[nl] 统计兜底被 2A-P0 名次守卫改写为 %s，交回统一分派',
+                            guard_turn.action)
+            else:
+                guard_outcome = _run_aggregate_turn(
+                    guard_turn, catalog,
+                    context=context,
+                    aggregate_context=aggregate_context,
+                    user_id=user_id,
+                    session_key=session_key,
+                    document_override=document_override,
+                )
+                if guard_outcome.get('status') == STATUS_OK:
+                    guard_outcome['statistical_guard'] = True
+                    return guard_outcome
+                logger.info('[nl] 统计兜底未成功（status=%s），回退原路径：%s',
+                            guard_outcome.get('status'), guard_outcome.get('message'))
 
     # ---------- 2.4) 多步分析（Phase 4A）：两阶段，与 Phase 3 上下文隔离 ----------
     if turn.action == ACTION_ANALYSIS:
