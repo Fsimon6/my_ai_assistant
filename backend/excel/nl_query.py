@@ -18,7 +18,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from backend.excel import aggregate as excel_aggregate
 from backend.excel import calculation as excel_calculation
@@ -107,6 +107,20 @@ COLUMN_ALIASES: Dict[str, str] = {
     '国家': 'Country',
     '仓库': 'Warehouse Name',
     '分类': 'Product Category',
+}
+
+# 「度量列」目标：这些别名回答的是**排什么**（指标），不能当作**按什么分组**的维度。
+# 实测依据：「按订单金额排名前三」/「按数量排名前三」曾被误当成"分组排行"，
+# 进而执行了一次没有分组依据的聚合（order_by=aggregate_value 但 group_by 为空）。
+METRIC_COLUMN_TARGETS: FrozenSet[str] = frozenset({
+    'Order Amount', 'Quantity', 'Sku Quantity of return',
+    'Taxes', 'Order Refund Amount', 'Weight(kg)',
+})
+
+# 维度别名（= 别名表中除度量列以外的部分）：可用于确定性推导"按什么分组"。
+DIMENSION_ALIASES: Dict[str, str] = {
+    _k: _v for _k, _v in COLUMN_ALIASES.items()
+    if _v not in METRIC_COLUMN_TARGETS
 }
 
 _CODE_FENCE_RE = re.compile(r'```(?:json)?\s*(.*?)```', re.S | re.I)
@@ -2178,6 +2192,44 @@ def _column_is_numeric(sheet: 'SheetRepresentation', col_name: str) -> bool:
     return bool(numeric) and len(numeric) * 2 >= len(non_empty)
 
 
+def _metric_is_explicit(norm_text: str, column: Optional[str]) -> bool:
+    """文本里是否真的出现了**映射到该列的列别名**（即用户确实说到了这个指标）。
+
+    - 只认真实列别名（「金额」-> Order Amount、「数量」-> Quantity …）；
+    - LLM 自行填出的列（用户从没说过）不算 —— 那是"猜口径"；
+    - 「几个 / 多少 / 几笔」这类**数量词**不算指标（那是计数，不是指标列）。
+    """
+    if not column or not norm_text:
+        return False
+    for key, target in COLUMN_ALIASES.items():
+        k = nl_norm.normalize_name(key)
+        if k and k in norm_text and target == column:
+            return True
+    return False
+
+
+def _dimension_column_hint(text: str, norm_text: str, intent: Any,
+                           catalog: List[Dict[str, Any]]) -> Optional[str]:
+    """从**维度别名**（物流商 / SKU / 商品 / 城市 …）确定性推导"按什么分组"的列；无则 None。
+
+    只认维度别名，**不认度量别名**（金额 / 数量 / 单价）—— 后者是"排什么"，不是"按什么分组"。
+    文档未唯一确定时**沿用维度别名**（这里只确定"按什么分组"，绝不猜文件）；
+    真实 schema 可解析时以其中的真实列名为准，若该维度列在表中不存在则放弃（不猜）。
+    """
+    hit: Optional[str] = None
+    for key in sorted(DIMENSION_ALIASES, key=len, reverse=True):
+        k = nl_norm.normalize_name(key)
+        if k and k in norm_text:
+            hit = DIMENSION_ALIASES[key]
+            break
+    if hit is None:
+        return None
+    _rep, sheet = _resolve_sheet_for_message(intent, catalog)
+    if sheet is None:
+        return hit
+    return nl_norm.longest_resolvable_column(text, sheet.column_names, DIMENSION_ALIASES)
+
+
 def guard_contains_unsafe(sheet: 'SheetRepresentation', col_name: str, value: Any) -> None:
     """2A-P0：拦截**危险的 contains**（静默假命中的主要来源）。
 
@@ -2396,6 +2448,13 @@ def _guard_rank_semantics(
         return turn, [], None
 
     agg = turn.aggregate if turn.action == ACTION_AGGREGATE else None
+    norm_text = nl_norm.normalize_name(text)
+    # 2A-P0（统一边界，O2 收口）：analysis 轮次的"排名口径"在 step1。
+    # 对 analysis **只做放行 / 澄清判定**，绝不改写分析计划。
+    step1: Optional[Dict[str, Any]] = None
+    if turn.action == ACTION_ANALYSIS and turn.analysis is not None:
+        _steps = getattr(turn.analysis, 'steps', None) or []
+        step1 = _steps[0] if _steps else None
 
     # ---------- 2) 仅「前N名 / 前N位」：行级截取前 N 行 ----------
     if first_n and not explicit:
@@ -2413,6 +2472,25 @@ def _guard_rank_semantics(
                             source='deterministic_rank_first_n', raw=payload)
         return ranked, [f'名次语义(前N名) -> 行级截取 limit={n}'], None
 
+    # ---------- 1b) analysis 轮次：step1 即"排名口径" ----------
+    # 实测 bypass（修复前）：「排名前三的订单的总和是多少」-> llm_parse_turn 直接返回
+    # action=analysis 且 step1.col=Order Amount（用户从未说过指标）-> analysis_guard
+    # 补齐 step1 后直接 _run_analysis_turn 并 return，**完全绕过本守卫**（返回了真实数值）。
+    # 这里统一拦住：无显式指标且无分组维度 -> 澄清（不改写计划；有依据则原样放行）。
+    if step1 is not None:
+        col1 = step1.get('column') or step1.get('calculation')
+        grp1 = step1.get('group_by') or []
+        if grp1 or _metric_is_explicit(norm_text, col1):
+            return turn, [], None
+        cands1: List[str] = []
+        _r1, _s1 = _resolve_sheet_for_message(_EmptyIntent(), catalog)
+        if _s1 is not None:
+            cands1 = [c.name for c in _s1.columns if _column_is_numeric(_s1, c.name)][:30]
+        return turn, [], _clarify(
+            '需要明确按什么字段排名（例如「按订单金额排名前三的订单」「订单最多的前3个物流商」）。',
+            cands1, stage='order',
+        )
+
     # ---------- 1) 显式名次：必须有排序依据 ----------
     if agg is None:
         # LLM 直接要求澄清，但文本里是**显式名次**：给出可操作的"需要排序依据"澄清，
@@ -2428,53 +2506,41 @@ def _guard_rank_semantics(
         )
 
     notes: List[str] = []
-    # 分组维度判定**不依赖 schema**：只看文本里是否出现已知的维度别名
-    # （物流商 / SKU / 商品 / 城市 …）。这样即使文档未唯一确定，也能做出正确决策
-    # ——「查看排名前三订单」里的「订单」并不是可用的分组维度别名。
-    norm_text = nl_norm.normalize_name(text)
-    group_hint = None
-    for key in sorted(COLUMN_ALIASES, key=len, reverse=True):
-        k = nl_norm.normalize_name(key)
-        if k and k in norm_text:
-            group_hint = COLUMN_ALIASES[key]
-            break
-    if group_hint is not None:
-        _rep, sheet = _resolve_sheet_for_message(agg, catalog)
-        if sheet is not None:
-            gh = nl_norm.longest_resolvable_column(text, sheet.column_names, COLUMN_ALIASES)
-            if gh is not None and not _column_is_numeric(sheet, gh):
-                agg.group_by = agg.group_by or [gh]
-            elif gh is None:
-                group_hint = None
-        if group_hint is not None:
-            # 分组排行：有度量列用度量，否则用 COUNT（「排名前三的物流商」保持原能力）
-            if not agg.column and not agg.calculation \
-                    and agg.operation in excel_aggregate.NUMERIC_OPERATIONS:
-                agg.operation = excel_aggregate.OPERATION_COUNT
-                agg.calculation = None
-                notes.append('名次语义：无度量列 -> COUNT')
-            agg.order_by = excel_aggregate.ORDER_BY_AGGREGATE
-            agg.order_dir = agg.order_dir or 'desc'
-            if signals.top_n is not None:
-                agg.top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
-                notes.append(f'名次语义 -> 分组排行 TOP-{agg.top_n}')
-            else:
-                notes.append(f'名次语义 -> 分组排行（沿用原 top_n={agg.top_n}）')
-            return turn, notes, None
+    # 分组维度只认**维度别名**（物流商/SKU/商品/城市…），**不认度量别名**（金额/数量/单价…）：
+    # 后者回答的是"排什么"，不是"按什么分组"。实测依据：
+    #   * 「排名前三的物流商」-> 维度别名命中 -> 分组排行（保持原能力）；
+    #   * 「按订单金额排名前三」/「按数量排名前三」-> 只命中度量别名 -> **不得**当作分组维度
+    #     （曾误入分组排行，执行了一次没有分组依据的聚合）；
+    #   * 「查看排名前三订单」->「订单」不是维度别名 -> 澄清（O2 缺陷不会再回来）。
+    # 注意：**不能**直接信任 agg.group_by —— LLM 会给「查看排名前三订单」填出
+    # group_by=Order ID，那正是 O2 缺陷的来源。
+    group_hint = _dimension_column_hint(text, norm_text, agg, catalog)
 
-    # 度量列必须由**文本显式给出**才算"明确排序指标"：
-    #   * LLM 自行填的列（「查看排名前三订单」被填成 Order Amount）不算 ——
-    #     否则就是拿一个用户从未说过的口径去排名；
-    #   * 仅出现"几个/多少/几笔"这类**数量词**也不算（那是计数，不是指标列）
-    #     —— 实测反例：「哪几个订单排名最高」曾被 signals.count 判成"有统计词"。
-    metric_explicit = False
-    if agg.column or agg.calculation:
-        for key, target in COLUMN_ALIASES.items():
-            k = nl_norm.normalize_name(key)
-            if k and k in norm_text and target == agg.column:
-                metric_explicit = True
-                break
-    if (agg.column or agg.calculation) and metric_explicit:
+    if group_hint is not None:
+        agg.group_by = agg.group_by or [group_hint]
+        # 分组排行：有度量列用度量，否则用 COUNT（「排名前三的物流商」保持原能力）
+        if not agg.column and not agg.calculation \
+                and agg.operation in excel_aggregate.NUMERIC_OPERATIONS:
+            agg.operation = excel_aggregate.OPERATION_COUNT
+            agg.calculation = None
+            notes.append('名次语义：无度量列 -> COUNT')
+        agg.order_by = excel_aggregate.ORDER_BY_AGGREGATE
+        agg.order_dir = agg.order_dir or 'desc'
+        if signals.top_n is not None:
+            agg.top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
+            notes.append(f'名次语义 -> 分组排行 TOP-{agg.top_n}')
+        else:
+            notes.append(f'名次语义 -> 分组排行（沿用原 top_n={agg.top_n}）')
+        return turn, notes, None
+
+    # 指标排行：「度量列由文本显式给出」**且**「排行榜有分组维度」才成立。
+    #   * 度量列必须命中真实列别名（LLM 自行填的 Order Amount 不算）；
+    #   * 数量词（几个/多少/几笔）不算指标 —— 实测「哪几个订单排名最高」曾被误判；
+    #   * 没有分组维度时 order_by=aggregate_value 无意义（单值聚合无"排行"可言），
+    #     此时应澄清而不是执行一个无依据的 TOP-N。
+    if ((agg.column or agg.calculation)
+            and agg.group_by
+            and _metric_is_explicit(norm_text, agg.column)):
         agg.order_by = excel_aggregate.ORDER_BY_AGGREGATE
         agg.order_dir = agg.order_dir or 'desc'
         if signals.top_n is not None:
@@ -3785,6 +3851,25 @@ async def _run_nl_query_impl(
                 stage='pagination',
             )
         return _run_pagination(turn, context)
+
+    # ---------- 2.25) 2A-P0 统一名次守卫（O2 收口：堵住三条 analysis 绕过路径）----------
+    # 位置是关键：必须在 2.3（确定性升级 / analysis_guard）与 2.4（ACTION_ANALYSIS 分派）
+    # **之前**。实测 bypass：这三条路径都是先 `_run_analysis_turn(...)` 再 `return`，
+    # 因此 2.45 的名次守卫对它们**完全不可见**
+    # （「排名前三的订单的总和是多少」曾被 LLM 猜出 Order Amount 后直接执行并返回真实数值）。
+    # 只对 aggregate / analysis 且命中"显式名次"或 analysis 动作的轮次生效，其余动作不动。
+    if (turn is not None
+            and turn.action in (ACTION_AGGREGATE, ACTION_ANALYSIS)
+            and (turn.action == ACTION_ANALYSIS
+                 or nl_norm.EXPLICIT_RANK_RE.search(user_message))):
+        _pre_turn, _pre_notes, _pre_clarify = _guard_rank_semantics(
+            turn, user_message, catalog, signals)
+        if _pre_notes:
+            logger.info('[nl] 名次语义（2.25 统一守卫 2A-P0）：%s', '; '.join(_pre_notes))
+            repairs.extend(_pre_notes)
+        if _pre_clarify is not None:
+            return _pre_clarify
+        turn = _pre_turn
 
     # ---------- 2.3) 两步分析兜底（Phase 4A）----------
     # 必须在 analysis / aggregate / new_query 分发**之前**：
