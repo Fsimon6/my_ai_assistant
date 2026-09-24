@@ -123,6 +123,21 @@ DIMENSION_ALIASES: Dict[str, str] = {
     if _v not in METRIC_COLUMN_TARGETS
 }
 
+# 「排名单位」别名（Stage 2A-P0，2026-09-24）：
+# 只在「个/条/的/位/名 + 单位」这种**单位位置**出现时才生效（如「前3个订单」），
+# 且必须**同时**满足「有显式度量列」+「有显式 N」，才会构造单位级 TOP-N。
+#
+# ⚠️ 绝不可并入 DIMENSION_ALIASES：一旦「订单 -> Order ID」成为全局维度别名，
+# 「排名前三的订单」/「查看排名前三订单」会被识别成 group_by=Order ID + COUNT + TOP-N
+# 并**直接执行**，破坏"无明确指标排名必须澄清"（A 组 8/8 clarify）的既有规则。
+RANK_UNIT_ALIASES: Dict[str, str] = {
+    '订单': 'Order ID',
+    'order': 'Order ID',
+}
+
+# 单位位置匹配：「...前3个订单」「...排名前3的订单」；单独的「按订单金额排名前三」不匹配
+RANK_UNIT_RE = re.compile(r'(?:个|条|的|位|名)\s*(订单|order)', re.I)
+
 _CODE_FENCE_RE = re.compile(r'```(?:json)?\s*(.*?)```', re.S | re.I)
 
 
@@ -2208,6 +2223,27 @@ def _metric_is_explicit(norm_text: str, column: Optional[str]) -> bool:
     return False
 
 
+def _deterministic_rank_metric(text: str, sheet: 'SheetRepresentation') -> Optional[str]:
+    """从文本里**唯一**解析出度量列（用于「<度量>最高的前N个<单位>」）。
+
+    只认映射到度量列（METRIC_COLUMN_TARGETS）的别名，且该列必须在真实 schema 中
+    存在且可数值化（与统计层同一套判定）。解析不出、或解析出多个不同列 -> None（绝不猜）。
+    """
+    norm_text = nl_norm.normalize_name(text)
+    hits: List[str] = []
+    for key in sorted(COLUMN_ALIASES, key=len, reverse=True):
+        target = COLUMN_ALIASES[key]
+        if target not in METRIC_COLUMN_TARGETS:
+            continue
+        k = nl_norm.normalize_name(key)
+        if not k or k not in norm_text:
+            continue
+        if target in sheet.column_names and _column_is_numeric(sheet, target):
+            hits.append(target)
+    uniq = list(dict.fromkeys(hits))
+    return uniq[0] if len(uniq) == 1 else None
+
+
 def _dimension_column_hint(text: str, norm_text: str, intent: Any,
                            catalog: List[Dict[str, Any]]) -> Optional[str]:
     """从**维度别名**（物流商 / SKU / 商品 / 城市 …）确定性推导"按什么分组"的列；无则 None。
@@ -3157,6 +3193,70 @@ def _deterministic_top_group_turn(message: str, catalog: List[Dict[str, Any]],
     return TurnIntent(action=ACTION_AGGREGATE, aggregate=agg, source='deterministic_top_group')
 
 
+def _deterministic_unit_topn_turn(message: str, catalog: List[Dict[str, Any]],
+                                  signals: 'nl_norm.IntentSignals',
+                                  hint_intent: Any = None) -> Optional[TurnIntent]:
+    """「<度量>最高的前N个<单位>」-> **单位级 TOP-N** 的确定性意图。
+
+    真实故障（2026-09-24 实测，同一句话、同一模型、同一天）：
+    - 第 1 次：「订单金额最高的前3个订单」-> LLM 给 `new_query + limit=3`
+      （query 内**无任何排序**）-> 返回**表内前 3 行**，却 `status=ok`；
+    - 第 2 次：LLM 自行 clarify。
+    两者都不是用户要的"金额最高的 3 个订单"。
+
+    正确语义（沿用项目既有 TOP-N 口径「X 金额最高的 N 个 Y」）：
+        metric=<度量列>, operation=SUM, group_by=[<单位列>], top_n=N,
+        order_by=aggregate_value, order_dir=desc
+    即：OrderSKUList 是 SKU 行级表 -> 先 GROUP BY Order ID + SUM(Order Amount)，
+    再 ORDER BY SUM(Order Amount) DESC LIMIT 3。**不是** LIMIT 3 原始行，也不是 MAX。
+
+    触发条件（**全部**满足才构造，否则 None，保持原路径）：
+    1. `signals.top_n` 有显式 N（「前3个/前5个」）；
+    2. 文本出现「个/条/的/位/名 + 单位」（RANK_UNIT_RE），如「前3个订单」；
+       ——「按订单金额排名前三」没有单位位置，因此**不会**被本规则命中；
+    3. 文本里能**唯一**解析出真实存在且可数值化的度量列（显式指标）；
+    4. 文本里**没有**可解析的维度别名（物流商/SKU/…）——有维度时交给既有分组排行；
+    5. 该会话不像是"两步分析"（避免覆盖「…的总和是多少」这类多步问法）；
+    6. 单位列与度量列都必须在真实 schema 中存在。
+    """
+    text = nl_norm.to_halfwidth(message)
+    if not text or signals is None or signals.top_n is None:
+        return None
+    norm_text = nl_norm.normalize_name(text)
+    m = RANK_UNIT_RE.search(norm_text)
+    if m is None:
+        return None
+    if looks_like_multi_step_query(message):
+        return None
+    hint = hint_intent or _EmptyIntent()
+    # 有维度别名（物流商/SKU/商品…）时不动：让「订单最多的前3个物流商」走既有分组排行
+    if _dimension_column_hint(text, norm_text, hint, catalog) is not None:
+        return None
+    unit_col = next((v for k, v in RANK_UNIT_ALIASES.items()
+                     if nl_norm.normalize_name(k) == m.group(1)), None)
+    if unit_col is None:
+        return None
+    _rep, sheet = _resolve_sheet_for_message(hint, catalog)
+    if sheet is None or unit_col not in sheet.column_names:
+        return None
+    metric_col = _deterministic_rank_metric(text, sheet)
+    if metric_col is None or metric_col == unit_col:
+        return None
+    agg = AggregateIntent(
+        operation=excel_aggregate.OPERATION_SUM,
+        document=getattr(hint, 'document', None),
+        sheet=getattr(hint, 'sheet', None),
+        column=metric_col,
+        filters=normalize_filters(getattr(hint, 'filters', None) or []),
+        group_by=[unit_col],
+        order_by=excel_aggregate.ORDER_BY_AGGREGATE,
+        order_dir='desc',
+        top_n=max(1, min(signals.top_n, MAX_NL_LIMIT)),
+    )
+    return TurnIntent(action=ACTION_AGGREGATE, aggregate=agg,
+                      source='deterministic_unit_topn')
+
+
 class _EmptyIntent:
     """占位（只用于复用 `_resolve_sheet_for_message` 的"文档/Sheet"读取）。"""
 
@@ -3815,6 +3915,18 @@ async def _run_nl_query_impl(
     if downgrade_note:
         logger.info('[nl] %s（纯列表问题不进入统计链路）', downgrade_note)
         repairs.append(downgrade_note)
+
+    # ---------- 1.56) 单位级 TOP-N（Stage 2A-P0，2026-09-24）----------
+    # 「订单金额最高的前3个订单」必须 = SUM(Order Amount) + GROUP BY Order ID + TOP-3，
+    # 而不是 LLM 实测给出的两种错答（`new_query limit=3` 返回表内前 3 行 / 自行 clarify）。
+    # 该形态（显式度量 + 显式 N + 「个/的+单位」）完全可确定，故在此**确定性覆盖**。
+    # 触发条件见 `_deterministic_unit_topn_turn`（其中已排除有维度别名与两步分析的情况）。
+    _unit_topn = _deterministic_unit_topn_turn(
+        user_message, catalog, signals, turn.aggregate or turn.intent)
+    if _unit_topn is not None and turn.action in (
+            ACTION_NEW_QUERY, ACTION_AGGREGATE, ACTION_CLARIFY):
+        turn = _unit_topn
+        repairs.append('单位级 TOP-N（确定性：显式度量 + 单位 + N）')
 
     # ---------- 1.6) 计算字段兜底（后续 2A）----------
     # 「一店每笔订单的金额/数量」这类**逐行计算**问法，LLM 偶尔只给普通查询而漏掉
