@@ -2359,13 +2359,17 @@ def _count_in_range(sheet: 'SheetRepresentation', col_name: str, start, end) -> 
 def _temporal_filter_for_message(
     message: str,
     sheet: 'SheetRepresentation',
-    preferred: Optional[Sequence[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """2A-P0：把**绝对日期**表达式映射成 date_between 条件。
 
-    ``preferred``：本轮意图里**已经指向**的列（通常来自 LLM）。命中其中的日期列时
-    直接采用它 —— 这样「8月19日的订单」不会因为表里存在多个日期列
-    （Created Time / Paid Time / RTS Time / Shipped Time）而被迫澄清。
+    **日期列的选择权只来自用户文本**（2A-P0 修正，2026-09-24）：
+    只有当文本里出现了某个日期列（真实列名或列别名）时，才按该列筛选；
+    否则在"多日期列"的表中必须由用户指明 —— **绝不采纳 LLM 自行给出的列**。
+    实测依据（OrderSKUList 对「8月21日」：Created Time=0 / Paid Time=0 /
+    RTS Time=4 / Shipped Time=5）：
+      * 「8月21日的订单」+ LLM 给出任意一列 -> 旧实现直接采纳并按该列执行（静默假口径）；
+      * 文本已明确说「按 Created Time」时，LLM 给出的 Paid Time 反而胜出。
+    两者都是"把模型猜测当成用户明确表达"，必须澄清。
 
     返回 (filter, clarify)：
       - (filter, None)   -> 成功生成日期区间条件
@@ -2392,11 +2396,15 @@ def _temporal_filter_for_message(
             '没有找到可识别的日期列，无法按日期筛选。请指明具体列，或改用其他条件。',
             sheet.column_names[:30], stage='date',
         )
-    pref = [c for c in (preferred or []) if c in date_cols]
-    if len(pref) == 1:
-        col_name = pref[0]                      # 本轮意图已指向唯一日期列 -> 直接采用
+    # **用户文本**里能解析出的日期列（真实列名或列别名）才算"用户指定"。
+    # LLM 自己填的日期列不算（见函数 docstring 的两条实测依据）。
+    named = nl_norm.longest_resolvable_column(text, sheet.column_names, COLUMN_ALIASES)
+    if named not in date_cols:
+        named = None
+    if named is not None:
+        col_name = named                        # ① 用户明确指定 -> 严格执行该列
     elif len(date_cols) == 1:
-        col_name = date_cols[0]
+        col_name = date_cols[0]                 # ② 唯一日期列 -> 无歧义
     else:
         # 多日期列、且本轮未指向任何一列：仅当**所有日期列的命中数完全一致**时
         # 才无歧义（例如 8月21日在任何时间列里都没有记录 -> 一致为 0 行）；
@@ -2617,10 +2625,9 @@ def _apply_temporal_repair(
     if sheet is None:
         return [], None
 
-    # 本轮意图已指向的列（LLM 在 baseline 通常会给出 Created Time）
-    preferred = [f.get('column') for f in (getattr(holder, 'filters', None) or [])
-                 if isinstance(f, dict) and f.get('column')]
-    filt, clarify = _temporal_filter_for_message(message, sheet, preferred)
+    # 日期列只由**用户文本**决定：不接受 LLM 自行给出的列
+    # （修正前这里把 LLM 的 filter 列当 preferred 直接采用，导致多日期列表被静默选列）。
+    filt, clarify = _temporal_filter_for_message(message, sheet)
     if clarify is not None:
         return [], clarify
     if filt is None:
