@@ -309,8 +309,10 @@ def test_order_dir_phrasings(text, expected):
 
 
 @pytest.mark.parametrize('text,n,unit', [
-    # 量词决定语义：'group'=分组统计的 top_n，'row'=普通查询的 limit，None=未写量词（交由上下文判定）
-    ('前5个', 5, 'group'), ('前五个', 5, 'group'), ('排名前5', 5, None),
+    # 量词决定语义。**注意实际只有两个有效分支**（见 nl_query 的 topn_unit != 'row' / == 'row'）：
+    #   'row'  = 行级截取（「前N条 / 前N行」）-> 普通查询 limit=N
+    #   非'row'（'group' 或 None）= 统计/排行口径的 top_n（两者行为等价）
+    ('前5个', 5, 'group'), ('前五个', 5, 'group'), ('排名前5', 5, 'group'),
     ('TOP5', 5, None), ('Top 5', 5, None), ('最高的5个', 5, 'group'),
     ('最多的10个', 10, 'group'), ('前十名', 10, 'group'),
     ('前20条', 20, 'row'), ('前五十条', 50, 'row'),

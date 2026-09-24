@@ -439,8 +439,9 @@ def test_filter_column_empty_is_invalid(synth_rep):
 def test_unsupported_operator(synth_rep):
     err = expect_error(synth_rep, {'filters': [{'column': '备注', 'operator': 'like', 'value': 'x'}]},
                        'invalid_operator', 400)
-    # Phase 2 起白名单扩展为 7 个 operator
-    assert err.details['supported'] == ['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'contains']
+    # Phase 2 起白名单扩展为 7 个 operator；2A-P0 新增 date_between（日期区间，仅由 Python 按真实日期列生成）
+    assert err.details['supported'] == [
+        'eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'contains', 'date_between']
     # gt 已是合法 operator，但值必须可数值化
     expect_error(synth_rep, {'filters': [{'column': '备注', 'operator': 'gt', 'value': 'x'}]},
                  'invalid_param', 400)
