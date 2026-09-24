@@ -204,7 +204,7 @@ def test_pipeline_quantity_unit_topn(rep, monkeypatch):
 # 5) A 组回归：无明确指标排名 -> 仍必须澄清（LLM 猜出 Order Amount 也不得执行）
 # ===========================================================================
 @pytest.mark.parametrize('message', [
-    '查看排名前三订单', '排名前三的订单', '哪些订单排名前三',
+    '查看排名前三订单', '排名前三的订单', '前3名订单', '哪些订单排名前三',
     '排名前5的订单', '排行前3的订单', '第1名到第3名订单', '哪几个订单排名最高',
 ])
 def test_no_metric_rank_still_clarifies(message, rep, monkeypatch):
@@ -217,21 +217,38 @@ def test_no_metric_rank_still_clarifies(message, rep, monkeypatch):
 
 
 # ===========================================================================
-# 5b) 「前N名/前N位」= **既有设计**的行级截取（不是本次改动，也不澄清）
-#     证据：名次守卫「仅『前N名/前N位』（无"排名/排行/第"）-> 行级截取 limit=N」分支。
-#     注意：旧 Golden 里它表现为 clarify，是因为 catalog 有多文档歧义
-#     （blank.xlsx / empty.xlsx）先撞上 document clarify，而非名次语义澄清。
+# 5b) 「前N名/前N位」= **排名语义**（A3 修正，2026-09-24）-> 无指标必须澄清
+#     依据：prompt 第 6 条把行级截取定义为「前N条/前N行」；第 13 条与「只要前 N 名而无
+#     第二步汇总 -> action=aggregate」都把「前N名」当排名；analysis 路径对"有 top_n 无
+#     order_by"本来就是澄清。修正前它会降级为「行级截取 limit=N」（返回原始表前 3 行）。
 # ===========================================================================
-def test_first_n_rank_is_row_truncation_by_design(rep, monkeypatch):
+def test_first_n_rank_clarifies_without_metric(rep, monkeypatch):
     guessed = nl.TurnIntent(action=nl.ACTION_AGGREGATE, aggregate=nl.AggregateIntent(
         operation='sum', column='Order Amount', group_by=[], top_n=3))
     out = _run_with_llm_turn(rep, '前3名订单', guessed, monkeypatch, session_key='unit-firstn')
-    # 关键不变量：**不得**执行"猜出来的指标排名"
-    assert not out.get('group_aggregate'), out.get('group_aggregate')
-    assert not ((out.get('aggregate') or {}).get('value')), out.get('aggregate')
-    assert out['turn']['action'] == 'new_query'
-    assert out['turn']['source'] == 'deterministic_rank_first_n'
-    assert (out.get('query') or {}).get('limit') == 3      # 实际执行的是行级截取 limit=3
+    assert out['status'] == 'clarify', out.get('status')
+    assert not out.get('group_aggregate') and not out.get('aggregate')
+
+
+# ===========================================================================
+# 5c) 「前N条 / 前N行」= 行级截取（prompt 第 6 条）-> 必须保持 limit=N 且返回原始顺序行
+# ===========================================================================
+@pytest.mark.parametrize('message', ['前3条订单', '前3行订单'])
+def test_row_truncation_phrases_keep_limit(message, rep, monkeypatch):
+    # 这两种说法按 prompt 第 6 条应产出 new_query + limit=N（这里注入 LLM 的规范答案）
+    ok_turn = nl.TurnIntent(action=nl.ACTION_NEW_QUERY, intent=nl.intent_from_dict({
+        'query_type': nl.INTENT_STRUCTURED, 'filters': [],
+        'columns': ['Order ID', 'Order Amount'], 'limit': 3}))
+    out = _run_with_llm_turn(rep, message, ok_turn, monkeypatch,
+                             session_key='unit-rows-%s' % abs(hash(message)))
+    assert out['status'] == 'ok', (message, out.get('status'), out.get('message'))
+    assert not out.get('group_aggregate'), out.get('group_aggregate')   # 不是聚合/排名
+    assert (out.get('query') or {}).get('limit') == 3
+    res = out['result']
+    names = [c if isinstance(c, str) else (c or {}).get('name') for c in res['columns']]
+    i = names.index('Order Amount')
+    # 原始表前 3 行：10 / 20 / 25（**未排序**；若被误排序会变成 25 / 20 / 15）
+    assert [r[i] for r in res['rows'][:3]] == ['10', '20', '25']
 
 
 # ===========================================================================

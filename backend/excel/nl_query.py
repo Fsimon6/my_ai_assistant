@@ -2459,16 +2459,23 @@ def _guard_rank_semantics(
     catalog: List[Dict[str, Any]],
     signals: Optional['nl_norm.IntentSignals'],
 ) -> Tuple[Optional[TurnIntent], List[str], Optional[Dict[str, Any]]]:
-    """守卫中文名次语义，**绝不允许静默降级为全表 COUNT**。
+    """守卫中文名次语义，**绝不允许静默降级为全表 COUNT / 全表行截取**。
 
     返回 (turn, notes, clarify)：
 
-    1. **显式名次**（「排名 / 排行 / 第N名」）：
-       - 分组维度可确定性解析 -> 分组排行（有度量列用度量，否则 COUNT）+ TOP-N；
-       - 有度量列 -> 按聚合值排行 + TOP-N；
-       - 都没有 -> **澄清**（并给出可排名的数值列候选）。
-    2. **仅「前N名 / 前N位」**（无"排名/排行/第"）：
-       - 视为"取前 N 个"的行级截取 -> 普通查询 limit=N（不要求排序依据）。
+    名次语义统一口径（2A-P0 修正，2026-09-24）：
+    - **排名语义** = 「排名 / 排行 / 第N名 / 第N位 / 前N名 / 前N位」——
+      「名 / 位」天然是名次，**没有排序依据必须澄清**，绝不降级为"取前 N 行"。
+      依据：prompt 第 13 条「order_by / order_dir / top_n 只在用户明确要求排序或前 N 名时填写」；
+      prompt「只要「前 N 名」而没有第二步汇总 -> action=aggregate」；
+      以及 analysis 路径既有的澄清文案「「前 N 名」需要明确的排序依据（例如「金额最高的10个SKU」）」。
+    - **行级截取**只能由「前N条 / 前N行」表达（prompt 第 6 条：
+      「前N条」「前N行」表示 limit=N、offset=0），走普通查询路径，不受本守卫干预。
+
+    分派：
+    1. 分组维度可确定性解析 -> 分组排行（有度量列用度量，否则 COUNT）+ TOP-N；
+    2. 有显式度量列 -> 按聚合值排行 + TOP-N；
+    3. 都没有 -> **澄清**（并给出可排名的数值列候选）。
     """
     text = nl_norm.to_halfwidth(message)
     if not text or signals is None or turn is None:
@@ -2478,8 +2485,9 @@ def _guard_rank_semantics(
     if not (explicit or first_n):
         return turn, [], None
     # O2 收口（证据：实测「哪几个订单排名最高」→ 被 LLM 猜出 Order Amount 后直接执行）：
-    # **显式名次语义本身**就必须受本守卫约束，不要求文本一定带"前N/第N"这种显式 N。
-    # 只有「前N名/前N位」这一支（行级截取）必须有可解析的 N，否则不构造。
+    # **名次语义本身**就必须受本守卫约束，不要求文本一定带"前N/第N"这种显式 N。
+    # 「前N名/前N位」与「排名/排行/第N名」**同属排名语义**（口径见 docstring）：
+    # 2A-P0 修正前它会降级为「行级截取 limit=N」，使「前3名订单」返回原始表前 3 行。
     if first_n and not explicit and signals.top_n is None:
         return turn, [], None
 
@@ -2492,21 +2500,12 @@ def _guard_rank_semantics(
         _steps = getattr(turn.analysis, 'steps', None) or []
         step1 = _steps[0] if _steps else None
 
-    # ---------- 2) 仅「前N名 / 前N位」：行级截取前 N 行 ----------
-    if first_n and not explicit:
-        n = max(1, min(signals.top_n, MAX_NL_LIMIT))
-        payload = {
-            'query_type': INTENT_STRUCTURED,
-            'document': getattr(agg, 'document', None),
-            'sheet': getattr(agg, 'sheet', None),
-            'filters': list(getattr(agg, 'filters', None) or []),
-            'limit': n,
-        }
-        new_intent = intent_from_dict(payload)
-        new_intent.limit_explicit = True
-        ranked = TurnIntent(action=ACTION_NEW_QUERY, intent=new_intent,
-                            source='deterministic_rank_first_n', raw=payload)
-        return ranked, [f'名次语义(前N名) -> 行级截取 limit={n}'], None
+    # ---------- 2b) 已删除：曾把「前N名 / 前N位」降级为"行级截取 limit=N" ----------
+    # 2A-P0 修正（2026-09-24，A3）：该降级与系统自身口径矛盾 ——
+    #   * prompt 第 6 条把**行级截取**定义为「前N条 / 前N行」（不含"名/位"）；
+    #   * prompt 第 13 条与「只要前 N 名而无第二步汇总 -> action=aggregate」都把「前N名」当**排名**；
+    #   * analysis 路径遇到"有 top_n 但无 order_by"时本来就是**澄清**（见本文件 3670 附近）。
+    # 因此「名 / 位」一律按排名语义处理：无排序依据 -> 由下方 clarify / 分组排行 / 指标排行分派。
 
     # ---------- 1b) analysis 轮次：step1 即"排名口径" ----------
     # 实测 bypass（修复前）：「排名前三的订单的总和是多少」-> llm_parse_turn 直接返回
@@ -3969,11 +3968,12 @@ async def _run_nl_query_impl(
     # **之前**。实测 bypass：这三条路径都是先 `_run_analysis_turn(...)` 再 `return`，
     # 因此 2.45 的名次守卫对它们**完全不可见**
     # （「排名前三的订单的总和是多少」曾被 LLM 猜出 Order Amount 后直接执行并返回真实数值）。
-    # 只对 aggregate / analysis 且命中"显式名次"或 analysis 动作的轮次生效，其余动作不动。
+    # 只对 aggregate / analysis 且命中"名次语义"（含「前N名/前N位」，A3 修正）或 analysis 动作的轮次生效。
     if (turn is not None
             and turn.action in (ACTION_AGGREGATE, ACTION_ANALYSIS)
             and (turn.action == ACTION_ANALYSIS
-                 or nl_norm.EXPLICIT_RANK_RE.search(user_message))):
+                 or nl_norm.EXPLICIT_RANK_RE.search(user_message)
+                 or nl_norm.FIRST_N_RANK_RE.search(user_message))):
         _pre_turn, _pre_notes, _pre_clarify = _guard_rank_semantics(
             turn, user_message, catalog, signals)
         if _pre_notes:
@@ -4066,7 +4066,7 @@ async def _run_nl_query_impl(
             if _gclarify is not None:
                 return _gclarify
             if guard_turn.action != ACTION_AGGREGATE:
-                # 名次守卫把统计兜底改写成了别的动作（如「前N名」-> 行级截取）：
+                # 名次守卫把统计兜底改写成了别的动作（例如补出分组排行）：
                 # 放弃本条统计兜底，交给后续统一分派（2.45 会对原 turn 再判一次，幂等）。
                 logger.info('[nl] 统计兜底被 2A-P0 名次守卫改写为 %s，交回统一分派',
                             guard_turn.action)
