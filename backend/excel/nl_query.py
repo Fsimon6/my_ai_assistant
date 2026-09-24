@@ -2611,14 +2611,24 @@ def _apply_temporal_repair(
 
     - 生成前会丢弃 LLM 可能已产出的、指向同一列的旧条件（尤其是 ``contains``），
       避免「time 条件 + 子串条件」叠加；
-    - 文本没有时间语义时什么都不做（保持原路径）。
+    - 文本没有时间语义时什么都不做（保持原路径）；
+    - **analysis（D1/G1 修复）**：真正的数据筛选阶段是第 1 步，故条件落进
+      ``steps[0]['filters']``（第 2 步按设计不允许携带筛选条件）。
     """
     if turn is None:
         return [], None
+    # analysis：实际执行筛选的是第 1 步，条件必须落进 step1 的 filters
+    step1: Optional[Dict[str, Any]] = None
+    holder = None
     if turn.action == ACTION_AGGREGATE and turn.aggregate is not None:
         holder, hint = turn.aggregate, turn.aggregate
     elif turn.action == ACTION_NEW_QUERY and turn.intent is not None:
         holder, hint = turn.intent, turn.intent
+    elif turn.action == ACTION_ANALYSIS and turn.analysis is not None:
+        _steps = getattr(turn.analysis, 'steps', None) or []
+        if not _steps or not isinstance(_steps[0], dict):
+            return [], None
+        step1, hint = _steps[0], turn.analysis
     else:
         return [], None
     _rep, sheet = _resolve_sheet_for_message(hint, catalog)
@@ -2633,11 +2643,38 @@ def _apply_temporal_repair(
     if filt is None:
         return [], None
 
-    kept = [f for f in (getattr(holder, 'filters', None) or [])
-            if (f or {}).get('column') != filt['column']]
-    kept.append(filt)
-    holder.filters = kept
+    if step1 is not None:
+        kept = [f for f in (step1.get('filters') or [])
+                if (f or {}).get('column') != filt['column']]
+        kept.append(filt)
+        step1['filters'] = kept
+    else:
+        kept = [f for f in (getattr(holder, 'filters', None) or [])
+                if (f or {}).get('column') != filt['column']]
+        kept.append(filt)
+        holder.filters = kept
     return [f"时间条件 -> {filt['column']} {filt['value'][0]} ~ {filt['value'][1]}"], None
+
+
+def _apply_temporal_guard_before_execution(
+    turn: TurnIntent, message: str, catalog: List[Dict[str, Any]],
+) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+    """**执行前**的时间语义落点（2A-P0 / D1-G1 修复，2026-09-24）。
+
+    为什么必须存在：``2.3``（确定性升级 / analysis_guard）、``2.35``（统计守卫）、
+    ``2.4``（分析分派）都会在 `_run_*_turn(...)` 之后**立刻 return**，全部位于
+    ``2.45`` 之前 —— 因此 2.45 的时间守卫对这些路径**完全不可见**。
+
+    实测根因（D1/G1）：analysis 的 step1 拿不到 ``date_between``，
+    「8月21日 订单金额最高的前3个SKU的销售额总和是多少」按**全表**执行并返回 106.6
+    （正确行为：落日期条件；日期列无法唯一确定时必须澄清）。
+
+    只做「落日期条件 / 澄清」，**不改写**统计口径与排序口径，可重复调用（幂等）。
+    名次语义**不在这里**处理：它由 2.25（aggregate/analysis 轮次）、各守卫路径自己的
+    `_guard_rank_semantics` 与 2.45 负责 —— 若在这里对 new_query 轮次跑名次守卫，
+    会把「排名前三的物流商」在统计兜底之前错误澄清（实测回归）。
+    """
+    return _apply_temporal_repair(turn, message, catalog)
 
 
 def _execute_aggregate_with_prefix_relaxation(
@@ -3990,6 +4027,23 @@ async def _run_nl_query_impl(
             return _pre_clarify
         turn = _pre_turn
 
+    # ---------- 2.26) 2A-P0 执行前时间语义落点（D1/G1 修复）----------
+    # 为什么在这里：2.3（确定性升级 / analysis_guard）、2.35（统计守卫）、2.4（分析分派）
+    # 都在 `_run_*_turn(...)` 之后**立刻 return**，位置早于 2.45 的时间守卫 ——
+    # 实测根因：「8月21日 订单金额最高的前3个SKU的销售额总和是多少」在 analysis 路径
+    # 丢弃日期、按全表执行并返回 106.6（正确行为：落 date_between 或澄清）。
+    # 同一条绝对日期表达，不论最终是 new_query / aggregate / analysis，都先过这里
+    # （与 2.45 共用同一套函数，故幂等）。
+    # 位置：2.25 之后、2.3 之前；**不做名次判定**（避免抢在统计兜底之前误澄清）。
+    if turn is not None:
+        _pre2_turn_notes, _pre2_turn_clarify = _apply_temporal_guard_before_execution(
+            turn, user_message, catalog)
+        if _pre2_turn_notes:
+            logger.info('[nl] 执行前时间语义（2A-P0 D1/G1）：%s', '; '.join(_pre2_turn_notes))
+            repairs.extend(_pre2_turn_notes)
+        if _pre2_turn_clarify is not None:
+            return _pre2_turn_clarify
+
     # ---------- 2.3) 两步分析兜底（Phase 4A）----------
     # 必须在 analysis / aggregate / new_query 分发**之前**：
     # LLM 可能把「先排行、再对前 N 名汇总」判成 aggregate 或 new_query，
@@ -4034,6 +4088,16 @@ async def _run_nl_query_impl(
             guard_turn = TurnIntent(
                 action=ACTION_ANALYSIS, analysis=guard_analysis, source='analysis_guard',
             )
+            # 2A-P0（D1 修复）：analysis_guard 产出的计划是**第二次 LLM 调用**的结果，
+            # 不会经过 2.26 的时间语义落点，而这里执行后立刻 return —— 必须在此再落一次
+            # （与 2.26/2.45 同一套函数）。否则用户的时间条件不会进入 step1。
+            _ga_notes, _ga_clarify = _apply_temporal_guard_before_execution(
+                guard_turn, user_message, catalog)
+            if _ga_notes:
+                logger.info('[nl] analysis_guard 执行前时间语义（2A-P0 D1）：%s',
+                            '; '.join(_ga_notes))
+            if _ga_clarify is not None:
+                return _ga_clarify
             guard_outcome = _run_analysis_turn(
                 guard_turn, catalog,
                 context=context,
@@ -4063,6 +4127,15 @@ async def _run_nl_query_impl(
             guard_turn = TurnIntent(
                 action=ACTION_AGGREGATE, aggregate=guard_agg, source='statistical_guard',
             )
+            # 2A-P0（D1 修复）：统计守卫的 LLM 结果同样必须**先落时间条件**
+            # （本路径会 `_run_aggregate_turn` 后立刻 return，早于 2.45）。
+            # 实测根因：同一路径既绕过 2.45 的名次规则（O2 已修），也会丢弃用户的时间条件。
+            _gt_notes, _gt_clarify = _apply_temporal_guard_before_execution(
+                guard_turn, user_message, catalog)
+            if _gt_notes:
+                logger.info('[nl] 统计守卫执行前时间语义（2A-P0 D1）：%s', '; '.join(_gt_notes))
+            if _gt_clarify is not None:
+                return _gt_clarify
             # 2A-P0（O2 修复）：统计守卫的 LLM 结果**同样必须**过名次守卫。
             # 否则「查看排名前三订单」会在这里被补出指标（Order Amount）后直接执行成
             # TOP-3，绕过 2.45 的名次语义规则（实测根因：本路径会 return，不再往下走）。
