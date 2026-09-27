@@ -69,12 +69,13 @@ class _FakeLLM:
     """占位 LLM：管线的 LLM 调用点全部被 monkeypatch。"""
 
 
-def _plan(step2_operation: str) -> 'nl.AnalysisIntent':
+def _plan(step2_operation: str, top_n: int = 3,
+          order_dir: str = 'desc') -> 'nl.AnalysisIntent':
     return nl.AnalysisIntent(steps=[
         {'type': excel_multi_step.STEP_GROUP_AGGREGATE, 'group_by': ['SKU ID'],
          'operation': excel_aggregate.OPERATION_SUM, 'column': 'Order Amount',
-         'order_by': excel_aggregate.ORDER_BY_AGGREGATE, 'order_dir': 'desc',
-         'top_n': 3, 'filters': []},
+         'order_by': excel_aggregate.ORDER_BY_AGGREGATE, 'order_dir': order_dir,
+         'top_n': top_n, 'filters': []},
         {'type': excel_multi_step.STEP_AGGREGATE, 'operation': step2_operation,
          'source': excel_multi_step.SOURCE_STEP_1,
          'column': excel_multi_step.INTERMEDIATE_VALUE_COLUMN},
@@ -182,6 +183,79 @@ def test_f1_llm_correct_operation_kept(rep, monkeypatch, text, op, want_val):
     assert out['status'] == nl.STATUS_OK, out.get('message')
     assert _step2_operation(out) == op.upper()
     assert _final_number(out) == pytest.approx(want_val, abs=0.01)
+
+
+# ===========================================================================
+# G-3（最终验收审计）：analysis **step1 的 TOP-N 数量**必须来自用户文本
+#   GT（合成表）：top3 = 30+25+15 = 70；top4/top5 = 75
+# ===========================================================================
+def _step1_message_top_n(out: Dict[str, Any]) -> Optional[int]:
+    """从**执行文案**里读第 1 步实际截取的 N（当 N >= 分组数时文案省略该子句 -> None）。
+
+    注：回传的 ``turn`` 是**LLM 原始计划**；执行用的是经过 user-authority 校正后的
+    ``raw_steps`` 副本，因此以文案 + 数值为准（数值本身可区分 top3 与 top4+）。
+    """
+    m = re.search(r'TOP-(\d+)', str(out.get('message') or ''))
+    return int(m.group(1)) if m else None
+
+
+@pytest.mark.parametrize('text,want_top,want_val', [
+    ('找出金额最高的前3个SKU，并统计它们的总销售额是多少', 3, 70.0),   # plan 给 10
+    ('找出金额最高的前5个SKU，并统计它们的总销售额是多少', 5, 75.0),   # plan 给 3
+])
+def test_g3_analysis_step1_top_n_from_text(rep, monkeypatch, text, want_top, want_val):
+    """G-3：用户文本明确的 N 覆盖 plan.step1.top_n，且**真实结果 == GT**。
+
+    GT：top3 = 30+25+15 = 70；top5 = 全部 4 组 = 75（两者可区分，故数值即证明执行口径）。
+    """
+    llm_top = 10 if want_top == 3 else 3
+    # ① 修复函数级：注入错误 N -> 校正为用户文本的 N
+    assert nl._enforce_user_sort_params(None, llm_top, text, enabled=True)[1] == want_top
+    # ② 端到端：执行文案（若含）+ 数值双证据
+    out = _run(rep, text, _plan(excel_aggregate.OPERATION_SUM, top_n=llm_top), monkeypatch)
+    assert out['status'] == nl.STATUS_OK, out.get('message')
+    assert _step1_message_top_n(out) in (None, want_top)
+    assert _final_number(out) == pytest.approx(want_val, abs=0.01)
+
+
+def test_g3_analysis_step1_order_dir_from_text(rep, monkeypatch):
+    """G-3 补充：第 1 步的排序方向同样以用户文本为准（「最低」-> asc）。"""
+    msg = '找出金额最低的3个SKU，并统计它们的总销售额是多少'
+    _dir, _top, notes = nl._enforce_user_sort_params('desc', 10, msg, enabled=True)
+    assert (_dir, _top) == ('asc', 3)
+    assert notes and notes[0].startswith('排序方向=asc')
+    # 用户未表达方向 -> 原样返回（不改既有默认）
+    assert nl._enforce_user_sort_params(
+        'desc', 3, '找出金额最高的3个SKU，并统计它们的总销售额是多少', enabled=True)[:2] == ('desc', 3)
+    # 语境不成立（无排序/分组）-> 不介入
+    assert nl._enforce_user_sort_params('desc', 3, msg, enabled=False)[:2] == ('desc', 3)
+    # 端到端：plan 给 desc/10，用户说「最低的3个」-> 执行 asc + TOP-3（GT 5+15+25=45）
+    out = _run(rep, msg, _plan(excel_aggregate.OPERATION_SUM, top_n=10, order_dir='desc'),
+               monkeypatch)
+    assert out['status'] == nl.STATUS_OK, out.get('message')
+    assert _step1_message_top_n(out) == 3
+    assert _final_number(out) == pytest.approx(45.0, abs=0.01)
+
+
+# ===========================================================================
+# G-4（analysis 侧）：第 1 步的**排序键**同样必须来自用户文本
+#   实测：文本「金额最高的前3个SKU」而 plan 给 order_by='SKU ID' -> 曾按 SKU 名排序（64.48）
+# ===========================================================================
+def test_g4_analysis_step1_sort_key_from_text(rep, monkeypatch):
+    """G-4：plan 给 order_by='SKU ID'，但文本说的是「金额最高」-> 必须按聚合值排序。"""
+    msg = '找出金额最高的前3个SKU，并统计它们的总销售额是多少'
+    plan = nq_plan_with_sort('SKU ID')
+    out = _run(rep, msg, plan, monkeypatch)
+    assert out['status'] == nl.STATUS_OK, out.get('message')
+    assert 'SKU ID」降序' not in str(out.get('message'))
+    assert _final_number(out) == pytest.approx(70.0, abs=0.01)   # GT: 按金额取 top3 = 30+25+15
+
+
+def nq_plan_with_sort(order_by: str) -> 'nl.AnalysisIntent':
+    """构建 plan 并注入错误的 step1.order_by（模拟 LLM 误判排序键）。"""
+    plan = _plan(excel_aggregate.OPERATION_SUM)
+    plan.steps[0]['order_by'] = order_by
+    return plan
 
 
 # ===========================================================================

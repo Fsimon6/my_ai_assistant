@@ -852,6 +852,66 @@ def parse_simple_filter(
 
 
 # ---------------------------------------------------------------------------
+# 7b) 比较筛选的确定性抽取（后续 2A：LLM 给错 operator 时以用户文本为准）
+# ---------------------------------------------------------------------------
+#: 中文比较词 → operator。**严格对齐既有 operator 语义表**（后端 LLM 提示里已声明的
+#: 支持范围：gt 大于/超过/多于；gte 大于等于/不小于/至少；lt 小于/少于/低于；
+#: lte 小于等于/不大于/至多，以及 > >= < <= 符号）。
+#: ⚠️ 本轮**不扩展**新表述（「不低于 / 不超过 / 高于」等仍交回 LLM），顺序按"长词优先"。
+_COMPARISON_WORDS: Tuple[Tuple[str, str], ...] = (
+    ('大于等于', 'gte'), ('不小于', 'gte'), ('至少', 'gte'), ('>=', 'gte'), ('≥', 'gte'),
+    ('小于等于', 'lte'), ('不大于', 'lte'), ('至多', 'lte'), ('<=', 'lte'), ('≤', 'lte'),
+    ('大于', 'gt'), ('超过', 'gt'), ('多于', 'gt'), ('>', 'gt'), ('＞', 'gt'),
+    ('小于', 'lt'), ('少于', 'lt'), ('低于', 'lt'), ('<', 'lt'), ('＜', 'lt'),
+)
+_COMPARISON_MAP: Dict[str, str] = dict(_COMPARISON_WORDS)
+_COMPARISON_RE = re.compile(
+    r'([A-Za-z0-9_\u4e00-\u9fff]{1,20}?)\s*(?P<w>'
+    + '|'.join(re.escape(k) for k, _ in _COMPARISON_WORDS)
+    + r')\s*(\d+(?:\.\d+)?)'
+)
+
+
+def parse_comparison_filter(
+    message: Any,
+    column_names: Sequence[str],
+    aliases: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """确定性抽取「<列> 大于/小于/… <数字>」比较筛选（**只用既有 operator 语义表内的词**）。
+
+    设计要点（宁可不补，也不猜）：
+    - 只认既有语义表已支持的中文比较词与符号，**不新增表述**；
+    - 列名必须唯一解析到真实列（解析不到的前缀噪声自动跳过：逐起点尝试）；
+    - 片段先按分隔符（且/和/与/，/、/空格）取**紧邻比较词的尾部**，
+      避免「物流商为SF且数量大于3」把前面的「物流商」误当成本条件的列；
+    - 值必须是阿拉伯数字（中文数词不在此处处理）；
+    - 解析出**多个不同列**的比较 → None（不猜，交回 LLM / 澄清）。
+    """
+    text = to_halfwidth(message)
+    if not text or not column_names:
+        return None
+    hits: List[Dict[str, Any]] = []
+    seen_cols: List[str] = []
+    for m in _COMPARISON_RE.finditer(text):
+        frag = (m.group(1) or '').strip()
+        tail = re.split(r'[，,、；;和且与\s]+', frag)[-1] if frag else ''
+        col: Optional[str] = None
+        for cand in ((tail,) if tail else ()) + ((frag,) if frag else ()):
+            col, _cands = resolve_column_deterministic(column_names, cand, aliases)
+            if col is None:
+                col = longest_resolvable_column(cand, column_names, aliases)
+            if col is not None:
+                break
+        if col is None or col in seen_cols:
+            continue
+        seen_cols.append(col)
+        raw = m.group(3)
+        hits.append({'column': col, 'operator': _COMPARISON_MAP[m.group('w')],
+                     'value': float(raw) if '.' in raw else int(raw)})
+    return hits[0] if len(hits) == 1 else None
+
+
+# ---------------------------------------------------------------------------
 # 8) 分组维度列的确定性判定（后续 2A）
 # ---------------------------------------------------------------------------
 #: 分组标记（后面紧跟的一般就是"分组维度"）

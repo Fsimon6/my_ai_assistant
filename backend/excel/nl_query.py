@@ -551,8 +551,17 @@ def _clarify(message: str, candidates: Optional[List[str]] = None, stage: str = 
 def build_validated_query(
     intent: NlIntent,
     rep: WorkbookRepresentation,
+    user_message: str = '',
 ) -> Dict[str, Any]:
-    """把意图草图按真实 schema 校验成 Phase 1B 的 payload。解析失败抛 NlQueryError。"""
+    """把意图草图按真实 schema 校验成 Phase 1B 的 payload。解析失败抛 NlQueryError。
+
+    2A-P1（参数全集扫描）：本函数是 new_query 的**唯一校验边界**，因此两项 user-authority
+    在此落地（与聚合/分析路径共用同一套 helper，不复制逻辑）：
+      * ``columns``（P1-A）：用户文本明确点名查询列时覆盖 LLM 的 columns；
+      * ``filters``（P1-B）：用户明确的 field / operator / value 覆盖 LLM 的同列条件。
+    用户没有明确表达、或解析不安全（不可解析 / 注入样式）-> 保持原值，交给既有校验
+    （无法解析的列仍抛 ``column_ambiguous_or_missing`` -> 上层澄清，绝不"洗白"）。
+    """
     sheet, sheet_candidates = resolve_sheet_nl(rep, intent.sheet)
     if sheet is None:
         raise NlQueryError(
@@ -560,6 +569,24 @@ def build_validated_query(
             f'无法确定要查询哪个 Sheet（候选：{", ".join(sheet_candidates) or "无"}）',
             {'candidates': sheet_candidates},
         )
+
+    # 2A-P1（P1-A）：用户点名列的确定性覆盖。
+    # 安全条件：LLM 现有列必须**本身可解析**才替换；否则保持原值（上层照旧澄清）。
+    _want_columns = _user_columns(user_message, sheet) if user_message else None
+    if _want_columns:
+        _existing_ok = all(resolve_column_nl(sheet, str(n))[0] is not None
+                           for n in (intent.columns or []))
+        if _existing_ok and list(intent.columns or []) != list(_want_columns):
+            logger.info('[nl] 查询列用户语义（2A-P1 P1-A）：%s（LLM 给的是 %s）',
+                        _want_columns, intent.columns or '空')
+            intent.columns = list(_want_columns)
+
+    # 2A-P1（P1-B）：筛选的 field / operator / value 以用户文本为准（同列替换）。
+    if user_message:
+        _uf, _uf_notes = _enforce_user_filters(intent.filters or [], user_message, sheet)
+        if _uf_notes:
+            logger.info('[nl] new_query 筛选用户语义（2A-P1 P1-B）：%s', '; '.join(_uf_notes))
+            intent.filters = _uf
 
     resolved_columns: List[str] = []
     for name in (intent.columns or []):
@@ -2271,12 +2298,14 @@ def _deterministic_rank_metric(text: str, sheet: 'SheetRepresentation') -> Optio
 
 
 def _dimension_column_hint(text: str, norm_text: str, intent: Any,
-                           catalog: List[Dict[str, Any]]) -> Optional[str]:
+                           catalog: List[Dict[str, Any]],
+                           sheet: Optional['SheetRepresentation'] = None) -> Optional[str]:
     """从**维度别名**（物流商 / SKU / 商品 / 城市 …）确定性推导"按什么分组"的列；无则 None。
 
     只认维度别名，**不认度量别名**（金额 / 数量 / 单价）—— 后者是"排什么"，不是"按什么分组"。
     文档未唯一确定时**沿用维度别名**（这里只确定"按什么分组"，绝不猜文件）；
     真实 schema 可解析时以其中的真实列名为准，若该维度列在表中不存在则放弃（不猜）。
+    ``sheet``：调用方**已解析**的 sheet（执行边界用）——给出后不再自行解析文件。
     """
     hit: Optional[str] = None
     for key in sorted(DIMENSION_ALIASES, key=len, reverse=True):
@@ -2286,7 +2315,8 @@ def _dimension_column_hint(text: str, norm_text: str, intent: Any,
             break
     if hit is None:
         return None
-    _rep, sheet = _resolve_sheet_for_message(intent, catalog)
+    if sheet is None:
+        _rep, sheet = _resolve_sheet_for_message(intent, catalog)
     if sheet is None:
         return hit
     return nl_norm.longest_resolvable_column(text, sheet.column_names, DIMENSION_ALIASES)
@@ -2808,6 +2838,416 @@ def _apply_temporal_guard_before_execution(
     return _apply_temporal_repair(turn, message, catalog)
 
 
+def _user_sort_params(message: str) -> Tuple[Optional[str], Optional[int]]:
+    """用户文本**明确**表达的 ``(order_dir, top_n)``；未表达则为 None（不猜、不改既有默认）。
+
+    只复用既有确定性信号 ``nl_norm.detect_signals``：
+      * 方向（比较短语）：``ORDER_ASC_RE``（从低到高 / 升序 / 由小到大 …）-> ``asc``；
+                        ``ORDER_DESC_RE``（从高到低 / 降序 / 由大到小 …）-> ``desc``；
+      * 方向（**极值词**，仅在 TOP-N 语境）：``最低/最小/最少`` -> ``asc``；
+        ``最高/最大/最多`` -> ``desc``。实测（2026-09-27）：「订单金额**最低**的3个订单」
+        在 LLM 未给方向时被 1.56/守卫默认成 ``desc`` —— 执行了**最高的 3 个**（静默反序），
+        而 prompt 既有口径是「订单金额最低的3个物流商 -> order_dir=asc」。
+        限定条件：必须同时有显式 TOP-N 数量（``top_n`` 非空），避免把「金额最大是多少」
+        这类**聚合口径**误当成排序方向。
+      * 数量：``TOPN_RE`` 解析出的显式 N；但 **「前N条 / 前N行」是行级截取**
+        （``topn_unit == 'row'``），不属于统计 TOP-N，故不在此返回（A3 语义保持不变）。
+    """
+    signals = nl_norm.detect_signals(message or '')
+    top_n: Optional[int] = None
+    if signals.top_n is not None and signals.topn_unit != 'row':
+        top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
+    order_dir = signals.order_dir
+    if not order_dir and top_n is not None:
+        text = nl_norm.to_halfwidth(message or '')
+        if nl_norm.TOP_GROUP_MIN_RE.search(text):
+            order_dir = 'asc'
+        elif nl_norm.TOP_GROUP_MAX_RE.search(text):
+            order_dir = 'desc'
+    return order_dir, top_n
+
+
+def _enforce_user_sort_params(
+    order_dir: Optional[str], top_n: Optional[int], message: str, *, enabled: bool,
+) -> Tuple[Optional[str], Optional[int], List[str]]:
+    """**执行前** user-authority：用户已明确的「排序方向 / TOP-N 数量」**覆盖** LLM 参数。
+
+    G-1 / G-2（2026-09-27 最终验收审计，确定性复现）：
+      * 「订单金额从低到高排名前三的物流商」+ LLM ``order_dir=desc`` -> 曾执行 desc（静默错序）；
+      * 「各物流商订单金额前5个」+ LLM ``top_n=3`` -> 曾执行 3（静默少取）。
+
+    只在 ``enabled``（存在排序或分组语境，此时方向/数量才有意义）且用户**明确表达**时覆盖；
+    用户没有表达时**原样返回**，保持既有默认/LLM 行为不变。
+    """
+    if not message or not enabled:
+        return order_dir, top_n, []
+    want_dir, want_top = _user_sort_params(message)
+    notes: List[str] = []
+    if want_dir and order_dir != want_dir:
+        notes.append(f'排序方向={want_dir}（以用户文本为准；LLM 给的是 {order_dir or "空"}）')
+        order_dir = want_dir
+    if want_top is not None and top_n != want_top:
+        notes.append('TOP-N=%s（以用户文本为准；LLM 给的是 %s）'
+                     % (want_top, top_n if top_n is not None else '空'))
+        top_n = want_top
+    return order_dir, top_n, notes
+
+
+#: 「按 <排序键> <排序词>」——用户表达的**排序键**（最小抽取，列解析全部复用既有机制）
+_SORT_KEY_RE = re.compile(
+    r'按\s*([^\s，,。；;：:？?、（）()]{1,24}?)\s*'
+    r'(?:升序|降序|排列|排序|从高到低|从低到高|由大到小|由小到大|递增|递减|倒序|正序)'
+)
+
+
+def _user_sort_key(message: str, sheet: Optional['SheetRepresentation'],
+                   group_by: Sequence[str]) -> Tuple[Optional[str], Optional[str]]:
+    """用户文本**明确**表达的排序键 -> ``(order_by, source)``。
+
+    G-4（2026-09-27 最终扫描，确定性复现）：
+      * 「按物流商**名称**升序排列」+ LLM ``order_by=aggregate_value`` -> 曾按**计数**排序；
+      * 「各物流商按**订单数量**降序排列」+ LLM ``order_by=物流商`` -> 曾按**分组列**排序。
+
+    两类语义**必须区分**（不统一映射成同一字段）：
+      * 排序键是**维度/分组列**（「按物流商名称排序」）-> 返回该列名（执行层会规约成
+        ``group_column_<i>``，即按分组列原文排序）；
+      * 排序键是**度量/聚合结果**（「按订单数量降序」「按订单金额排序」）-> 返回
+        ``ORDER_BY_AGGREGATE``（按聚合值排序）。
+
+    解析只用既有机制（`resolve_column_deterministic` / `longest_resolvable_column` /
+    `COLUMN_ALIASES` / `METRIC_COLUMN_TARGETS` / `_column_is_numeric`）；
+    无法唯一解析、或维度列不在本次分组内 -> ``(None, None)``（保持 LLM/默认行为，不猜）。
+    """
+    if not message or sheet is None:
+        return None, None
+    text = nl_norm.to_halfwidth(message)
+    # ① 「按 <排序键> <排序词>」：排序键可为维度列（按分组列排）或度量列（按聚合值排）
+    m = _SORT_KEY_RE.search(text)
+    if m is not None:
+        frag = m.group(1)
+        col, _cands = nl_norm.resolve_column_deterministic(sheet.column_names, frag,
+                                                           COLUMN_ALIASES)
+        if col is None:
+            # 注意：无命中时 resolve_column_deterministic 会返回"全部列名"作为候选，
+            # 因此这里不能被候选列表误导，必须用"最长唯一可解析"再扫一次。
+            col = nl_norm.longest_resolvable_column(frag, sheet.column_names, COLUMN_ALIASES)
+        if col is not None:
+            if col in METRIC_COLUMN_TARGETS or _column_is_numeric(sheet, col):
+                return excel_aggregate.ORDER_BY_AGGREGATE, 'metric'
+            if col in list(group_by or []):
+                return col, 'dimension'
+            return None, None
+    # ② 「<度量>最高/最低/最大/最小的 N 个 <单位>」= 项目既有排行口径（按聚合值排序）
+    signals = nl_norm.detect_signals(text)
+    if signals.top_n is not None and (
+            nl_norm.TOP_GROUP_MAX_RE.search(text) or nl_norm.TOP_GROUP_MIN_RE.search(text)):
+        if _deterministic_rank_metric(text, sheet) is not None:
+            return excel_aggregate.ORDER_BY_AGGREGATE, 'metric_rank'
+    # ③ 「<度量> + 明确方向」（无「按X」、也无显式 N）：如
+    #    「各物流商订单金额**从高到低**排列」—— N-1（2026-09-27 最终扫描，确定性复现）：
+    #    LLM 给 ``order_by=物流商`` 时曾按**分组列**排序（静默错序）。
+    #    边界：必须有**明确方向词**（ORDER_ASC/DESC）**且**文本唯一解析出度量列；
+    #    故「订单金额最高是多少」这类**聚合口径**（无方向词）不会被误判成排序语义。
+    if signals.order_dir and _deterministic_rank_metric(text, sheet) is not None:
+        return excel_aggregate.ORDER_BY_AGGREGATE, 'metric_dir'
+    return None, None
+
+
+def _enforce_user_sort_key(
+    order_by: Optional[str], message: str, sheet: Optional['SheetRepresentation'],
+    group_by: Sequence[str], *, enabled: bool,
+) -> Tuple[Optional[str], List[str]]:
+    """**执行前** user-authority：用户已明确的**排序键**覆盖 LLM 的 ``order_by``。
+
+    只在 ``enabled``（存在分组语境，排序只作用于分组统计结果）且用户**明确表达**排序键时覆盖；
+    用户没有表达时**原样返回**，保持既有 LLM/默认行为（不做"全部 deterministic"）。
+    """
+    if not enabled:
+        return order_by, []
+    want_key, source = _user_sort_key(message, sheet, group_by)
+    if want_key is None or want_key == order_by:
+        return order_by, []
+    return want_key, [f'排序键={want_key}（{source}；以用户文本为准；LLM 给的是 {order_by or "空"}）']
+
+
+def _enforce_user_metric_column(
+    column: Optional[str], operation: Optional[str], message: str,
+    sheet: Optional['SheetRepresentation'], *, enabled: bool,
+) -> Tuple[Optional[str], List[str]]:
+    """**执行前** user-authority：用户已明确的**统计目标列（metric）**覆盖 LLM 的 ``column``。
+
+    N-2（2026-09-27 最终扫描，确定性复现）：
+      * 「各物流商的订单金额总和」+ LLM ``column=Quantity`` -> 曾执行 ``SUM(Quantity)``
+        （静默按错误指标求值）。
+
+    只在 ``enabled``（**普通数值聚合**：sum / avg / min / max）时生效：
+    文本**唯一**解析出度量列（`_deterministic_rank_metric`）且与 LLM 不同 -> 以文本为准；
+    否则**原样返回**（用户没明确 metric 时保持既有 LLM/默认行为，不做全量 deterministic）。
+
+    **安全条件（不改变既有拒绝语义）**：只有当 LLM 给出的 ``column`` 本身**可解析**
+    （"合法但与文本冲突"，如 Quantity）时才替换。若 LLM 给的是无法解析的值
+    （乱码 / 注入串 `Order Amount; DROP TABLE t` —— 实测 `resolve_column_nl -> None`，
+    `looks_like_injection -> True`），仍交给既有澄清/报错路径，**绝不被本函数"洗白"**
+    成可执行查询。
+
+    为什么 COUNT 不在适用范围：``COUNT(*)`` 不需要数值列（「各物流商分别有多少订单」的
+    既有语义是 COUNT + 分组列，由 `_repair_turn_with_signals` 的"订单数量"判定负责），
+    若在这里把 ``column`` 补成数值列会改变既有口径 —— 故由调用方以
+    ``operation in NUMERIC_OPERATIONS`` 作为 ``enabled``。
+    """
+    if not enabled or not message or sheet is None:
+        return column, []
+    if column:
+        col_ok, _cands = resolve_column_nl(sheet, column)
+        if col_ok is None:
+            return column, []           # 不可解析（含注入串）-> 交给既有澄清路径
+    want = _deterministic_rank_metric(message, sheet)
+    if want is None or want == column:
+        return column, []
+    return want, ['统计目标列=%s（以用户文本为准；LLM 给的是 %s；口径=%s）'
+                  % (want, column or '空', operation)]
+
+
+def _user_operation_from_signals(
+    signals: Optional['nl_norm.IntentSignals'],
+) -> Optional[str]:
+    """用户文本**明确**表达的统计口径 -> operation；歧义 / 未表达 -> None（绝不猜）。
+
+    计数类：「多少 / 几条」等（``signals.count``）；或「订单数量 / 单量」这类条数说法
+    （``signals.order_count_word``，与既有 `_repair_turn_with_signals` 的判定一致）。
+    数值类：「总和 / 之和」「平均 / 平均值」「最大值」「最小值」。
+    同时出现多个**不同**口径（如「订单数量总和」= count 词 + sum 词）-> None（不猜）。
+    """
+    if signals is None:
+        return None
+    numeric = [op for flag, op in (
+        (signals.sum_, excel_aggregate.OPERATION_SUM),
+        (signals.avg, excel_aggregate.OPERATION_AVG),
+        (signals.min_, excel_aggregate.OPERATION_MIN),
+        (signals.max_, excel_aggregate.OPERATION_MAX),
+    ) if flag]
+    countish = bool(signals.count) or bool(signals.order_count_word and not numeric)
+    cands = ([excel_aggregate.OPERATION_COUNT] if countish else []) + numeric
+    uniq = list(dict.fromkeys(cands))
+    return uniq[0] if len(uniq) == 1 else None
+
+
+def _column_values_of(sheet: 'SheetRepresentation', name: str) -> Sequence[Any]:
+    """取某列的全部原始值（供确定性筛选解析使用）。"""
+    col = next((c for c in sheet.columns if c.name == name), None)
+    return sheet.column_values(col.index) if col is not None else []
+
+
+def _user_filters(message: str, sheet: 'SheetRepresentation') -> List[Dict[str, Any]]:
+    """用户文本**明确**表达的筛选条件（确定性、可安全执行）-> 条件列表；无 -> []。
+
+    两个**互补**来源，各自独立安全：
+      * 比较筛选 `parse_comparison_filter`：只用既有 operator 语义表内的词，且值是数字；
+      * 等值/包含 `parse_simple_filter`：值必须**在真实单元格里存在**。
+    同列冲突（例如同时出现「数量为3」与「数量大于3」）时不合并该列，交回既有路径（不猜）。
+    """
+    out: List[Dict[str, Any]] = []
+    comp = nl_norm.parse_comparison_filter(message, sheet.column_names, COLUMN_ALIASES)
+    if comp is not None:
+        out.append(comp)
+    simple = nl_norm.parse_simple_filter(
+        message, sheet.column_names, COLUMN_ALIASES,
+        lambda name: _column_values_of(sheet, name))
+    if simple is not None and not any(f['column'] == simple['column'] for f in out):
+        out.append(simple)
+    return out
+
+
+def _enforce_user_filters(
+    filters: Sequence[Dict[str, Any]], message: str, sheet: 'SheetRepresentation',
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """**执行前** user-authority：用户明确表达的筛选条件覆盖 LLM 的同列条件（field/operator/value）。
+
+    S-E（field/value）与本轮 P1-B（operator）共用这一条边界：
+      * 用户「物流商为SF」-> 同列上的 field/operator/value 全部以文本为准；
+      * 用户「数量大于3」-> 同列的 operator 与 value 以文本为准（LLM 给 lt 也无效）。
+
+    安全条件（§六/§八）：
+      * 同列的 LLM 条件若**本身**非法或带注入样式（operator 不在受支持集合、字段/值含注入）
+        -> 不替换（不"洗白"），仍由既有校验拒绝（`filter_operator_invalid` 等）；
+      * 用户侧条件来自确定性解析器（列必须真实、值必须真实或为数字）-> 才允许覆盖；
+      * 用户没有明确表达 -> 原样返回。
+    """
+    notes: List[str] = []
+    want = _user_filters(message, sheet)
+    if not want:
+        return list(filters), notes
+    kept: List[Dict[str, Any]] = list(filters)
+    for wf in want:
+        same = [f for f in kept if (f or {}).get('column') == wf['column']]
+        _invalid = any(str((f or {}).get('operator') or excel_query.OPERATOR_EQ)
+                       not in excel_query.SUPPORTED_OPERATORS for f in same)
+        tainted = _invalid or any(nl_norm.looks_like_injection(str(f.get('column') or ''))
+                                  or nl_norm.looks_like_injection(str(f.get('value') or ''))
+                                  for f in same)
+        if tainted or same == [wf]:
+            continue
+        notes.append('筛选=%s %s %r（以用户文本为准；LLM 给的是 %s）'
+                     % (wf['column'], wf['operator'], wf['value'],
+                        [((f or {}).get('operator'), (f or {}).get('value')) for f in same] or '空'))
+        kept = [f for f in kept if (f or {}).get('column') != wf['column']]
+        kept.append(dict(wf))
+    return kept, notes
+
+
+#: 「列清单」动词：只有出现这类词才认为用户在**点名要哪些列**
+#: （只用强清单动词；「看一下 / 看看 / 查看」等弱动词不参与，避免误判普通问句）
+_LIST_VERB_RE = re.compile(r'(列出|列一下|列举|列示|显示|展示|返回|输出|导出|给出)')
+
+
+def _user_columns(message: str, sheet: 'SheetRepresentation') -> Optional[List[str]]:
+    """用户文本**明确点名**的查询列（保持文本出现顺序）；无 / 不适用 -> None。
+
+    P1-A（参数全集扫描发现）：文本「列出订单号和物流商」时，LLM 的 ``columns``
+    仍会胜出（静默返回错误列）。此处用既有别名表 + 真实列名做确定性解析。
+
+    适用边界（避免误伤既有语义）：
+      * 必须出现**列清单动词**（列出/显示/返回/…），避免「有哪些订单」这类被误判；
+      * 排行/TOP-N 语境不适用（``signals.top_n`` 或「排名」）；
+      * 至少解析出 1 列；解析出的列必须是真实列（`COLUMN_ALIASES` / 真实列名）。
+    """
+    if not message or sheet is None:
+        return None
+    text = nl_norm.to_halfwidth(message)
+    if not _LIST_VERB_RE.search(text):
+        return None
+    signals = nl_norm.detect_signals(text)
+    if signals.top_n is not None or '排名' in text:
+        return None
+    norm = nl_norm.normalize_name(message)
+    hits: List[Tuple[int, str]] = []
+    for key, target in COLUMN_ALIASES.items():
+        k = nl_norm.normalize_name(key)
+        if not k or target not in sheet.column_names:
+            continue
+        pos = norm.find(k)
+        if pos >= 0:
+            hits.append((pos, target))
+    for name in sheet.column_names:
+        k = nl_norm.normalize_name(name)
+        pos = norm.find(k) if k else -1
+        if pos >= 0:
+            hits.append((pos, name))
+    hits.sort(key=lambda hp: hp[0])
+    ordered: List[str] = []
+    for _pos, col in hits:
+        if col not in ordered:
+            ordered.append(col)
+    return ordered or None
+
+
+def _user_group_column(
+    agg: 'AggregateIntent', message: str, sheet: 'SheetRepresentation',
+    signals: Optional['nl_norm.IntentSignals'], catalog: List[Dict[str, Any]],
+) -> Optional[str]:
+    """用户文本**明确**的分组维度列 -> 列名；无 / 多义 -> None（绝不猜）。
+
+    只用既有确定性解析器（`parse_group_hint`：要求「每个/各/按/分别」标记且跳过数值列；
+    `_dimension_column_hint`：维度别名，如「SKU」-> ``SKU ID``）。
+    两者给出**不同**列 -> None（交给既有澄清路径，不猜）。
+    """
+    if signals is None or not signals.group or sheet is None:
+        return None
+    text = nl_norm.to_halfwidth(message)
+    norm_text = nl_norm.normalize_name(message)
+
+    def _numeric(name: str) -> bool:
+        return _column_is_numeric(sheet, name)
+
+    cands: List[str] = []
+    a = nl_norm.parse_group_hint(message, sheet.column_names, COLUMN_ALIASES, _numeric)
+    if a is not None:
+        cands.append(a)
+    b = _dimension_column_hint(text, norm_text, agg, catalog, sheet=sheet)
+    if b is not None and b not in cands:
+        cands.append(b)
+    return cands[0] if len(cands) == 1 else None
+
+
+def _enforce_user_aggregate_params(
+    agg: 'AggregateIntent', message: str, sheet: Optional['SheetRepresentation'],
+    signals: Optional['nl_norm.IntentSignals'], catalog: List[Dict[str, Any]],
+    *, enforce_operation: bool = True,
+) -> List[str]:
+    """**执行前** user-authority：用户已明确表达的 operation / group_by / filter 覆盖 LLM。
+
+    S-A ~ S-E（2026-09-27 最终扫描，**确定性复现**的静默错误）：
+      * A 文本「各物流商的订单金额**总和**」+ LLM ``operation=avg`` -> 曾执行 AVG；
+      * B 文本「…订单金额**平均值**」+ LLM ``operation=max`` -> 曾执行 MAX；
+      * C 文本「各**物流商**的订单金额总和」+ LLM ``group_by=[SKU ID]`` -> 曾按 SKU 分组；
+      * D 文本「各**SKU**的订单金额总和」+ LLM ``group_by=[物流商]`` -> 曾按物流商分组；
+      * E 文本「**物流商为SF**的订单金额总和」+ LLM ``filters=[物流商 eq JS…]`` -> 曾查 JS。
+    根因：`_repair_aggregate_from_text` 是**只填空**（且要求 ``turn.raw`` 非空），
+    LLM 给出的**冲突值**从不被用户文本校正。
+
+    三个参数**互相独立**地从用户文本解析后覆盖（§三：错误的 LLM operation 不得阻止
+    用户已明确的 metric / group / filter 生效 —— 故调用方在 operation 落地之后才做 metric 判定）。
+
+    边界（避免破坏已封板语义）：
+      * operation 只在**普通聚合口径**语境生效，必须同时满足三个条件，否则一律不动作：
+          ① ``signals.top_n is None``（排行形态里的「最高/最低」是**排名口径**，由
+             `_guard_rank_semantics` 负责 —— 「订单金额最高的前3个订单」必须仍按
+             **SUM(top3)** 回答，B1 封板）；
+          ② 文本**不含「哪个/哪些…」**（``WHICH_RE``）—— 「哪个物流商订单最多？」
+             的「最多」是**选哪个分组**的依据，不是 ``MAX`` 聚合（实测会退化成
+             「MAX 需要指定一个数值列」并错误澄清）；
+          ③ 文本能**唯一解析出度量列**（`_deterministic_rank_metric`）—— 无度量时
+             「最多/最少」不构成数值聚合口径（条数语义由既有 COUNT 规则负责，§八）；
+      * group_by 只在**非 TOP-N** 语境生效（同上，避免与 ranking unit 的 group_by 冲突）——
+        覆盖的正是「各物流商…总和」这类普通分组统计；且**只有当 LLM 给出的分组值本身
+        可解析**时才替换（不可解析 = 乱码 / 注入串 -> 交给既有澄清路径，绝不"洗白"）；
+      * filter 总是生效（最强的用户语义安全边界，§五）；
+      * 用户没有明确表达时**原样保留** LLM 值（不做全量 deterministic）。
+      * ``enforce_operation=False``：analysis 第 1 步专用 —— 追问句里的「平均」通常指
+        **第 2 步**（由 `_repair_analysis_step2_operation` / F1 负责），第 1 步口径由
+        `_repair_analysis_plan_from_text` 校正（实测 A-1 已覆盖）。
+    """
+    notes: List[str] = []
+    if sheet is None or not message:
+        return notes
+    _text = nl_norm.to_halfwidth(message)
+    _which = bool(nl_norm.WHICH_RE.search(_text))
+
+    # ---- ① operation ----
+    if (enforce_operation and signals is not None and signals.top_n is None and not _which
+            and _deterministic_rank_metric(message, sheet) is not None):
+        want_op = _user_operation_from_signals(signals)
+        if want_op is not None and want_op != agg.operation:
+            notes.append('统计口径=%s（以用户文本为准；LLM 给的是 %s）'
+                         % (want_op, agg.operation or '空'))
+            agg.operation = want_op
+            if want_op == excel_aggregate.OPERATION_COUNT and agg.calculation is None:
+                # COUNT 不需要数值列（避免沿用 LLM 的数值列改变既有 COUNT 语义）
+                if agg.column:
+                    notes.append('统计口径=count -> 该口径不使用数值列（原列=%s）' % agg.column)
+                agg.column = None
+
+    # ---- ② group_by ----
+    if signals is not None and signals.top_n is None:
+        # 安全条件：LLM 给的分组值必须**本身可解析**才替换；
+        # 不可解析（乱码 / 注入串）-> 保留原值，交给既有澄清/报错路径（不"洗白"）。
+        _existing_ok = all(resolve_column_nl(sheet, str(name))[0] is not None
+                           for name in (agg.group_by or []))
+        want_group = _user_group_column(agg, message, sheet, signals, catalog) \
+            if _existing_ok else None
+        if want_group is not None and list(agg.group_by or []) != [want_group]:
+            notes.append('分组维度=%s（以用户文本为准；LLM 给的是 %s）'
+                         % (want_group, agg.group_by or '空'))
+            agg.group_by = [want_group]
+
+    # ---- ③ filter（field / operator / value 三者都来自确定性解析）----
+    _new_filters, _filter_notes = _enforce_user_filters(agg.filters or [], message, sheet)
+    if _filter_notes:
+        notes.extend(_filter_notes)
+        agg.filters = _new_filters
+    return notes
+
+
 def _execute_aggregate_with_prefix_relaxation(
     rep: WorkbookRepresentation, payload: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], Any, str, List[str]]:
@@ -2948,6 +3388,23 @@ def _run_aggregate_turn(
                     cands, stage='schema',
                 )
 
+    # ---- 2A-P1：**执行前统一用户语义边界**（operation / metric 列 / group_by / filter）----
+    # 顺序即 §三 的要求：先落 operation，再做 metric 列判定（否则 LLM 的错误 operation 会
+    # 因 `NUMERIC_OPERATIONS` 门槛而阻止用户已明确的 metric 生效）；filter 必须落在
+    # `resolve_filters_nl` **之前**（它是 filter 的最终解析/校验入口）。
+    _sig = nl_norm.detect_signals(user_message)
+    _u_notes = _enforce_user_aggregate_params(agg, user_message, sheet, _sig, catalog)
+    _metric_col, _metric_notes = _enforce_user_metric_column(
+        agg.column, agg.operation, user_message, sheet,
+        enabled=bool(not agg.calculation
+                     and agg.operation in excel_aggregate.NUMERIC_OPERATIONS),
+    )
+    if _metric_notes:
+        _u_notes = list(_u_notes) + list(_metric_notes)
+        agg.column = _metric_col
+    if _u_notes:
+        logger.info('[nl] 用户语义优先（2A-P1）：%s', '; '.join(_u_notes))
+
     # ---- 目标列 / 筛选条件解析 ----
     try:
         resolved_filters = resolve_filters_nl(sheet, (inherited_filters + list(agg.filters)))
@@ -3011,8 +3468,25 @@ def _run_aggregate_turn(
 
     # ---- Phase 3C：排序 / TOP-N（本轮显式给出优先；否则继承上一轮统计的排序） ----
     raw_order_by = agg.order_by or inherited_order_by
-    raw_order_dir = agg.order_dir or inherited_order_dir
-    raw_top_n = agg.top_n if agg.top_n is not None else inherited_top_n
+    # 2A-P1（G-4）：**执行前最终边界** —— 用户文本已明确的**排序键**覆盖 LLM 的 order_by
+    # （维度键 -> 按分组列原文排序；度量键 -> 按聚合值排序）。
+    # 无分组时不介入：排序只作用于分组统计结果（后续 normalize_order_by 会给出明确澄清）。
+    raw_order_by, _key_notes = _enforce_user_sort_key(
+        raw_order_by, user_message, sheet, resolved_group_by,
+        enabled=bool(resolved_group_by),
+    )
+    if _key_notes:
+        logger.info('[nl] 排序键用户语义（2A-P1 G-4）：%s', '; '.join(_key_notes))
+    # 2A-P1（G-1/G-2）：**执行前最终边界** —— 用户文本已明确的排序方向 / TOP-N 数量
+    # 覆盖 LLM 参数（原先只在为空时补，导致 LLM 的冲突值被直接执行）。
+    raw_order_dir, raw_top_n, _sort_notes = _enforce_user_sort_params(
+        agg.order_dir or inherited_order_dir,
+        agg.top_n if agg.top_n is not None else inherited_top_n,
+        user_message,
+        enabled=bool(raw_order_by or resolved_group_by),
+    )
+    if _sort_notes:
+        logger.info('[nl] 排序/TOP-N 用户语义（2A-P1 G-1/G-2）：%s', '; '.join(_sort_notes))
     # 只要有任一排序字段是"继承来的"（本轮未显式给出），就在结果里明确告知用户
     order_inherited = bool(
         (inherited_order_by and not agg.order_by)
@@ -3772,6 +4246,19 @@ def _run_analysis_turn(
     _op_notes = _repair_analysis_step2_operation(raw_steps, user_message)
     if _op_notes:
         logger.info('[nl] 两步分析汇总口径（2A-P1 F1）：%s', '; '.join(_op_notes))
+    # 2A-P1（G-3）：第 1 步的**排序方向 / TOP-N 数量**同样以用户文本为准
+    # （实测：文本「前3个SKU」而 plan 给 top_n=10 -> 曾执行 TOP-10 并返回 267.61，应为 106.6）。
+    if raw_steps and isinstance(raw_steps[0], dict):
+        _s1 = raw_steps[0]
+        _dir1, _top1, _s1_notes = _enforce_user_sort_params(
+            _as_text(_s1.get('order_dir')), _positive_int(_s1.get('top_n')), user_message,
+            enabled=bool(_as_text(_s1.get('order_by')) or _as_str_list(_s1.get('group_by'))),
+        )
+        if _s1_notes:
+            logger.info('[nl] 第 1 步排序/TOP-N 用户语义（2A-P1 G-3）：%s', '; '.join(_s1_notes))
+            _s1['order_dir'] = _dir1
+            if _top1 is not None:
+                _s1['top_n'] = _top1
     try:
         plan = excel_multi_step.normalize_analysis_plan({'steps': raw_steps})
     except excel_query.ExcelQueryError as e:
@@ -3874,6 +4361,46 @@ def _run_analysis_turn(
         if e.code in ('column_ambiguous_or_missing',):
             return _clarify(e.message, e.details.get('candidates'), stage='schema')
         return {'status': STATUS_ERROR, 'message': e.message, 'details': e.details}
+
+    # 2A-P1（G-4）：**执行前最终边界** —— analysis 第 1 步的**排序键**同样以用户文本为准。
+    # 实测：文本「金额最高的前3个SKU」而 plan 给 order_by='SKU ID' -> 曾按 SKU 名排序
+    # （得到 64.48，应为按金额排序的 106.6）。此处需要真实 schema，故放在分组列解析之后。
+    _s1_key, _s1_key_notes = _enforce_user_sort_key(
+        s1.order_by, user_message, sheet, resolved_group,
+        enabled=bool(resolved_group),
+    )
+    if _s1_key_notes:
+        logger.info('[nl] 第 1 步排序键用户语义（2A-P1 G-4）：%s', '; '.join(_s1_key_notes))
+        s1.order_by = _s1_key
+
+    # 2A-P1（S-A~S-E）：**analysis 第 1 步的 operation / metric 列 / group_by / filter
+    # 同样以用户文本为准**。复用聚合路径的同一套 helper（同一边界，不复制日期/口径逻辑），
+    # 覆盖 analysis_guard / 2.3 确定性升级 / 2.4 分派三条入口（都在本函数内收口）。
+    # 实测（确定性注入 §七）：文本「各物流商的订单金额总和是多少」而 plan 给
+    # step1.group_by=['SKU ID'] -> 曾按 SKU 分组执行（静默错分组）。
+    from types import SimpleNamespace
+    _s1_ns = SimpleNamespace(
+        operation=s1.operation, column=resolved_column,
+        group_by=list(resolved_group or []), filters=list(resolved_filters or []),
+        calculation=resolved_calculation,
+        document=getattr(intent, 'document', None), sheet=getattr(intent, 'sheet', None),
+    )
+    _s1_notes = _enforce_user_aggregate_params(
+        _s1_ns, user_message, sheet, nl_norm.detect_signals(user_message), catalog,
+        enforce_operation=False)
+    _s1_col, _s1_col_notes = _enforce_user_metric_column(
+        _s1_ns.column, _s1_ns.operation, user_message, sheet,
+        enabled=bool(not resolved_calculation
+                     and _s1_ns.operation in excel_aggregate.NUMERIC_OPERATIONS),
+    )
+    if _s1_col_notes:
+        _s1_notes = list(_s1_notes) + list(_s1_col_notes)
+    if _s1_notes:
+        logger.info('[nl] 第 1 步用户语义优先（2A-P1 S-A~S-E）：%s', '; '.join(_s1_notes))
+        s1.operation = _s1_ns.operation
+        resolved_column = _s1_col
+        resolved_group = list(_s1_ns.group_by)
+        resolved_filters = list(_s1_ns.filters)
 
     order_by: Optional[str] = None
     order_dir: Optional[str] = None
@@ -4340,6 +4867,7 @@ async def _run_nl_query_impl(
                     user_id=user_id,
                     session_key=session_key,
                     document_override=document_override,
+                    user_message=user_message,
                 )
                 if guard_outcome.get('status') == STATUS_OK:
                     guard_outcome['statistical_guard'] = True
@@ -4438,6 +4966,7 @@ async def _run_nl_query_impl(
                     user_id=user_id,
                     session_key=session_key,
                     document_override=document_override,
+                    user_message=user_message,
                 )
         if turn.action == ACTION_CLARIFY:
             return _clarify(turn.clarification or '请补充要查询的文件、Sheet 或列。', stage='llm')
@@ -4471,7 +5000,7 @@ async def _run_nl_query_impl(
 
     # schema 校验 -> Phase 1B payload
     try:
-        payload = build_validated_query(intent, rep)
+        payload = build_validated_query(intent, rep, user_message=user_message)
     except NlQueryError as e:
         if e.code in ('sheet_ambiguous_or_missing', 'column_ambiguous_or_missing'):
             return _clarify(e.message, e.details.get('candidates'), stage='schema')
