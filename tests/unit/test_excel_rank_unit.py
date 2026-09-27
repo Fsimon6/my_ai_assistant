@@ -301,3 +301,71 @@ def test_d_and_e_plain_queries_not_affected(rep, monkeypatch):
     out2 = _run(rep, 'SF物流商有多少订单', monkeypatch,
                 turn=_new_query_turn(), session_key='e1')
     assert out2['status'] == nl.STATUS_OK
+
+
+# ===========================================================================
+# F2：ranking metric 同样必须来自用户文本（不能被 LLM 覆盖）
+#   GT（合成表）：
+#     sum(Order Amount) by 物流商 = SF 35 / Yanwen Express 40
+#     sum(Quantity)     by 物流商 = SF 3  / Yanwen Express 7
+#     count             by 物流商 = SF 3  / Yanwen Express 2
+#     sum(Order Amount) by SKU    = S1 35 / S2 20 / S3 15
+# ===========================================================================
+def _exec(out):
+    gg = out.get('group_aggregate') or {}
+    return (gg.get('operation'), gg.get('column'), _executed_group(out), _executed_vals(out))
+
+
+@pytest.mark.parametrize('text,llm_col,want_op,want_col,want_group,want_vals', [
+    # F2-1：用户说「订单金额」，LLM 给 Quantity -> 必须 Order Amount
+    ('各物流商订单金额排名前三', 'Quantity', 'sum', 'Order Amount',
+     ['Shipping Provider Name'], [40.0, 35.0]),
+    # F2-2：用户说「订单数量」，LLM 给 Order Amount -> 必须 Quantity
+    ('各物流商订单数量排名前三', 'Order Amount', 'sum', 'Quantity',
+     ['Shipping Provider Name'], [7.0, 3.0]),
+    # F2-3：用户没说指标 -> 保持既有正式默认口径 COUNT（LLM 的 Order Amount 不生效）
+    ('各物流商排名前三', 'Order Amount', 'count', None,
+     ['Shipping Provider Name'], [3, 2]),
+    # F2-4：同上（LLM 给 Quantity）
+    ('各物流商排名前三', 'Quantity', 'count', None,
+     ['Shipping Provider Name'], [3, 2]),
+    # F2-5：C2 已封板形态 -> 保持 COUNT
+    ('排名前三的物流商', 'Order Amount', 'count', None,
+     ['Shipping Provider Name'], [3, 2]),
+    # F2-6：单位级 TOP-N 的指标也必须来自文本
+    ('订单金额最高的前3个SKU', 'Quantity', 'sum', 'Order Amount',
+     ['SKU ID'], [35.0, 20.0, 15.0]),
+])
+def test_f2_ranking_metric_from_text_wins(rep, monkeypatch, text, llm_col,
+                                          want_op, want_col, want_group, want_vals):
+    """F2-1~F2-6：用户文本已表达指标 -> 以文本为准；未表达 -> 既有默认 COUNT。"""
+    out = _run(rep, text, monkeypatch,
+               turn=_agg_turn(['Shipping Provider Name'], column=llm_col,
+                              top_n=3 if '排名' in text else None),
+               session_key='f2-%s-%s' % (text, llm_col))
+    assert out['status'] == nl.STATUS_OK, out.get('message')
+    op, col, group, vals = _exec(out)
+    assert (op, col) == (want_op, want_col), (op, col)
+    assert group == want_group
+    assert vals == want_vals
+
+
+def test_f2_metric_and_unit_both_from_text(rep, monkeypatch):
+    """§12：用户同时明确「单位 + 指标」时，**两个参数**都必须由用户语义决定。"""
+    out = _run(rep, '各物流商订单金额排名前三', monkeypatch,
+               turn=_agg_turn(['SKU ID'], column='Quantity', top_n=3),
+               session_key='f2-both')
+    assert out['status'] == nl.STATUS_OK, out.get('message')
+    op, col, group, vals = _exec(out)
+    assert group == ['Shipping Provider Name']       # 单位由文本决定
+    assert (op, col) == ('sum', 'Order Amount')      # 指标由文本决定
+    assert vals == [40.0, 35.0]
+
+
+def test_f2_ambiguous_metric_clarifies(rep, monkeypatch):
+    """文本出现两个不同统计指标且无法唯一确定 -> clarify（不猜）。"""
+    out = _run(rep, '各物流商订单金额和订单数量排名前三', monkeypatch,
+               turn=_agg_turn(['Shipping Provider Name'], column='Order Amount', top_n=3),
+               session_key='f2-ambig')
+    assert out['status'] == nl.STATUS_CLARIFY
+    assert out.get('stage') == 'order'

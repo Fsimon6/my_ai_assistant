@@ -2207,6 +2207,32 @@ def _column_is_numeric(sheet: 'SheetRepresentation', col_name: str) -> bool:
     return bool(numeric) and len(numeric) * 2 >= len(non_empty)
 
 
+def _has_any_metric_word(norm_text: str) -> bool:
+    """文本里是否出现**任何**度量别名（金额 / 数量 / 税费 / 重量 …）。
+
+    用途：区分"用户没有说要排什么"（-> 沿用既有默认口径 COUNT）与
+    "说了但无法唯一解析"（-> 歧义，必须澄清）。只复用 `COLUMN_ALIASES`，不新增词表。
+    """
+    for key, target in COLUMN_ALIASES.items():
+        if target not in METRIC_COLUMN_TARGETS:
+            continue
+        k = nl_norm.normalize_name(key)
+        if k and k in norm_text:
+            return True
+    return False
+
+
+def _rank_metric_operation(norm_text: str) -> str:
+    """已知排名指标时的聚合口径：文本说「平均」用 avg，其余沿用项目既有口径 sum。
+
+    依据：prompt「「X 金额最高的 N 个 Y」= sum + group_by=[Y] + top_n，**不要用 max**」；
+    「最高/最大」在排行语境里是**排序方向**，不是聚合口径（`_STEP2_OP_RULES` 注释同）。
+    """
+    if re.search(r'平均|均值|平均数', norm_text):
+        return excel_aggregate.OPERATION_AVG
+    return excel_aggregate.OPERATION_SUM
+
+
 def _metric_is_explicit(norm_text: str, column: Optional[str]) -> bool:
     """文本里是否真的出现了**映射到该列的列别名**（即用户确实说到了这个指标）。
 
@@ -2603,6 +2629,18 @@ def _guard_rank_semantics(
         if list(step1.get('group_by') or []) != [unit_col]:
             notes1.append(f'第 1 步排名单位=「{unit_col}」（以用户文本为准）')
         step1['group_by'] = [unit_col]
+        # 2A-P1（F2）：第 1 步的统计指标同样必须来自用户文本。
+        # 保守版：只在文本**明确**给出指标、且计划用的不是计算字段时覆盖。
+        # 注意：**只覆盖 column，不改 operation** —— 第 1 步是"按分组聚合值排行"，
+        # 其口径（sum/avg…）由计划与既有规则决定；实测若在此处按整句推断口径，
+        # 会把第 2 步的「平均」泄漏进第 1 步（avg of avg 会算错，见 F1 回归）。
+        _rep4, sheet4 = _resolve_sheet_for_message(turn.analysis, catalog)
+        step_metric = (_deterministic_rank_metric(text, sheet4)
+                       if sheet4 is not None else None)
+        if step_metric is not None and not step1.get('calculation'):
+            if step1.get('column') != step_metric:
+                notes1.append(f'第 1 步统计指标=「{step_metric}」（以用户文本为准）')
+            step1['column'] = step_metric
         return turn, notes1, None
 
     # ---------- 1) 显式名次：必须有排序依据 ----------
@@ -2636,12 +2674,46 @@ def _guard_rank_semantics(
         if prev_group != [unit_col]:
             notes.append(f'排名单位=「{unit_col}」（以用户文本为准；LLM 给的是 {prev_group or "空"}）')
         agg.group_by = [unit_col]
-        # 分组排行：有度量列用度量，否则用 COUNT（「排名前三的物流商」保持原能力）
-        if not agg.column and not agg.calculation \
-                and agg.operation in excel_aggregate.NUMERIC_OPERATIONS:
-            agg.operation = excel_aggregate.OPERATION_COUNT
+        # ---- 2A-P1（F2）：ranking **metric** 也必须来自用户文本 ----
+        # 实测（2026-09-27）：旧实现只看 group_by，LLM 给 Order Amount / Quantity / 空
+        # 分别会执行 sum(Order Amount) / sum(Quantity) / count —— 同一句话得到不同榜单。
+        _rep3, sheet3 = _resolve_sheet_for_message(agg, catalog)
+        text_metric = (_deterministic_rank_metric(text, sheet3)
+                       if sheet3 is not None else None)
+        if agg.calculation:
+            # 指标是**计算字段**（如「平均单价」）：口径由计算字段校验层负责，这里不介入
+            pass
+        elif text_metric is not None:
+            # 情况 A/B：用户明确说了指标 -> 以文本为准（覆盖 LLM 的指标与口径）
+            if agg.column != text_metric:
+                notes.append(f'排名指标=「{text_metric}」'
+                             f'（以用户文本为准；LLM 给的是 {agg.column or "空"}）')
+            agg.column = text_metric
             agg.calculation = None
-            notes.append('名次语义：无度量列 -> COUNT')
+            want_op = _rank_metric_operation(norm_text)
+            if agg.operation != want_op:
+                notes.append(f'排名指标口径={want_op}'
+                             f'（以用户文本为准；LLM 给的是 {agg.operation}）')
+            agg.operation = want_op
+        elif _has_any_metric_word(norm_text):
+            # 情况 D：文本出现了统计指标但无法唯一解析（如同时说金额与数量）-> 绝不猜
+            cands_m: List[str] = []
+            if sheet3 is not None:
+                cands_m = [c.name for c in sheet3.columns
+                           if _column_is_numeric(sheet3, c.name)][:30]
+            return turn, notes, _clarify(
+                '文本里出现了多个/无法唯一确定的统计指标，请明确按哪一个指标排名。',
+                cands_m, stage='order',
+            )
+        else:
+            # 情况 C：用户没有说要排什么 -> 沿用**既有正式默认口径**：按行数（COUNT）
+            #（与「排名前三的物流商」「哪个物流商订单最多」的既有口径一致）
+            if (agg.column or agg.calculation
+                    or agg.operation != excel_aggregate.OPERATION_COUNT):
+                notes.append('无统计指标 -> COUNT（既有默认口径）')
+            agg.operation = excel_aggregate.OPERATION_COUNT
+            agg.column = None
+            agg.calculation = None
         agg.order_by = excel_aggregate.ORDER_BY_AGGREGATE
         agg.order_dir = agg.order_dir or 'desc'
         if signals.top_n is not None:
@@ -3179,13 +3251,59 @@ _STEP2_OP_RULES: Tuple[Tuple[str, 're.Pattern'], ...] = (
 )
 
 
-def _step2_operation_from_text(message: str) -> str:
-    """从用户原话里确定性推导第 2 步的汇总口径（缺省 sum：能触发多步判定的都是"要总量"的说法）。"""
+def _step2_clause(message: str) -> str:
+    """取消息里的**第 2 步子句**（最后一个连接词之后）；没有连接词时返回整句。
+
+    必要性（实测 2026-09-27）：「找出金额最高的前3个SKU，并统计它们的销售额」里的「最高」
+    只是**第 1 步的排序口径**；若按整句匹配会被误判成第 2 步的 `max`。
+    只复用既有 `nl_norm.MULTI_CONNECT_RE`，不新增语法。
+    """
     text = nl_norm.to_halfwidth(message)
+    last_end = 0
+    for m in nl_norm.MULTI_CONNECT_RE.finditer(text):
+        last_end = m.end()
+    return text[last_end:] if last_end else text
+
+
+def _user_step2_operation(message: str) -> Optional[str]:
+    """用户文本**明确**表达的「第 2 步汇总口径」；没有明确表达时返回 None（不猜、不设默认）。
+
+    复用 `_STEP2_OP_RULES`（与 2.3 确定性升级、F1 修复为**同一套**规则，不复制第二套 parser）；
+    只看第 2 步子句（见 `_step2_clause`），避免把第 1 步的排序词当成汇总口径。
+    """
+    text = _step2_clause(message)
     for op, regex in _STEP2_OP_RULES:
         if regex.search(text):
             return op
-    return excel_aggregate.OPERATION_SUM
+    return None
+
+
+def _step2_operation_from_text(message: str) -> str:
+    """从用户原话里确定性推导第 2 步的汇总口径（缺省 sum：能触发多步判定的都是"要总量"的说法）。"""
+    return _user_step2_operation(message) or excel_aggregate.OPERATION_SUM
+
+
+def _repair_analysis_step2_operation(steps: Optional[List[Dict[str, Any]]],
+                                     message: str) -> List[str]:
+    """F1（2A-P1）：用户文本已明确汇总口径时，**覆盖** step2.operation。
+
+    实测（2026-09-27，离线可确定性复现）：`_repair_analysis_plan_from_text` 只纠正 step1 口径，
+    `multi_step` 校验也不校验 step2.operation，于是：
+      * 用户「…销售额总和是多少」+ LLM `avg` -> 执行 AVG（35.53；正确 SUM 106.6）；
+      * 用户「…销售额平均值是多少」+ LLM `sum` -> 执行 SUM（106.6；正确 AVG 35.53）。
+    这里用**同一套** `_STEP2_OP_RULES` 纠正；用户**没有**明确口径时不动（保持既有行为）。
+    """
+    want = _user_step2_operation(message)
+    if want is None or not steps or len(steps) != 2:
+        return []
+    step2 = steps[1]
+    if not isinstance(step2, dict):
+        return []
+    current = (_as_text(step2.get('operation')) or '').lower()
+    if current == want:
+        return []
+    step2['operation'] = want
+    return [f'第 2 步汇总口径={want}（以用户文本为准；LLM 给的是 {current or "空"}）']
 
 
 def _aggregate_to_analysis_turn(turn: TurnIntent,
@@ -3649,6 +3767,11 @@ def _run_analysis_turn(
             '和第 2 步（对前几名做什么汇总），例如「找出金额最高的10个SKU，并统计它们的总销售额」。',
             stage='analysis',
         )
+    # 2A-P1（F1）：用户文本已明确汇总口径时，覆盖 LLM 可能给错的 step2.operation
+    # （覆盖 analysis_guard / llm_parse_analysis / 2.3 升级**全部**两条执行入口）。
+    _op_notes = _repair_analysis_step2_operation(raw_steps, user_message)
+    if _op_notes:
+        logger.info('[nl] 两步分析汇总口径（2A-P1 F1）：%s', '; '.join(_op_notes))
     try:
         plan = excel_multi_step.normalize_analysis_plan({'steps': raw_steps})
     except excel_query.ExcelQueryError as e:
