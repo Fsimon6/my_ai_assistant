@@ -2461,6 +2461,59 @@ def _temporal_filter_for_message(
 # ============================================================================
 # 2A-P0-B) 中文名次语义守卫（排名前N / 排行前N / 第N名 / 前N名）
 # ============================================================================
+def _user_ranking_unit(text: str, norm_text: str, intent: Any,
+                       catalog: List[Dict[str, Any]]) -> Tuple[Optional[str], List[str]]:
+    """**用户文本**确定的排名单位列（2A-P1：排名单位只能来自用户表达）。
+
+    只复用既有确定性机制，**不新增语法**。返回 ``(column, candidates)``：
+
+      - ``(col, [])``      文本唯一确定排名单位 -> 以文本为准（LLM 的 group_by 仅作候选）；
+      - ``(None, [a, b])`` 文本出现**多个不同**维度 -> 歧义，必须澄清（绝不猜）；
+      - ``(None, [])``     文本没有表达排名单位 -> **不得**采用 LLM 自行给出的 group_by。
+
+    判定顺序：
+      ① ``DIMENSION_ALIASES`` 命中（物流商 / SKU / 商品 / 城市 …），长键优先、去重；
+         ——命中多个不同列即为歧义（如「各物流商的SKU金额排名前三」）。
+      ② ``RANK_UNIT_RE``（「…个 / 的 / 名 / 位 + 订单」）**且**文本存在唯一显式度量
+         （``_deterministic_rank_metric``）—— 即「订单金额最高的前3个订单」；
+         只有单位位置而无度量（「前3名订单」「排名前三的订单」）**不构成**依据
+         （A 组 8/8 必须继续澄清，不能被这里放行）。
+      ③ 真实列名唯一命中，且该列可作维度（**非数值、非日期列**）。
+
+    实测依据（2026-09-27）：对「按订单金额排名前三」三项判定全部为空 ->
+    该句的 group_by 只可能来自 LLM，因此必须澄清而不是执行 LLM 猜出的单位。
+    """
+    if not text or not norm_text:
+        return None, []
+    matched: List[str] = []
+    for key in sorted(DIMENSION_ALIASES, key=len, reverse=True):
+        k = nl_norm.normalize_name(key)
+        if k and k in norm_text:
+            target = DIMENSION_ALIASES[key]
+            if target not in matched:
+                matched.append(target)
+    if len(matched) > 1:
+        return None, matched
+    if len(matched) == 1:
+        return matched[0], []
+
+    _rep, sheet = _resolve_sheet_for_message(intent or _EmptyIntent(), catalog)
+    if sheet is None:
+        return None, []                    # 文档未唯一：不猜（沿用既有文件歧义澄清）
+    unit_match = RANK_UNIT_RE.search(norm_text)
+    if unit_match is not None and _deterministic_rank_metric(text, sheet) is not None:
+        unit_col = next((v for k, v in RANK_UNIT_ALIASES.items()
+                         if nl_norm.normalize_name(k) == unit_match.group(1)), None)
+        if unit_col is not None and unit_col in sheet.column_names:
+            return unit_col, []
+    real = nl_norm.longest_resolvable_column(text, sheet.column_names, DIMENSION_ALIASES)
+    if (real is not None and real in sheet.column_names
+            and real not in _iter_date_columns(sheet)
+            and not _column_is_numeric(sheet, real)):
+        return real, []
+    return None, []
+
+
 def _guard_rank_semantics(
     turn: Optional[TurnIntent],
     message: str,
@@ -2480,17 +2533,23 @@ def _guard_rank_semantics(
     - **行级截取**只能由「前N条 / 前N行」表达（prompt 第 6 条：
       「前N条」「前N行」表示 limit=N、offset=0），走普通查询路径，不受本守卫干预。
 
-    分派：
-    1. 分组维度可确定性解析 -> 分组排行（有度量列用度量，否则 COUNT）+ TOP-N；
-    2. 有显式度量列 -> 按聚合值排行 + TOP-N；
-    3. 都没有 -> **澄清**（并给出可排名的数值列候选）。
+    分派（**2A-P1：排名单位必须来自用户文本**）：
+    1. 文本确定排名单位 -> **以用户文本为准**执行排行（有度量列用度量，否则 COUNT）+ TOP-N；
+       —— LLM 自行给出的 group_by 只作候选，单位不一致时被文本覆盖；
+    2. 文本出现**多个**不同维度 -> 歧义 -> **澄清**（绝不猜）；
+    3. 文本没有表达排名单位 -> **澄清**（LLM 自行给出的 group_by **不作依据**）。
     """
     text = nl_norm.to_halfwidth(message)
     if not text or signals is None or turn is None:
         return turn, [], None
     explicit = bool(nl_norm.EXPLICIT_RANK_RE.search(text))
     first_n = bool(nl_norm.FIRST_N_RANK_RE.search(text))
-    if not (explicit or first_n):
+    # 2A-P1：**显式 N + 极值词**（「…最高的前3个SKU」/「…最多的前3个物流商」）同属 TOP-N 排行，
+    # 也必须过本守卫 —— 否则用户文本里的单位无法覆盖 LLM 自选的 group_by（实测 P9/C1 被 LLM 覆盖）。
+    extremum_topn = (signals.top_n is not None
+                     and bool(nl_norm.TOP_GROUP_MAX_RE.search(text)
+                              or nl_norm.TOP_GROUP_MIN_RE.search(text)))
+    if not (explicit or first_n or extremum_topn):
         return turn, [], None
     # O2 收口（证据：实测「哪几个订单排名最高」→ 被 LLM 猜出 Order Amount 后直接执行）：
     # **名次语义本身**就必须受本守卫约束，不要求文本一定带"前N/第N"这种显式 N。
@@ -2508,6 +2567,10 @@ def _guard_rank_semantics(
         _steps = getattr(turn.analysis, 'steps', None) or []
         step1 = _steps[0] if _steps else None
 
+    # 2A-P1：排名单位只认**用户文本**（LLM 的 group_by 只能作候选）
+    unit_col, unit_cands = _user_ranking_unit(
+        text, norm_text, agg if agg is not None else turn.analysis, catalog)
+
     # ---------- 2b) 已删除：曾把「前N名 / 前N位」降级为"行级截取 limit=N" ----------
     # 2A-P0 修正（2026-09-24，A3）：该降级与系统自身口径矛盾 ——
     #   * prompt 第 6 条把**行级截取**定义为「前N条 / 前N行」（不含"名/位"）；
@@ -2521,18 +2584,26 @@ def _guard_rank_semantics(
     # 补齐 step1 后直接 _run_analysis_turn 并 return，**完全绕过本守卫**（返回了真实数值）。
     # 这里统一拦住：无显式指标且无分组维度 -> 澄清（不改写计划；有依据则原样放行）。
     if step1 is not None:
-        col1 = step1.get('column') or step1.get('calculation')
-        grp1 = step1.get('group_by') or []
-        if grp1 or _metric_is_explicit(norm_text, col1):
-            return turn, [], None
-        cands1: List[str] = []
-        _r1, _s1 = _resolve_sheet_for_message(_EmptyIntent(), catalog)
-        if _s1 is not None:
-            cands1 = [c.name for c in _s1.columns if _column_is_numeric(_s1, c.name)][:30]
-        return turn, [], _clarify(
-            '需要明确按什么字段排名（例如「按订单金额排名前三的订单」「订单最多的前3个物流商」）。',
-            cands1, stage='order',
-        )
+        # 2A-P1：step1 的排名单位同样必须来自用户文本（LLM 自行给的 step1.group_by 不作依据）。
+        if unit_cands:
+            return turn, [], _clarify(
+                '文本里出现多个可能的排名维度（%s），请明确按哪一个排名。' % '、'.join(unit_cands),
+                list(unit_cands), stage='order',
+            )
+        if unit_col is None:
+            cands1: List[str] = []
+            _r1, _s1 = _resolve_sheet_for_message(_EmptyIntent(), catalog)
+            if _s1 is not None:
+                cands1 = [c.name for c in _s1.columns if _column_is_numeric(_s1, c.name)][:30]
+            return turn, [], _clarify(
+                '需要明确按什么字段排名（例如「按订单金额排名前三的订单」「订单最多的前3个物流商」）。',
+                cands1, stage='order',
+            )
+        notes1: List[str] = []
+        if list(step1.get('group_by') or []) != [unit_col]:
+            notes1.append(f'第 1 步排名单位=「{unit_col}」（以用户文本为准）')
+        step1['group_by'] = [unit_col]
+        return turn, notes1, None
 
     # ---------- 1) 显式名次：必须有排序依据 ----------
     if agg is None:
@@ -2549,18 +2620,22 @@ def _guard_rank_semantics(
         )
 
     notes: List[str] = []
-    # 分组维度只认**维度别名**（物流商/SKU/商品/城市…），**不认度量别名**（金额/数量/单价…）：
-    # 后者回答的是"排什么"，不是"按什么分组"。实测依据：
-    #   * 「排名前三的物流商」-> 维度别名命中 -> 分组排行（保持原能力）；
-    #   * 「按订单金额排名前三」/「按数量排名前三」-> 只命中度量别名 -> **不得**当作分组维度
-    #     （曾误入分组排行，执行了一次没有分组依据的聚合）；
-    #   * 「查看排名前三订单」->「订单」不是维度别名 -> 澄清（O2 缺陷不会再回来）。
-    # 注意：**不能**直接信任 agg.group_by —— LLM 会给「查看排名前三订单」填出
-    # group_by=Order ID，那正是 O2 缺陷的来源。
-    group_hint = _dimension_column_hint(text, norm_text, agg, catalog)
-
-    if group_hint is not None:
-        agg.group_by = agg.group_by or [group_hint]
+    # ---------- 2A-P1：排名单位只认**用户文本** ----------
+    # 实测（2026-09-27）旧实现只看 `agg.group_by` 真值 -> LLM 自行给出 group_by 时
+    # 「按订单金额排名前三」被直接执行（7 次采样 1 次 ok / 6 次 clarify，全由 LLM 决定）；
+    # 另一面是文本已明确单位（物流商 / SKU）时 LLM 的单位反而胜出
+    # （旧写法 `agg.group_by or [group_hint]` 只在为空时补）。
+    # 现在统一：单位来自文本才执行，且**以文本为准**；无单位 / 多义 -> 澄清。
+    if unit_cands:
+        return turn, notes, _clarify(
+            '文本里出现多个可能的排名维度（%s），请明确按哪一个排名。' % '、'.join(unit_cands),
+            list(unit_cands), stage='order',
+        )
+    if unit_col is not None:
+        prev_group = list(agg.group_by or [])
+        if prev_group != [unit_col]:
+            notes.append(f'排名单位=「{unit_col}」（以用户文本为准；LLM 给的是 {prev_group or "空"}）')
+        agg.group_by = [unit_col]
         # 分组排行：有度量列用度量，否则用 COUNT（「排名前三的物流商」保持原能力）
         if not agg.column and not agg.calculation \
                 and agg.operation in excel_aggregate.NUMERIC_OPERATIONS:
@@ -2571,29 +2646,13 @@ def _guard_rank_semantics(
         agg.order_dir = agg.order_dir or 'desc'
         if signals.top_n is not None:
             agg.top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
-            notes.append(f'名次语义 -> 分组排行 TOP-{agg.top_n}')
+            notes.append(f'名次语义 -> 排行 TOP-{agg.top_n}')
         else:
-            notes.append(f'名次语义 -> 分组排行（沿用原 top_n={agg.top_n}）')
+            notes.append(f'名次语义 -> 排行（沿用原 top_n={agg.top_n}）')
         return turn, notes, None
 
-    # 指标排行：「度量列由文本显式给出」**且**「排行榜有分组维度」才成立。
-    #   * 度量列必须命中真实列别名（LLM 自行填的 Order Amount 不算）；
-    #   * 数量词（几个/多少/几笔）不算指标 —— 实测「哪几个订单排名最高」曾被误判；
-    #   * 没有分组维度时 order_by=aggregate_value 无意义（单值聚合无"排行"可言），
-    #     此时应澄清而不是执行一个无依据的 TOP-N。
-    if ((agg.column or agg.calculation)
-            and agg.group_by
-            and _metric_is_explicit(norm_text, agg.column)):
-        agg.order_by = excel_aggregate.ORDER_BY_AGGREGATE
-        agg.order_dir = agg.order_dir or 'desc'
-        if signals.top_n is not None:
-            agg.top_n = max(1, min(signals.top_n, MAX_NL_LIMIT))
-            notes.append(f'名次语义 -> 指标排行 TOP-{agg.top_n}')
-        else:
-            notes.append(f'名次语义 -> 指标排行（沿用原 top_n={agg.top_n}）')
-        return turn, notes, None
-
-    # 无分组维度、无度量列 -> **澄清**（禁止降级为无排序的全表 COUNT）
+    # 文本没有表达排名单位 -> **澄清**：不接受 LLM 自行给出的 group_by，
+    # 也不降级为无排序的全表 COUNT（并给出可排名的数值列候选）。
     cands: List[str] = []
     _rep2, sheet2 = _resolve_sheet_for_message(agg, catalog)
     if sheet2 is not None:
