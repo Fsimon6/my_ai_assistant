@@ -1,11 +1,12 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 import json
 import os
 import logging
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 
 from backend.config.settings import settings
 from backend.services.rag_service import get_rag_service
@@ -720,6 +721,242 @@ async def aggregate_excel_document(
         raise HTTPException(status_code=500, detail=f'Excel 统计失败：{str(e)}')
 
 
+# ============================================================================
+# 第 3 项「结果与可解释性」：Excel 历史快照（assistant 消息的 meta_info['excel']）
+# ============================================================================
+#: 历史快照 schema 版本：前端按版本号决定能否恢复卡片；未知版本 -> 回退纯文字展示
+EXCEL_HISTORY_SCHEMA_VERSION = 1
+
+#: 历史快照里每类结果保留的最大行数（与 NL 查询的 limit 上限一致，不额外凭空收紧）。
+#: 超出时截断并置 history_truncated=True，前端必须显式提示，绝不假装结果完整。
+EXCEL_HISTORY_MAX_ROWS = 500
+
+_RESULT_KEYS = ('offset', 'limit', 'returned_count', 'total_matches', 'total_rows_in_sheet',
+                'has_more', 'next_offset', 'sheet_index', 'sheet_name')
+_AGG_KEYS = ('operation', 'operation_label', 'column', 'column_index', 'column_letter',
+             'column_numeric_in_sheet', 'value', 'value_display', 'matched_rows', 'numeric_rows',
+             'empty_rows', 'non_numeric_rows', 'total_rows_in_sheet', 'row_excel_spans',
+             'sheet_index', 'sheet_name', 'definition')
+_GROUP_KEYS = ('kind', 'operation', 'operation_label', 'column', 'column_index', 'column_letter',
+               'column_numeric_in_sheet', 'total_groups', 'returned_groups', 'top_n', 'order_by',
+               'order_by_column', 'order_by_label', 'order_dir', 'order_dir_label', 'sorted',
+               'sort_description', 'truncated_by_top_n', 'matched_rows', 'total_rows_in_sheet',
+               'row_excel_spans', 'sheet_index', 'sheet_name', 'definition')
+_STEP_KEYS = _GROUP_KEYS + ('type', 'source', 'source_text', 'input_rows')
+_ROW_KEYS = ('group_key', 'group_display', 'value', 'value_display', 'matched_rows',
+             'numeric_rows', 'empty_rows', 'non_numeric_rows', 'group')
+_MULTISTEP_KEYS = ('kind', 'engine', 'filename', 'sheet_index', 'sheet_name', 'definition',
+                   'max_steps', 'step_count', 'value', 'value_display')
+
+
+def _json_safe(value: Any) -> Any:
+    """把任意结果递归转换成**标准 JSON 可序列化**的值（绝不使用 pickle / eval / repr）。"""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if hasattr(value, 'item'):          # numpy 标量（若有）
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            pass
+    return str(value)
+
+
+def _history_columns(columns: Any) -> List[Dict[str, Any]]:
+    """列清单 / 分组列的展示所需子集（保留 dtype / 列字母等解释性字段）。"""
+    out: List[Dict[str, Any]] = []
+    for col in (columns or []):
+        if not isinstance(col, dict):
+            continue
+        out.append({k: col.get(k) for k in
+                    ('name', 'index', 'excel_column', 'excel_column_letter', 'dtype',
+                     'semantic_type', 'non_empty', 'null_count', 'header_row_excel')
+                    if k in col})
+    return out
+
+
+def _history_filters(filters: Any) -> List[Dict[str, Any]]:
+    """筛选条件子集（前端 formatFilters 依赖 column/resolved_column/operator/value）。"""
+    out: List[Dict[str, Any]] = []
+    for f in (filters or []):
+        if not isinstance(f, dict):
+            continue
+        out.append({k: f.get(k) for k in ('column', 'resolved_column', 'operator', 'value')
+                    if k in f})
+    return out
+
+
+def _cap_rows(rows: Any) -> tuple:
+    """按上限截断行（返回 (rows, truncated)）。"""
+    items = list(rows or [])
+    if len(items) > EXCEL_HISTORY_MAX_ROWS:
+        return items[:EXCEL_HISTORY_MAX_ROWS], True
+    return items, False
+
+
+def _history_group_rows(rows: Any) -> tuple:
+    capped, truncated = _cap_rows(rows)
+    return ([{k: r.get(k) for k in _ROW_KEYS if isinstance(r, dict) and k in r}
+             for r in capped], truncated)
+
+
+def _history_step_payload(step: Any) -> tuple:
+    """第 1 步 / 第 2 步的展示子集（含分组列、行、排序/TOP-N、来源与口径）。"""
+    if not isinstance(step, dict):
+        return None, False
+    rows, truncated = _history_group_rows(step.get('rows'))
+    payload = {k: step.get(k) for k in _STEP_KEYS if k in step}
+    payload['group_by'] = _history_columns(step.get('group_by'))
+    payload['rows'] = rows
+    payload['applied_filters'] = _history_filters(
+        step.get('applied_filters') or step.get('filters'))
+    payload['filters'] = _history_filters(step.get('filters'))
+    if 'calculation' in step:
+        payload['calculation'] = step.get('calculation')
+    return payload, truncated
+
+
+def build_excel_history_snapshot(outcome: Any) -> Optional[Dict[str, Any]]:
+    """把一次 Excel 查询的**展示所需**结构化结果整理为历史快照（versioned / JSON-safe）。
+
+    ⚠️ 白名单提取，**绝不**把整个 outcome 原样落库。明确排除：
+      * new_context / new_aggregate_context / new_analysis_context（实时执行状态，历史只读展示）；
+      * intent / turn / statistical_guard 等内部解析细节；
+      * 任何 provider / model 密钥、prompt、原始报文。
+
+    返回 None 表示本轮没有可展示的结构化结果（澄清 / 报错 / not_excel）→ 不写该键，
+    历史消息保持纯文字摘要（旧历史即此行为）。
+    """
+    if not isinstance(outcome, dict):
+        return None
+    kind = ''
+    payload: Optional[Dict[str, Any]] = None
+    truncated = False
+
+    r = outcome.get('result')
+    a = outcome.get('aggregate')
+    g = outcome.get('group_aggregate')
+    m = outcome.get('multi_step')
+    if r is not None:
+        kind = 'result'
+        rows, truncated = _cap_rows(r.get('rows'))
+        payload = {k: r.get(k) for k in _RESULT_KEYS if k in r}
+        payload['columns'] = _history_columns(r.get('columns'))
+        payload['rows'] = rows
+        payload['row_excel_numbers'] = list(r.get('row_excel_numbers') or [])[:len(rows)] \
+            if truncated else list(r.get('row_excel_numbers') or [])
+        payload['row_ranges'] = list(r.get('row_ranges') or [])[:len(rows)] \
+            if truncated else list(r.get('row_ranges') or [])
+        payload['applied_filters'] = _history_filters(
+            r.get('applied_filters') or r.get('filters'))
+        payload['filters'] = _history_filters(r.get('filters'))
+        for k in ('calculation', 'calc_filter'):
+            if k in r:
+                payload[k] = r.get(k)
+    elif a is not None:
+        kind = 'aggregate'
+        payload = {k: a.get(k) for k in _AGG_KEYS if k in a}
+        payload['row_excel_numbers'] = list(a.get('row_excel_numbers') or [])[
+            :EXCEL_HISTORY_MAX_ROWS]
+        payload['applied_filters'] = _history_filters(a.get('applied_filters') or a.get('filters'))
+        payload['filters'] = _history_filters(a.get('filters'))
+        if 'calculation' in a:
+            payload['calculation'] = a.get('calculation')
+    elif g is not None:
+        kind = 'group_aggregate'
+        rows, truncated = _history_group_rows(g.get('rows'))
+        payload = {k: g.get(k) for k in _GROUP_KEYS if k in g}
+        payload['group_by'] = _history_columns(g.get('group_by'))
+        payload['rows'] = rows
+        payload['row_excel_numbers'] = list(g.get('row_excel_numbers') or [])[
+            :EXCEL_HISTORY_MAX_ROWS]
+        payload['applied_filters'] = _history_filters(g.get('applied_filters') or g.get('filters'))
+        payload['filters'] = _history_filters(g.get('filters'))
+        if 'calculation' in g:
+            payload['calculation'] = g.get('calculation')
+    elif m is not None:
+        kind = 'multi_step'
+        s1, t1 = _history_step_payload(m.get('step1'))
+        s2, _t2 = _history_step_payload(m.get('step2'))
+        payload = {k: m.get(k) for k in _MULTISTEP_KEYS if k in m}
+        payload['step1'] = s1
+        payload['step2'] = s2
+        payload['step2_input_values'] = list(m.get('step2_input_values') or [])[
+            :EXCEL_HISTORY_MAX_ROWS]
+        plan = m.get('plan') if isinstance(m.get('plan'), dict) else None
+        if plan is not None:
+            payload['plan'] = {
+                'max_steps': plan.get('max_steps'),
+                'steps': [{k: s.get(k) for k in
+                           ('type', 'operation', 'column', 'group_by', 'order_by', 'order_dir',
+                            'top_n') if isinstance(s, dict) and k in s}
+                          for s in (plan.get('steps') or [])],
+            }
+        truncated = bool(t1)
+    if payload is None:
+        return None
+
+    doc = outcome.get('document') if isinstance(outcome.get('document'), dict) else {}
+    sh = outcome.get('sheet') if isinstance(outcome.get('sheet'), dict) else {}
+    snapshot = {
+        'schema_version': EXCEL_HISTORY_SCHEMA_VERSION,
+        'kind': kind,
+        'document': {
+            'document_id': doc.get('document_id') or payload.get('document_id'),
+            'filename': doc.get('filename') or payload.get('filename'),
+        },
+        'sheet': {
+            'sheet_index': sh.get('sheet_index', payload.get('sheet_index')),
+            'sheet_name': sh.get('sheet_name') or payload.get('sheet_name'),
+        },
+        'engine': outcome.get('engine'),
+        'inherited_from': outcome.get('inherited_from', ''),
+        'relaxed_filters': list(outcome.get('relaxed_filters') or []),
+        'continued': bool(outcome.get('continued', False)),
+        'history_truncated': bool(truncated),
+        'payload': payload,
+    }
+    return _json_safe(snapshot)
+
+
+def build_excel_turn_meta(snapshot: Any) -> Dict[str, Any]:
+    """Excel 轮次的 meta_info 组装（``source`` 恒为 ``'excel'``）。
+
+    ⚠️ 契约（2026-09-28 修复双层包裹）：
+      * ``snapshot`` 必须是 ``build_excel_history_snapshot(outcome)`` 的返回值**本体**
+        （即 ``{schema_version, kind, document, sheet, payload, …}``）；
+      * 调用方**不得**再自行包一层 ``{'excel': snapshot}`` —— 包装只在本函数做一次；
+      * 传入 ``None`` -> meta 只有 ``source``（旧历史行为，前端回退纯文字）。
+    """
+    meta: Dict[str, Any] = {'source': SOURCE_EXCEL}
+    if snapshot:
+        meta['excel'] = snapshot
+    return meta
+
+
+def persist_excel_turn(conv_id: Optional[int], role: str, content: str, model: str,
+                       snapshot: Any = None) -> None:
+    """写入一条 Excel 表格查询对话记录（**生产唯一写入口**，端点与契约测试共用）。
+
+    ``snapshot`` 语义同上：快照本体，包装由 ``build_excel_turn_meta`` 统一完成。
+    任何失败只记日志、绝不冒泡（保存失败不得影响查询响应）。
+    """
+    if conv_id is None or not content:
+        return
+    try:
+        conversation_service.append_message(
+            conv_id, role, content, model, meta_info=build_excel_turn_meta(snapshot))
+    except Exception as pe:
+        logger.warning('保存表格查询对话记录失败（忽略）：%s', pe)
+
+
 class ExcelNlQueryRequest(BaseModel):
     """自然语言表格查询请求体（Phase 1C + 1D）
 
@@ -853,22 +1090,24 @@ async def excel_nl_query(
         if status != 'not_excel':
             conv_id = _resolve_rag_conversation_id(req.character_id, current_user.id)
 
-            def _persist_excel_turn(role: str, content: str) -> None:
-                """写入一条表格查询对话记录（来源标记 = excel）；
-                任何失败只记日志，绝不冒泡。
-                该标记使普通聊天链路可通过 exclude_sources 整轮丢弃表格轮次。"""
-                if conv_id is None or not content:
-                    return
-                try:
-                    conversation_service.append_message(
-                        conv_id, role, content, effective_model,
-                        meta_info={'source': SOURCE_EXCEL},
-                    )
-                except Exception as pe:
-                    logger.warning('保存表格查询对话记录失败（忽略）：%s', pe)
+            def _persist_excel_turn(role: str, content: str, snapshot: Any = None) -> None:
+                """端点内的薄封装：委托 ``persist_excel_turn``（生产唯一写入口）。
+
+                ``snapshot`` = ``build_excel_history_snapshot(outcome)`` 的**本体**；
+                包装成 ``meta_info['excel']`` 只由 ``build_excel_turn_meta`` 做一次
+                （2026-09-28 修复：此处曾多包一层 ``{'excel': …}``，导致落库双层包裹、
+                历史卡片无法恢复）。``source='excel'`` 保持不变，普通聊天链路
+                仍可经 ``exclude_sources`` 整轮丢弃表格轮次。"""
+                persist_excel_turn(conv_id, role, content, effective_model, snapshot)
 
             _persist_excel_turn('user', message)
-            _persist_excel_turn('assistant', outcome.get('message') or '（表格查询完成）')
+            try:
+                _history_snapshot = build_excel_history_snapshot(outcome)
+            except Exception as se:            # 快照构建失败绝不影响查询响应
+                _history_snapshot = None
+                logger.warning('构建 Excel 历史快照失败（忽略）：%s', se)
+            _persist_excel_turn('assistant', outcome.get('message') or '（表格查询完成）',
+                                _history_snapshot)
 
         return {
             'success': True,

@@ -598,6 +598,8 @@ import type {
 import FileUploader from '@/components/chat/FileUploader.vue'
 import type { Character, SpeakResponse } from "@/types/character"
 import { useStreamingChat } from '@/composables/useStreamingChat'
+// 第 3 项「结果与可解释性」：历史消息的结构化结果恢复（复用本文件既有的 4 个 builder）
+import { restoreExcelHistory } from './excelHistory'
 
 const route = useRoute()
 const router = useRouter()
@@ -715,7 +717,19 @@ const loadHistory = async () => {
         .map((m: any) => ({
           role: m.role,
           content: m.content,
-          timestamp: m.created_at || new Date().toISOString()
+          timestamp: m.created_at || new Date().toISOString(),
+          // 第 3 项「结果与可解释性」：新 Excel 历史消息 -> 从 meta_info['excel'] 恢复结构化卡片。
+          // 旧历史 / 普通 chat / RAG（无 excel 快照）-> restoreExcelHistory 返回 {}，
+          // 保持原有纯文字渲染。**只读展示**：不恢复 excelSessionId / 查询或分页上下文，
+          // 实时执行状态与历史展示严格分离（历史消息不具备「下一页」等实时能力）。
+          ...(m.role === 'assistant'
+            ? restoreExcelHistory(m.meta_info, {
+              buildExcelTable,
+              buildExcelAgg,
+              buildGroupAgg,
+              buildMultiStep
+            })
+            : {})
         }))
     } else {
       // 无历史：显示欢迎语（不重复）
