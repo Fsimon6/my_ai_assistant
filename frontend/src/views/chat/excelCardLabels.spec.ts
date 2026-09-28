@@ -3,7 +3,13 @@
  * 离线、无网络；只验证文案规则与"旧快照缺字段时优雅降级"。
  */
 import { describe, expect, it } from 'vitest'
-import { groupRelaxedLabel, multiStepSpanLabel, multiStepStep2InputLabel } from './excelCardLabels'
+import {
+  groupRelaxedLabel,
+  multiStepSpanLabel,
+  multiStepStep2InputLabel,
+  multiStepStep2SourceLabel,
+  tableRowRangeLabel
+} from './excelCardLabels'
 
 describe('G1 multiStepSpanLabel', () => {
   it('有真实行区间 -> 复用分组卡片的既有格式', () => {
@@ -44,6 +50,66 @@ describe('G2 multiStepStep2InputLabel', () => {
   it('连 input_rows 都没有 -> 空串', () => {
     expect(multiStepStep2InputLabel({})).toBe('')
     expect(multiStepStep2InputLabel(undefined)).toBe('')
+  })
+})
+
+describe('R1 tableRowRangeLabel（本页行号语义）', () => {
+  const page = (offset: number, nums: number[], returned = nums.length, total = 19, limit = 5) => ({
+    row_excel_numbers: nums, offset, returned_count: returned, total_matches: total, limit
+  })
+
+  it('第一页：明确写「本页 Excel 行号」', () => {
+    expect(tableRowRangeLabel(page(0, [3, 4, 5, 6, 7])))
+      .toBe('本页 Excel 行号 3 ~ 7｜共命中 19 行，本次返回 5 行（第 1~5 条，offset=0, limit=5）')
+  })
+
+  it('第二页：本页行号与分页窗口都正确（数值/分页逻辑不变）', () => {
+    const label = tableRowRangeLabel(page(5, [8, 9, 10, 11, 12]))
+    expect(label).toBe('本页 Excel 行号 8 ~ 12｜共命中 19 行，本次返回 5 行（第 6~10 条，offset=5, limit=5）')
+    expect(label.includes('Excel 行号 8 ~ 12')).toBe(true)
+    expect(label.startsWith('本页 Excel 行号')).toBe(true)   // 不得退回歧义写法
+  })
+
+  it('末页部分返回：本次返回行数与序号窗口按实际值显示', () => {
+    expect(tableRowRangeLabel(page(15, [18, 19, 20, 21], 4, 19, 5)))
+      .toBe('本页 Excel 行号 18 ~ 21｜共命中 19 行，本次返回 4 行（第 16~19 条，offset=15, limit=5）')
+  })
+
+  it('无匹配行：沿用既有文案（不含本页行号）', () => {
+    expect(tableRowRangeLabel(page(0, [], 0, 0, 5)))
+      .toBe('无匹配行（起点为第 1 条，共命中 0 行）')
+  })
+
+  it('旧快照缺 offset/returned_count/limit 时优雅降级（不产生 NaN）', () => {
+    const label = tableRowRangeLabel({ row_excel_numbers: [3, 4], total_matches: 2 })
+    expect(label).toBe('本页 Excel 行号 3 ~ 4｜共命中 2 行，本次返回 2 行（第 1~2 条，offset=0, limit=undefined）')
+    expect(label.includes('NaN')).toBe(false)
+  })
+})
+
+describe('R4 multiStepStep2SourceLabel（自然中文 + 动态数量）', () => {
+  it('动态带出本步实际输入的分组数', () => {
+    expect(multiStepStep2SourceLabel({ input_rows: 3 }))
+      .toBe('数据来源：第 1 步的结果（3 个分组的聚合值），不会重新回到原始 Excel 数据行')
+    expect(multiStepStep2SourceLabel({ input_rows: 7 })).toContain('（7 个分组的聚合值）')
+  })
+
+  it('保留关键语义：不回原始 Excel 数据行；且不含固定 TOP 文案', () => {
+    const label = multiStepStep2SourceLabel({ input_rows: 3 })
+    expect(label).toContain('第 1 步的结果')
+    expect(label).toContain('不会重新回到原始 Excel 数据行')
+    expect(label).not.toContain('TOP')
+    expect(label).not.toContain('本阶段')
+  })
+
+  it('数量不是写死的 3：不同输入得到不同文案', () => {
+    expect(multiStepStep2SourceLabel({ input_rows: 5 }))
+      .not.toBe(multiStepStep2SourceLabel({ input_rows: 3 }))
+  })
+
+  it('旧快照缺 input_rows 时不报错（退化为不含数量）', () => {
+    expect(multiStepStep2SourceLabel({})).toBe('数据来源：第 1 步的结果，不会重新回到原始 Excel 数据行')
+    expect(multiStepStep2SourceLabel(undefined)).toContain('不会重新回到原始 Excel 数据行')
   })
 })
 

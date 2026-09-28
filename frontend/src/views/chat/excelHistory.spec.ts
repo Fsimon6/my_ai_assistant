@@ -6,7 +6,13 @@
  *      裁剪提示、以及"历史消息不获得实时能力"（无 excelSessionId / 分页上下文）。
  */
 import { describe, expect, it, vi } from 'vitest'
-import { groupRelaxedLabel, multiStepSpanLabel, multiStepStep2InputLabel } from './excelCardLabels'
+import {
+  groupRelaxedLabel,
+  multiStepSpanLabel,
+  multiStepStep2InputLabel,
+  multiStepStep2SourceLabel,
+  tableRowRangeLabel
+} from './excelCardLabels'
 import {
   EXCEL_HISTORY_SCHEMA_VERSION,
   EXCEL_HISTORY_TRUNCATED_NOTICE,
@@ -262,6 +268,39 @@ describe('restoreExcelHistory', () => {
     const [, resLike] = calls.group!
     expect(resLike.relaxed_filters).toEqual(['物流商 eq SF → contains SF'])
     expect(groupRelaxedLabel(resLike)).toBe('物流商 eq SF → contains SF')
+  })
+
+  it('R1：表格卡片「本页 Excel 行号」在历史恢复后同样正确（含分页窗口）', () => {
+    const { builders, calls } = makeBuilders()
+    const out = restoreExcelHistory({ source: 'excel', excel: snapshot('result', PAYLOADS.result) },
+                                    builders)
+    expect(out.excelTable).toBeTruthy()
+    expect(tableRowRangeLabel(calls.result![0]))
+      .toBe('本页 Excel 行号 3 ~ 3｜共命中 19 行，本次返回 1 行（第 1~1 条，offset=0, limit=50）')
+  })
+
+  it('R1：旧快照缺 offset/returned_count 时仍可恢复且不产生 NaN', () => {
+    const { builders, calls } = makeBuilders()
+    const legacy = { ...PAYLOADS.result } as Record<string, any>
+    delete legacy.offset
+    delete legacy.returned_count
+    const out = restoreExcelHistory({ source: 'excel', excel: snapshot('result', legacy) }, builders)
+    expect(out.excelTable).toBeTruthy()
+    const label = tableRowRangeLabel(calls.result![0])
+    expect(label.startsWith('本页 Excel 行号')).toBe(true)     // 不回退到歧义写法
+    expect(label.includes('NaN')).toBe(false)
+  })
+
+  it('R4：历史恢复后第 2 步来源文案取**动态**分组数（不再展示旧 source_text）', () => {
+    const { builders, calls } = makeBuilders()
+    const out = restoreExcelHistory(
+      { source: 'excel', excel: snapshot('multi_step', PAYLOADS.multi_step) }, builders)
+    expect(out.excelMultiStep).toBeTruthy()
+    const step2 = calls.multi![0].step2
+    const label = multiStepStep2SourceLabel(step2)
+    expect(label).toContain(`（${step2.input_rows} 个分组的聚合值）`)
+    expect(label).toContain('不会重新回到原始 Excel 数据行')
+    expect(label).not.toContain('TOP')
   })
 
   it('实时与历史使用同一 builder（注入）—— 相同 payload 得到相同视图模型', () => {

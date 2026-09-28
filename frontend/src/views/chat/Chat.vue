@@ -432,7 +432,7 @@
                     <div class="excel-step-block">
                       <div class="excel-step-title">第二步：{{ message.excelMultiStep.step2Title }}</div>
                       <div class="excel-answer-note">
-                        数据来源：{{ message.excelMultiStep.step2.source_text }}
+                        {{ message.excelMultiStep.step2SourceLabel }}
                         {{ message.excelMultiStep.step2InputLabel }}
                       </div>
                       <div class="excel-step2-value">
@@ -606,8 +606,14 @@ import type { Character, SpeakResponse } from "@/types/character"
 import { useStreamingChat } from '@/composables/useStreamingChat'
 // 第 3 项「结果与可解释性」：历史消息的结构化结果恢复（复用本文件既有的 4 个 builder）
 import { restoreExcelHistory } from './excelHistory'
-// 第 3 项 P2：卡片文案纯函数（G1 行区间 / G2 可数值化个数 / G5 条件放宽说明）
-import { groupRelaxedLabel, multiStepSpanLabel, multiStepStep2InputLabel } from './excelCardLabels'
+// 第 3 项 P2：卡片文案纯函数（G1 行区间 / G2 可数值化个数 / G5 条件放宽说明 / R1 本页行号 / R4 第 2 步来源）
+import {
+  groupRelaxedLabel,
+  multiStepSpanLabel,
+  multiStepStep2InputLabel,
+  multiStepStep2SourceLabel,
+  tableRowRangeLabel
+} from './excelCardLabels'
 
 const route = useRoute()
 const router = useRouter()
@@ -988,13 +994,8 @@ const buildExcelTable = (r: ExcelQueryResult, documentName: string, continued = 
     row.forEach((v: any, ci: number) => { obj[String(ci)] = v })
     return obj
   })
-  const nums = r.row_excel_numbers || []
-  const seqStart = r.offset + 1
-  const seqEnd = r.offset + r.returned_count
-  const rowRangeLabel = nums.length
-    ? `Excel 行号 ${nums[0]} ~ ${nums[nums.length - 1]}｜共命中 ${r.total_matches} 行，`
-      + `本次返回 ${r.returned_count} 行（第 ${seqStart}~${seqEnd} 条，offset=${r.offset}, limit=${r.limit}）`
-    : `无匹配行（起点为第 ${seqStart} 条，共命中 ${r.total_matches} 行）`
+  // R1：行范围说明由纯函数给出（数值与分页逻辑不变，仅把「本页」语义写明）
+  const rowRangeLabel = tableRowRangeLabel(r)
   // Phase 4B：计算字段口径（标签与说明全部由后端给出）
   const calc = r.calculation || null
   const calcLabel = calc
@@ -1191,6 +1192,8 @@ const buildMultiStep = (m: ExcelMultiStepResult, res: ExcelNlQueryResult) => {
     spanLabel: multiStepSpanLabel(s1),
     // 第 3 项 P2（G2）：第 2 步输入说明（可数值化个数为 0 也如实显示；旧快照缺字段时省略该子句）
     step2InputLabel: multiStepStep2InputLabel(s2),
+    // 第 3 项 P2（R4）：第 2 步来源说明（自然中文 + 动态分组数；仅文案，不改 step2 数据）
+    step2SourceLabel: multiStepStep2SourceLabel(s2),
     document: res.document?.filename || m.filename || '',
     sheet: s1.sheet_name || m.sheet_name,
     step2ValueLabel,
