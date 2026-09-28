@@ -742,7 +742,12 @@ _GROUP_KEYS = ('kind', 'operation', 'operation_label', 'column', 'column_index',
                'order_by_column', 'order_by_label', 'order_dir', 'order_dir_label', 'sorted',
                'sort_description', 'truncated_by_top_n', 'matched_rows', 'total_rows_in_sheet',
                'row_excel_spans', 'sheet_index', 'sheet_name', 'definition')
-_STEP_KEYS = _GROUP_KEYS + ('type', 'source', 'source_text', 'input_rows')
+#: multi_step 的 step 白名单 = 分组结果键 + 步骤专有键。
+#: 第 3 项 P2：G1 需要 ``row_excel_spans``（已在 _GROUP_KEYS 中）、``row_excel_truncated``；
+#: G2 需要 ``numeric_rows``（**第 2 步输入中可数值化的个数**，由执行器用与求值同一条数值化
+#: 规则算出，不在前端重算）。二者都是 **schema v1 的可选增量字段**（旧快照缺失即降级显示）。
+_STEP_KEYS = _GROUP_KEYS + ('type', 'source', 'source_text', 'input_rows', 'numeric_rows',
+                            'row_excel_truncated')
 _ROW_KEYS = ('group_key', 'group_display', 'value', 'value_display', 'matched_rows',
              'numeric_rows', 'empty_rows', 'non_numeric_rows', 'group')
 _MULTISTEP_KEYS = ('kind', 'engine', 'filename', 'sheet_index', 'sheet_name', 'definition',

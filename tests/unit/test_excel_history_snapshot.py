@@ -104,6 +104,8 @@ def _outcome(kind: str) -> dict:
             'max_steps': 2, 'step_count': 2, 'value': 106.6, 'value_display': '106.6',
             'step1': {'type': 'group_aggregate', 'sheet_name': 'OrderSKUList', 'operation': 'sum',
                       'operation_label': '求和', 'column': 'Order Amount',
+                      'row_excel_spans': {'first': 3, 'last': 21},
+                      'row_excel_truncated': False,
                       'group_by': [{'name': 'SKU ID', 'index': 1, 'excel_column': 2}],
                       'rows': rows, 'total_groups': 15, 'returned_groups': 3, 'top_n': 3,
                       'order_by': 'aggregate_value', 'order_by_label': '聚合值',
@@ -116,7 +118,8 @@ def _outcome(kind: str) -> dict:
             'step2': {'type': 'aggregate', 'operation': 'sum', 'operation_label': '求和',
                       'source': 'step_1', 'source_text': 'Step 1 的结果',
                       'input_rows': 3, 'numeric_rows': 3, 'value': 106.6,
-                      'value_display': '106.6'},
+                      'value_display': '106.6',
+                      'row_excel_truncated': False},
             'step2_input_values': [59.32, 35.33, 33.2],
             'plan': {'max_steps': 2, 'steps': [
                 {'type': 'group_aggregate', 'operation': 'sum', 'column': 'Order Amount',
@@ -188,6 +191,30 @@ def test_multi_step_snapshot_contract():
     assert p['step1']['group_by'][0]['name'] == 'SKU ID'
     assert p['step1']['rows'][0]['value_display'] == '66.3'
     assert p['step2']['input_rows'] == 3
+
+
+def test_multi_step_snapshot_keeps_g1_g2_fields():
+    """第 3 项 P2：G1（step1 真实行区间）与 G2（step2 可数值化个数）必须随快照落库。"""
+    snap = build_excel_history_snapshot(_outcome('multi_step'))
+    s1, s2 = snap['payload']['step1'], snap['payload']['step2']
+    assert s1['row_excel_spans'] == {'first': 3, 'last': 21}
+    assert s1['row_excel_truncated'] is False
+    assert s2['numeric_rows'] == 3
+    # 白名单仍只保留展示所需：不落整份行号数组
+    assert 'row_excel_numbers' not in s1
+
+
+def test_old_snapshot_without_g1_g2_fields_is_graceful():
+    """旧快照（v1，缺 G1/G2 新字段）仍可正常构建与序列化：不回填、不报错、版本不变。"""
+    out = _outcome('multi_step')
+    for key in ('row_excel_spans', 'row_excel_truncated'):
+        out['multi_step']['step1'].pop(key, None)
+    out['multi_step']['step2'].pop('numeric_rows', None)
+    snap = build_excel_history_snapshot(out)
+    assert snap['schema_version'] == EXCEL_HISTORY_SCHEMA_VERSION        # 仍为 v1（可选增量字段）
+    s1, s2 = snap['payload']['step1'], snap['payload']['step2']
+    assert 'row_excel_spans' not in s1 and 'numeric_rows' not in s2
+    assert json.loads(json.dumps(snap, ensure_ascii=False))['kind'] == 'multi_step'
 
 
 # ---------------------------------------------------------------------------

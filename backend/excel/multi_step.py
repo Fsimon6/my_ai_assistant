@@ -502,6 +502,11 @@ class AnalysisResult:
                 'truncated_by_top_n': self.step1.is_truncated,
                 'matched_rows': self.step1.matched_rows,
                 'total_rows_in_sheet': self.step1.total_rows_in_sheet,
+                # 第 3 项 P2（G1）：第 1 步的**真实** Excel 行区间 —— 直接复用分组执行器
+                # 逐行命中的行号（与分组聚合卡片同源、同格式），**不是**用 matched_rows 反推。
+                # 无命中 / 执行器未提供时为 None；被上限裁剪时 row_excel_truncated=True。
+                'row_excel_spans': getattr(self.step1, 'row_excel_span', None),
+                'row_excel_truncated': getattr(self.step1, 'row_excel_truncated', False),
                 'rows': [r.to_dict(self.step1.operation) for r in self.step1.rows],
                 'sort_description': self.step1.sort_description(),
                 'source': self.step1_source,

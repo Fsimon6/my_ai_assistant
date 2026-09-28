@@ -475,6 +475,56 @@ def test_zero_match_count_step2_returns_zero(small_rep):
     assert result.step2_value == pytest.approx(0.0, **TOL)
 
 
+# ==========================================================================
+# 第 3 项 P2（G1/G2）：Step1 真实 Excel 行区间 + Step2 可数值化个数
+# ==========================================================================
+def test_g1_step1_row_span_comes_from_real_rows(small_rep):
+    """G1：step1 行区间必须来自**真实命中行号**（带筛选时无法用 matched_rows 反推）。"""
+    carrier = _first_present(small_rep, [CARRIER])
+    sheet = small_rep.sheets[0]
+    ci = sheet.column_names.index(carrier)
+    want_rows = [sheet.row_excel_numbers[i] for i, row in enumerate(sheet.rows)
+                 if row[ci] is not None and 'SF' in str(row[ci])]
+    assert len(want_rows) >= 2, '前置条件：该表需存在含 SF 的物流商行'
+
+    result, _engine = _run_plan(small_rep, [
+        _group_step(group_by=[carrier],
+                    filters=[{'column': carrier, 'operator': 'contains', 'value': 'SF'}]),
+        _agg_step()])
+
+    s1 = result.to_dict()['step1']
+    assert s1['row_excel_spans'] == {'first': want_rows[0], 'last': want_rows[-1]}
+    assert s1['matched_rows'] == len(want_rows)
+    span_len = s1['row_excel_spans']['last'] - s1['row_excel_spans']['first'] + 1
+    assert span_len > len(want_rows), '区间必须来自真实行号，而不是按命中行数连续推算'
+
+
+def test_g2_step2_numeric_rows_reuses_step1_values(small_rep):
+    """G2：step2.numeric_rows = 第 1 步聚合值中**可数值化**的个数（与求值同一口径）。"""
+    result, _engine = _run_plan(small_rep, [
+        _group_step(group_by=[SKU], top_n=3), _agg_step()])
+    d = result.to_dict()
+    s1, s2 = d['step1'], d['step2']
+    assert s2['input_rows'] == len(s1['rows']) == 3
+    assert s2['numeric_rows'] == 3                     # 三个分组的 SUM 值都可数值化
+    assert s2['value_display'] == d['value_display']
+
+
+def test_g2_step2_numeric_rows_zero(small_rep):
+    """G2 边界：第 2 步没有可数值化输入时为 0（不是缺失/None）；无命中时行区间为 None。"""
+    carrier = _first_present(small_rep, [CARRIER])
+    result, _engine = _run_plan(small_rep, [
+        _group_step(group_by=[carrier],
+                    filters=[{'column': carrier, 'operator': 'contains',
+                              'value': 'ZZZ_NO_SUCH_VALUE'}]),
+        _agg_step()])
+    d = result.to_dict()
+    assert d['step1']['rows'] == []
+    assert d['step2']['input_rows'] == 0
+    assert d['step2']['numeric_rows'] == 0
+    assert d['step1']['row_excel_spans'] is None       # 无命中 -> 不伪造区间
+
+
 def test_group_with_null_and_non_numeric_values(small_rep):
     """中间结果里出现 None（该组无可数值化单元格）时，第 2 步按口径忽略，不当作 0。"""
     steps = [_group_step(group_by=['Order Status'], operation='sum', column=AMOUNT, top_n=200),

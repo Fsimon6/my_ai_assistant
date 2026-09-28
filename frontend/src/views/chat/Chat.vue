@@ -332,6 +332,10 @@
                     </div>
 
                     <div class="excel-answer-note">{{ message.excelGroupAgg.summaryLabel }}</div>
+                    <div v-if="message.excelGroupAgg.relaxedLabel"
+                         class="excel-answer-filters excel-answer-relaxed">
+                      注意：{{ message.excelGroupAgg.relaxedLabel }}
+                    </div>
                     <div v-if="message.excelGroupAgg.spanLabel" class="excel-answer-note">
                       {{ message.excelGroupAgg.spanLabel }}
                     </div>
@@ -418,6 +422,9 @@
                       </div>
 
                       <div class="excel-answer-note">{{ message.excelMultiStep.step1Summary }}</div>
+                      <div v-if="message.excelMultiStep.spanLabel" class="excel-answer-note">
+                        {{ message.excelMultiStep.spanLabel }}
+                      </div>
                       <div class="excel-answer-note">第 1 步来源：{{ message.excelMultiStep.step1.source }}</div>
                     </div>
 
@@ -426,8 +433,7 @@
                       <div class="excel-step-title">第二步：{{ message.excelMultiStep.step2Title }}</div>
                       <div class="excel-answer-note">
                         数据来源：{{ message.excelMultiStep.step2.source_text }}
-                        （输入 {{ message.excelMultiStep.step2.input_rows }} 个分组，
-                        其中可数值化 {{ message.excelMultiStep.step2.numeric_rows }} 个）
+                        {{ message.excelMultiStep.step2InputLabel }}
                       </div>
                       <div class="excel-step2-value">
                         <span class="label">{{ message.excelMultiStep.step2ValueLabel }}</span>
@@ -600,6 +606,8 @@ import type { Character, SpeakResponse } from "@/types/character"
 import { useStreamingChat } from '@/composables/useStreamingChat'
 // 第 3 项「结果与可解释性」：历史消息的结构化结果恢复（复用本文件既有的 4 个 builder）
 import { restoreExcelHistory } from './excelHistory'
+// 第 3 项 P2：卡片文案纯函数（G1 行区间 / G2 可数值化个数 / G5 条件放宽说明）
+import { groupRelaxedLabel, multiStepSpanLabel, multiStepStep2InputLabel } from './excelCardLabels'
 
 const route = useRoute()
 const router = useRouter()
@@ -1117,6 +1125,9 @@ const buildGroupAgg = (g: ExcelGroupedAggregateResult, res: ExcelNlQueryResult) 
     sorted: !!g.sorted,
     summaryLabel,
     spanLabel: span ? `匹配 Excel 行区间：${span.first} ~ ${span.last}` : '',
+    // 第 3 项 P2（G5）：条件放宽说明（与表格/单聚合卡片同一格式；放宽≠最终条件，
+    // 最终执行条件仍以 filtersLabel 为准）
+    relaxedLabel: groupRelaxedLabel(res),
     definition: g.definition
   }
 }
@@ -1176,6 +1187,10 @@ const buildMultiStep = (m: ExcelMultiStepResult, res: ExcelNlQueryResult) => {
     sortLabel,
     topLabel,
     step1Summary,
+    // 第 3 项 P2（G1）：第 1 步匹配的**真实** Excel 行区间（后端分组执行器逐行命中行号）
+    spanLabel: multiStepSpanLabel(s1),
+    // 第 3 项 P2（G2）：第 2 步输入说明（可数值化个数为 0 也如实显示；旧快照缺字段时省略该子句）
+    step2InputLabel: multiStepStep2InputLabel(s2),
     document: res.document?.filename || m.filename || '',
     sheet: s1.sheet_name || m.sheet_name,
     step2ValueLabel,

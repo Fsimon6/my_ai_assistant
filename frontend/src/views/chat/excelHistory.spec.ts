@@ -6,6 +6,7 @@
  *      裁剪提示、以及"历史消息不获得实时能力"（无 excelSessionId / 分页上下文）。
  */
 import { describe, expect, it, vi } from 'vitest'
+import { groupRelaxedLabel, multiStepSpanLabel, multiStepStep2InputLabel } from './excelCardLabels'
 import {
   EXCEL_HISTORY_SCHEMA_VERSION,
   EXCEL_HISTORY_TRUNCATED_NOTICE,
@@ -212,6 +213,55 @@ describe('restoreExcelHistory', () => {
     snap2.history_truncated = true
     const out2 = restoreExcelHistory({ source: 'excel', excel: snap2 }, builders)
     expect(out2.excelTable.rowRangeLabel).toContain(EXCEL_HISTORY_TRUNCATED_NOTICE)
+  })
+
+  it('G1/G2：新快照的 step1 行区间与 step2 可数值化个数随恢复透传给 builder', () => {
+    const { builders, calls } = makeBuilders()
+    const snap = snapshot('multi_step', {
+      ...PAYLOADS.multi_step,
+      step1: { ...PAYLOADS.multi_step.step1,
+               row_excel_spans: { first: 3, last: 21 }, row_excel_truncated: false },
+      step2: { ...PAYLOADS.multi_step.step2, numeric_rows: 3 }
+    })
+    const out = restoreExcelHistory({ source: 'excel', excel: snap }, builders)
+    expect(out.excelMultiStep).toBeTruthy()
+    const [payload] = calls.multi!
+    expect(payload.step1.row_excel_spans).toEqual({ first: 3, last: 21 })
+    expect(payload.step2.numeric_rows).toBe(3)
+    expect(multiStepSpanLabel(payload.step1)).toBe('匹配 Excel 行区间：3 ~ 21')
+    expect(multiStepStep2InputLabel(payload.step2)).toBe('（输入 3 个分组，其中可数值化 3 个）')
+  })
+
+  it('旧快照（v1，缺 G1/G2 新字段）-> 仍正常恢复且文案优雅降级', () => {
+    const { builders, calls } = makeBuilders()
+    // 显式构造"旧快照"：删除 G1/G2 引入的可选增量字段
+    const legacyStep1 = { ...PAYLOADS.multi_step.step1 } as Record<string, any>
+    const legacyStep2 = { ...PAYLOADS.multi_step.step2 } as Record<string, any>
+    delete legacyStep1.row_excel_spans
+    delete legacyStep1.row_excel_truncated
+    delete legacyStep2.numeric_rows
+    const out = restoreExcelHistory(
+      { source: 'excel',
+        excel: snapshot('multi_step', { ...PAYLOADS.multi_step,
+                                       step1: legacyStep1, step2: legacyStep2 }) }, builders)
+    expect(out.excelMultiStep).toBeTruthy()               // 不报错、不丢卡片
+    const [payload] = calls.multi!
+    expect(payload.step1.row_excel_spans).toBeUndefined()
+    expect(multiStepSpanLabel(payload.step1)).toBe('')                     // 不渲染行区间行
+    expect(multiStepStep2InputLabel(payload.step2)).toBe('（输入 3 个分组）')  // 省略子句
+  })
+
+  it('G5：group_aggregate 的 relaxed_filters 随恢复透传（历史卡片同样显示放宽说明）', () => {
+    const { builders, calls } = makeBuilders()
+    const snap = {
+      ...snapshot('group_aggregate', PAYLOADS.group_aggregate),
+      relaxed_filters: ['物流商 eq SF → contains SF']
+    }
+    const out = restoreExcelHistory({ source: 'excel', excel: snap }, builders)
+    expect(out.excelGroupAgg).toBeTruthy()
+    const [, resLike] = calls.group!
+    expect(resLike.relaxed_filters).toEqual(['物流商 eq SF → contains SF'])
+    expect(groupRelaxedLabel(resLike)).toBe('物流商 eq SF → contains SF')
   })
 
   it('实时与历史使用同一 builder（注入）—— 相同 payload 得到相同视图模型', () => {
