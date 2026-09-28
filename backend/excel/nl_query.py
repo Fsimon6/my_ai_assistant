@@ -562,7 +562,12 @@ def build_validated_query(
     用户没有明确表达、或解析不安全（不可解析 / 注入样式）-> 保持原值，交给既有校验
     （无法解析的列仍抛 ``column_ambiguous_or_missing`` -> 上层澄清，绝不"洗白"）。
     """
-    sheet, sheet_candidates = resolve_sheet_nl(rep, intent.sheet)
+    # 2A-P1（D2）：用户文本**明确指名**的 Sheet 优先于 LLM 的 sheet（歧义 -> 澄清，不猜）
+    _u_sheet, _sheet_clarify = _user_sheet_choice(user_message, rep)
+    if _sheet_clarify is not None:
+        raise NlQueryError('sheet_ambiguous_or_missing', _sheet_clarify['message'],
+                           {'candidates': _sheet_clarify.get('candidates') or []})
+    sheet, sheet_candidates = resolve_sheet_nl(rep, _u_sheet or intent.sheet)
     if sheet is None:
         raise NlQueryError(
             'sheet_ambiguous_or_missing',
@@ -3141,6 +3146,163 @@ def _user_columns(message: str, sheet: 'SheetRepresentation') -> Optional[List[s
     return ordered or None
 
 
+#: 「用户指名了文件」的**强匹配**门槛：对齐 `score_document_hint` 的分档
+#: （1000 精确 / 500+ 文件名含于文本 / 400+ 文件名含于文本的反向 / 300 同「N店」）。
+#: 只到 token 重叠档（≤100）**不足以**认定"用户指名了文件"，否则「订单金额总和」这类
+#: 普通问句会因局部词重叠被误判成"指定了某个文件"。
+_DOC_STRONG_SCORE = 300.0
+
+#: **文件资源形态**（显式文件名）：带既有支持的表格扩展名。只有这种"明确的资源格式"
+#: 才算"用户提出了资源选择意图"（普通中文短语绝不当成文件名，见 §八）。
+_FILE_TOKEN_RE = re.compile(
+    r'[^\s，,。；;：:？?、（）()「」“”\'"\[\]]{1,64}'
+    r'\.(?:xlsx|xlsm|xls|csv|tsv)', re.I)
+
+#: **Sheet 形态**：混合大小写（首位之后仍有大写）且含小写 —— 如 OrderSKUList / RefundList /
+#: NoSuchSheet。纯大写（SKU / SF）与普通英文词（Order / Amount / Created / Time）都不算，
+#: 以免把列名或业务词误判成 Sheet 选择。
+_SHEET_LIKE_RE = re.compile(r'[A-Za-z][A-Za-z0-9_]{2,}')
+#: 显式 Sheet 表达：<名称> + 「Sheet / 工作表」
+_SHEET_EXPLICIT_RE = re.compile(r'([A-Za-z0-9_]{3,})\s*(?:Sheet|工作表)', re.I)
+
+
+def _file_mention(message: str) -> Optional[str]:
+    """用户是否**明确提到某个文件**（带表格扩展名）-> 提到的片段；未提到 -> None。"""
+    m = _FILE_TOKEN_RE.search(nl_norm.to_halfwidth(message))
+    return m.group(0) if m is not None else None
+
+
+def _is_existing_column(name: str, rep: 'WorkbookRepresentation') -> bool:
+    """该片段是否是工作簿里**真实存在的列名**（用于把"列名"排除出 Sheet 选择）。"""
+    for sh in rep.sheets:
+        if resolve_column_nl(sh, name)[0] is not None:
+            return True
+    return False
+
+
+def _sheet_mention(message: str, rep: 'WorkbookRepresentation') -> Optional[str]:
+    """用户是否**明确提到某个 Sheet** -> 提到的名称片段；未提到 -> None。
+
+    只认两类明确形态（避免把列名 / 普通英文词当成 Sheet 选择）：
+      * 混合大小写标记（首位之后仍有大写且含小写）：OrderSKUList / NoSuchSheet；
+      * 显式表达：<名称> + 「Sheet / 工作表」。
+    额外排除：该片段本身是**真实列名**（某些表里可能有同名列）-> 不算 Sheet 选择。
+    """
+    if rep is None:
+        return None
+    text = nl_norm.to_halfwidth(message)
+    for m in _SHEET_LIKE_RE.finditer(text):
+        tok = m.group(0)
+        if not any(c.isupper() for c in tok[1:]) or not any(c.islower() for c in tok):
+            continue
+        if _is_existing_column(tok, rep):
+            continue
+        return tok
+    m = _SHEET_EXPLICIT_RE.search(text)
+    if m is not None and not _is_existing_column(m.group(1), rep):
+        return m.group(1)
+    return None
+
+
+def _user_document_choice(
+    message: str, catalog: Sequence[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """用户文本里的**文件选择意图** -> 三态 ``(文件名 或 None, clarify 或 None)``。
+
+    D1（最终验收发现）：三条执行入口的 ``doc_hint`` 都只来自 LLM（``intent.document``），
+    用户文本里写明的文件名**没有任何 authority** —— 实测「直邮一店 8.20号订单.xlsx 的
+    订单金额总和」+ LLM 给「直邮5店 7.10号订单.xlsx」会执行后者（静默错误）。
+
+    C（2026-09-28 补充授权）：原实现把"用户**提到了**但匹配不到"错误折叠成"完全没提"，
+    于是「根本不存在的文件XYZ.xlsx 的…」会静默执行 LLM 的候选。三态必须严格区分：
+
+      | 状态 | 判据 | 结果 |
+      |---|---|---|
+      | ① 未提文件 | 无强匹配 **且** 无「文件形态」提及 | ``(None, None)`` → 保持既有 LLM/继承行为 |
+      | ② 提到了且唯一匹配 | `score_document_hint ≥ 300` 唯一最高分 | 采用该文件（覆盖 LLM） |
+      | ③ 提到了但不可用 | 强匹配并列（歧义）**或** 有明确文件形态但匹配不到 | 澄清（**绝不退回 LLM 候选**） |
+
+    "文件形态"= 带既有支持的表格扩展名（.xlsx/.xlsm/.xls/.csv/.tsv）；疑似注入 -> 交由
+    既有校验（不参与、不"洗白"）。
+    """
+    if not message or not catalog:
+        return None, None
+    if nl_norm.looks_like_injection(message):
+        return None, None
+    text_norm = nl_norm.normalize_name(message)
+    if not text_norm:
+        return None, None
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for doc in catalog:
+        stem = nl_norm.normalize_name(Path(str(doc.get('filename') or '')).stem)
+        if not stem:
+            continue
+        scored.append((nl_norm.score_document_hint(stem, text_norm), doc))
+    scored = [(s, d) for s, d in scored if s >= _DOC_STRONG_SCORE]
+    if scored:
+        best = max(s for s, _d in scored)
+        tied = [d for s, d in scored if abs(s - best) < 1e-9]
+        if len(tied) > 1:
+            names = [str(d.get('filename') or '') for d in tied]
+            return None, _clarify(
+                f'你说的表格名可能指多份文件，请指定其中之一：{", ".join(names)}',
+                names, stage='document',
+            )
+        return (str(tied[0].get('filename') or '') or None), None
+    # 状态③：用户**提到了文件**（明确的文件名形态）但 catalog 里匹配不到 -> 澄清
+    mention = _file_mention(message)
+    if mention:
+        names = [str(d.get('filename') or '') for d in catalog]
+        return None, _clarify(
+            f'你说的表格「{mention}」不在可用文件里，请指定其中之一：{", ".join(names)}',
+            names, stage='document',
+        )
+    return None, None
+
+
+def _user_sheet_choice(
+    message: str, rep: 'WorkbookRepresentation',
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """用户文本里的 **Sheet 选择意图** -> 三态 ``(Sheet 名 或 None, clarify 或 None)``。
+
+    D2（最终验收发现）：三条执行入口的 ``sheet_hint`` 都只来自 LLM（``intent.sheet``），
+    实测「OrderSKUList 里的订单金额总和」+ LLM 给 ``RefundList`` 会执行后者（静默错误）。
+
+    F（2026-09-28 补充授权）：与 D1 同理，必须区分"提到但不存在"与"完全没提"：
+
+      | 状态 | 判据 | 结果 |
+      |---|---|---|
+      | ① 未提 Sheet | 无命中 **且** 无 Sheet 形态提及 | ``(None, None)`` → 保持既有 LLM/继承行为 |
+      | ② 提到了且唯一命中 | `normalize_name` 唯一子串（与 `resolve_sheet_deterministic` 同规则） | 采用该 Sheet |
+      | ③ 提到了但不可用 | 命中 ≥2（歧义）**或** 有明确 Sheet 形态但该文件里没有 | 澄清（**绝不退回 LLM 候选**） |
+
+    "Sheet 形态"见 `_sheet_mention`（混合大小写标记 / `<名称> + Sheet|工作表`，且排除真实列名）；
+    疑似注入 -> 交由既有校验（不参与、不"洗白"）。
+    """
+    if not message or rep is None or not rep.sheets:
+        return None, None
+    if nl_norm.looks_like_injection(message):
+        return None, None
+    text_norm = nl_norm.normalize_name(message)
+    if not text_norm:
+        return None, None
+    hits = [s.sheet_name for s in rep.sheets
+            if nl_norm.normalize_name(s.sheet_name) in text_norm]
+    if len(hits) == 1:
+        return hits[0], None
+    if len(hits) > 1:
+        return None, _clarify(
+            f'你说的 Sheet 可能指多个，请指定其中之一：{", ".join(hits)}', hits, stage='schema')
+    # 状态③：用户**提到了 Sheet**（明确形态）但该工作簿里没有 -> 澄清
+    mention = _sheet_mention(message, rep)
+    if mention:
+        names = [s.sheet_name for s in rep.sheets]
+        return None, _clarify(
+            f'你说的 Sheet「{mention}」不在该文件里，请指定其中之一：{", ".join(names)}',
+            names, stage='schema')
+    return None, None
+
+
 def _user_group_column(
     agg: 'AggregateIntent', message: str, sheet: 'SheetRepresentation',
     signals: Optional['nl_norm.IntentSignals'], catalog: List[Dict[str, Any]],
@@ -3345,7 +3507,11 @@ def _run_aggregate_turn(
             )
 
     # ---- 文件定位 ----
-    doc_hint = document_override or agg.document
+    # 2A-P1（D1）：用户文本**明确指名**的文件优先于 LLM 的 document（歧义 -> 澄清，不猜）
+    _u_doc, _doc_clarify = _user_document_choice(user_message, catalog)
+    if _doc_clarify is not None:
+        return _doc_clarify
+    doc_hint = document_override or _u_doc or agg.document
     rep: Optional[WorkbookRepresentation] = None
     if not doc_hint and inherited_doc_id:
         rep = excel_store.load_representation(inherited_doc_id)
@@ -3366,7 +3532,11 @@ def _run_aggregate_turn(
             return {'status': STATUS_ERROR, 'message': f'表格文件「{doc["filename"]}」的表示数据缺失，请重新上传。'}
 
     # ---- Sheet 定位（继承时优先沿用上一轮 Sheet） ----
-    sheet_hint = agg.sheet
+    # 2A-P1（D2）：用户文本**明确指名**的 Sheet 优先于 LLM 的 sheet（歧义 -> 澄清，不猜）
+    _u_sheet, _sheet_clarify = _user_sheet_choice(user_message, rep)
+    if _sheet_clarify is not None:
+        return _sheet_clarify
+    sheet_hint = _u_sheet or agg.sheet
     sheet: Optional[SheetRepresentation] = None
     if sheet_hint:
         sheet, sheet_candidates = resolve_sheet_nl(rep, sheet_hint)
@@ -4265,7 +4435,11 @@ def _run_analysis_turn(
         return _clarify(e.message, stage='analysis')
 
     # ---- 文件定位（沿用逻辑与统计链路一致） ----
-    doc_hint = document_override or intent.document
+    # 2A-P1（D1）：用户文本**明确指名**的文件优先于 LLM 的 document（歧义 -> 澄清，不猜）
+    _u_doc, _doc_clarify = _user_document_choice(user_message, catalog)
+    if _doc_clarify is not None:
+        return _doc_clarify
+    doc_hint = document_override or _u_doc or intent.document
     rep: Optional[WorkbookRepresentation] = None
     if not doc_hint and inherited_doc_id:
         rep = excel_store.load_representation(inherited_doc_id)
@@ -4286,7 +4460,11 @@ def _run_analysis_turn(
             return {'status': STATUS_ERROR, 'message': f'表格文件「{doc["filename"]}」的表示数据缺失，请重新上传。'}
 
     # ---- Sheet 定位 ----
-    sheet_hint = intent.sheet
+    # 2A-P1（D2）：用户文本**明确指名**的 Sheet 优先于 LLM 的 sheet（歧义 -> 澄清，不猜）
+    _u_sheet, _sheet_clarify = _user_sheet_choice(user_message, rep)
+    if _sheet_clarify is not None:
+        return _sheet_clarify
+    sheet_hint = _u_sheet or intent.sheet
     sheet: Optional[SheetRepresentation] = None
     if sheet_hint:
         sheet, sheet_candidates = resolve_sheet_nl(rep, sheet_hint)
@@ -4982,7 +5160,11 @@ async def _run_nl_query_impl(
         return _clarify(intent.calc_error, stage='calculation')
 
     # 文件定位（确定性匹配，不猜）
-    doc_hint = document_override or intent.document
+    # 2A-P1（D1）：用户文本**明确指名**的文件优先于 LLM 的 document（歧义 -> 澄清，不猜）
+    _u_doc, _doc_clarify = _user_document_choice(user_message, catalog)
+    if _doc_clarify is not None:
+        return _doc_clarify
+    doc_hint = document_override or _u_doc or intent.document
     doc, doc_candidates = resolve_document(catalog, doc_hint)
     if doc is None:
         if doc_candidates:
