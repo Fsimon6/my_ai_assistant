@@ -246,6 +246,11 @@ class AggregateResult:
     definition: str
     # Phase 4B：受控计算字段（无则为 None）
     calculation: Optional[Dict[str, Any]] = None
+    # 相邻 P2（2026-09-29）：命中行的**真实最大连续段**（与表格卡片同一语义/同一折叠函数）。
+    # `row_excel_span` 是包络（首/末行号），不能证明连续；runs 才是"到底命中了哪些行"。
+    matched_row_runs: Optional[List[List[int]]] = None
+    matched_row_run_count: int = 0
+    matched_row_runs_truncated: bool = False
 
     @property
     def is_count(self) -> bool:
@@ -279,6 +284,10 @@ class AggregateResult:
             'column_numeric_in_sheet': self.column_numeric_in_sheet,
             'definition': self.definition,
             'calculation': self.calculation,
+            # 相邻 P2：真实连续段（可选增量字段；旧快照缺失即回退包络展示）
+            'matched_row_runs': self.matched_row_runs or [],
+            'matched_row_run_count': self.matched_row_run_count,
+            'matched_row_runs_truncated': self.matched_row_runs_truncated,
         }
 
 
@@ -355,6 +364,10 @@ class GroupedAggregateResult:
     total_groups_before_top: int = 0         # 截断前的分组总数
     # Phase 4B：受控计算字段（无则为 None）
     calculation: Optional[Dict[str, Any]] = None
+    # 相邻 P2（2026-09-29）：命中行的真实最大连续段（与单值统计/表格同一语义与同一折叠函数）
+    matched_row_runs: Optional[List[List[int]]] = None
+    matched_row_run_count: int = 0
+    matched_row_runs_truncated: bool = False
 
     @property
     def returned_groups(self) -> int:
@@ -440,6 +453,10 @@ class GroupedAggregateResult:
             'truncated_by_top_n': self.is_truncated,
             'sort_description': self.sort_description(),
             'calculation': self.calculation,
+            # 相邻 P2：真实连续段（可选增量字段；旧快照缺失即回退包络展示）
+            'matched_row_runs': self.matched_row_runs or [],
+            'matched_row_run_count': self.matched_row_run_count,
+            'matched_row_runs_truncated': self.matched_row_runs_truncated,
         }
 
 
@@ -1154,6 +1171,9 @@ def _build_result(
     row_numbers: List[int],
     truncated: bool,
     span: Optional[Dict[str, int]],
+    runs: Optional[List[List[int]]] = None,
+    run_count: int = 0,
+    runs_truncated: bool = False,
 ) -> AggregateResult:
     return AggregateResult(
         document_id=representation.document_id,
@@ -1176,6 +1196,9 @@ def _build_result(
         column_numeric_in_sheet=request.column_numeric_in_sheet,
         definition=_definition(request.operation, request.column, request.calculation),
         calculation=request.calculation,
+        matched_row_runs=runs,
+        matched_row_run_count=run_count,
+        matched_row_runs_truncated=runs_truncated,
     )
 
 
@@ -1237,10 +1260,13 @@ def execute_aggregate_duckdb(
     span = None
     if first_row is not None and last_row is not None:
         span = {'first': int(first_row), 'last': int(last_row)}
+    # 相邻 P2：DuckDB 单值路径**已取回全部命中行号**（rows_sql），直接折叠成真实连续段
+    runs, run_count, runs_truncated = excel_query.collapse_row_runs(fetched)
 
     return _build_result(
         representation, request, sheet.row_count, value, matched_rows, numeric_rows,
         empty_rows, non_numeric_rows, row_numbers, truncated, span,
+        runs, run_count, runs_truncated or truncated,
     )
 
 
@@ -1318,16 +1344,58 @@ def execute_aggregate_python(
     excel_rows = [r for _, r in matched]
     truncated = len(excel_rows) > MAX_ROW_NUMBERS
     span = {'first': excel_rows[0], 'last': excel_rows[-1]} if excel_rows else None
+    # 相邻 P2：Python 路径本就逐行收集了全部命中行号 -> 直接折叠成真实连续段
+    runs, run_count, runs_truncated = excel_query.collapse_row_runs(excel_rows)
 
     return _build_result(
         representation, request, sheet.row_count, value, matched_rows, numeric_rows,
         empty_rows, non_numeric_rows, excel_rows[:MAX_ROW_NUMBERS], truncated, span,
+        runs, run_count, runs_truncated or truncated,
     )
 
 
 # ----------------------------------------------------------------------------
 # 摘要（Python 生成，不经过 LLM）
 # ----------------------------------------------------------------------------
+def format_matched_row_runs(runs: Optional[Sequence[Sequence[int]]], run_count: Optional[int] = None,
+                            truncated: bool = False,
+                            total_matches: Optional[int] = None) -> str:
+    """命中行的**真实最大连续段**文本（与前端 ``matchedRowsLabel`` 完全同规则）。
+
+    * 单段 -> ``3 ~ 449``（单行 -> ``3``）
+    * 多段 -> ``3、12、18~19``（**保留真实不连续性，绝不写成包络 ``3~19``**）
+    * 段数被 cap 截断 -> ``共 4 个命中行，分布在 87 段｜范围 1 ~ 15``
+    * 无 runs（旧结果/不可得）-> 空串（调用方回退既有包络行或省略）
+    """
+    pairs: List[List[int]] = []
+    for item in (runs or []):
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            try:
+                pairs.append([int(item[0]), int(item[1])])
+            except (TypeError, ValueError):  # pragma: no cover - 防御脏数据
+                continue
+    if not pairs:
+        return ''
+    if truncated:
+        seg = run_count if isinstance(run_count, int) else len(pairs)
+        total = total_matches if isinstance(total_matches, int) else ''
+        return f'共 {total} 个命中行，分布在 {seg} 段｜范围 {pairs[0][0]} ~ {pairs[-1][1]}'
+    if len(pairs) == 1:
+        first, last = pairs[0]
+        return f'{first}' if first == last else f'{first} ~ {last}'
+    return '、'.join(f'{a}' if a == b else f'{a}~{b}' for a, b in pairs)
+
+
+def matched_rows_line(prefix: str, runs: Optional[Sequence[Sequence[int]]], run_count: Optional[int],
+                      runs_truncated: bool, total_matches: Optional[int],
+                      fallback_text: str = '') -> str:
+    """叙述用的「命中 Excel 行」行：**优先真实连续段**；拿不到 runs 时回退既有包络文案。"""
+    text = format_matched_row_runs(runs, run_count, runs_truncated, total_matches)
+    if text:
+        return f'- {prefix}：{text}'
+    return fallback_text
+
+
 def format_relaxed_notes(notes: Optional[Sequence[str]]) -> str:
     """把**执行层真实产生的** ``relaxed_filters`` 说明渲染成叙述行（R2）。
 
@@ -1370,7 +1438,12 @@ def format_aggregate_summary(result: AggregateResult, filename: str,
         )
         if result.value is None:
             lines.append('- 说明：命中行中没有可数值化的单元格，因此没有可计算的统计值（未按 0 处理）')
-    if result.row_excel_span:
+    # 相邻 P2：优先**真实连续段**（3、12、18~19）；拿不到 runs 时回退既有包络行
+    _runs_text = format_matched_row_runs(result.matched_row_runs, result.matched_row_run_count,
+                                         result.matched_row_runs_truncated, result.matched_rows)
+    if _runs_text:
+        lines.append(f'- 匹配 Excel 行：{_runs_text}（共 {result.matched_rows} 行）')
+    elif result.row_excel_span:
         lines.append(
             f'- 匹配 Excel 行：{result.row_excel_span["first"]} ~ {result.row_excel_span["last"]}'
             f'（共 {result.matched_rows} 行）'
@@ -1475,8 +1548,16 @@ def execute_group_aggregate_duckdb(
     if totals[1] is not None and totals[2] is not None:
         span = {'first': int(totals[1]), 'last': int(totals[2])}
 
+    # 相邻 P2：DuckDB 分组路径的 totals_sql 只给 MIN/MAX（**包络**），拿不到"到底命中了哪些行"。
+    # 为与表格/单值统计统一为**真实连续段**，这里复用本模块既有的确定性匹配器
+    # ``_matched_excel_rows``（与 Python 引擎、单值统计同一实现与同一口径；**不新增 SQL、
+    # 不改变任何聚合值**）。若未来要求"零额外扫描"，可改为留空 -> 卡片/叙述自动回退既有包络文案。
+    runs, run_count, runs_truncated = excel_query.collapse_row_runs(
+        _matched_excel_rows(sheet, plan_filters))
+
     return _build_group_result(representation, request, sheet, rows, total_matched, span,
-                               total_groups_before)
+                               total_groups_before,
+                               runs, run_count, runs_truncated)
 
 
 def _group_value_sort_key(value: Any, phys_type: str) -> Tuple[int, Any]:
@@ -1626,11 +1707,15 @@ def execute_group_aggregate_python(
 
     total_matched = sum(r.matched_rows for r in rows)
     span = None
+    runs: List[List[int]] = []
+    run_count, runs_truncated = 0, False
     if rows:
         # 整体匹配范围：从 Sheet 定位首个/末个命中行的 Excel 行号
         matched_excel_rows = _matched_excel_rows(sheet, plan_filters)
         if matched_excel_rows:
             span = {'first': matched_excel_rows[0], 'last': matched_excel_rows[-1]}
+            # 相邻 P2：同一份真实行号直接折叠成"真实连续段"（零额外扫描）
+            runs, run_count, runs_truncated = excel_query.collapse_row_runs(matched_excel_rows)
 
     # Phase 3C：排序（与 DuckDB 的 ORDER BY ... NULLS LAST 完全一致）后截取 TOP-N
     total_groups_before = len(rows)
@@ -1639,7 +1724,8 @@ def execute_group_aggregate_python(
         rows = rows[:request.top_n]
 
     return _build_group_result(representation, request, sheet, rows, total_matched, span,
-                               total_groups_before)
+                               total_groups_before,
+                               runs, run_count, runs_truncated)
 
 
 def _matched_excel_rows(
@@ -1666,6 +1752,9 @@ def _build_group_result(
     total_matched: int,
     span: Optional[Dict[str, int]],
     total_groups_before: int,
+    runs: Optional[List[List[int]]] = None,
+    run_count: int = 0,
+    runs_truncated: bool = False,
 ) -> GroupedAggregateResult:
     group_meta = [
         {'name': sheet.columns[i].name, 'index': i,
@@ -1687,6 +1776,9 @@ def _build_group_result(
         total_rows_in_sheet=sheet.row_count,
         row_excel_span=span,
         column_numeric_in_sheet=request.column_numeric_in_sheet,
+        matched_row_runs=runs,
+        matched_row_run_count=run_count,
+        matched_row_runs_truncated=runs_truncated,
         definition=_group_definition(request.operation, request.column, request.group_by,
                                      request.order_by, request.order_dir, request.top_n,
                                      request.calculation),
@@ -1736,7 +1828,12 @@ def format_group_aggregate_summary(result: GroupedAggregateResult, filename: str
         lines.append('- 排序说明：' + result.sort_description())
     else:
         lines.append('- 排序：无（结果顺序为数据库返回顺序）')
-    if result.row_excel_span:
+    # 相邻 P2：优先**真实连续段**（3、12、18~19）；拿不到 runs 时回退既有包络行
+    _runs_text = format_matched_row_runs(result.matched_row_runs, result.matched_row_run_count,
+                                         result.matched_row_runs_truncated, result.matched_rows)
+    if _runs_text:
+        lines.append(f'- 匹配 Excel 行：{_runs_text}（共 {result.matched_rows} 行）')
+    elif result.row_excel_span:
         lines.append(
             f'- 匹配 Excel 行区间：{result.row_excel_span["first"]} ~ {result.row_excel_span["last"]}'
         )

@@ -614,6 +614,7 @@ import { restoreExcelHistory } from './excelHistory'
 import {
   groupRelaxedLabel,
   matchedRowsLabel,
+  matchedRowsLine,
   multiStepSpanLabel,
   multiStepStep2InputLabel,
   multiStepStep2SourceLabel,
@@ -1059,7 +1060,7 @@ const buildExcelAgg = (a: ExcelAggregateResult, res: ExcelNlQueryResult) => {
     ? `${a.matched_rows} 行（该 Sheet 共 ${a.total_rows_in_sheet} 行）`
     : `${a.matched_rows} 行，其中可数值化 ${a.numeric_rows} 行`
       + `（空值 ${a.empty_rows}、非数值 ${a.non_numeric_rows} 不计入）`
-  const span = a.row_excel_spans
+  // （相邻 P2）行信息统一由 matchedRowsLine 处理：优先真实连续段，无 runs 时回退 row_excel_spans
   return {
     engine: res.engine || '',
     inherited: !!res.inherited_from,
@@ -1073,9 +1074,8 @@ const buildExcelAgg = (a: ExcelAggregateResult, res: ExcelNlQueryResult) => {
     document: res.document?.filename || '',
     sheet: a.sheet_name,
     definition: a.definition,
-    spanLabel: span
-      ? `匹配 Excel 行：${span.first} ~ ${span.last}（共 ${a.matched_rows} 行）`
-      : '',
+    // 相邻 P2：优先真实连续段（3、12、18~19）；无 runs 时回退既有包络行（数值/口径未变）
+    spanLabel: matchedRowsLine(a, { withCount: true, spanPrefix: '匹配 Excel 行' }),
     relaxedLabel: (res.relaxed_filters || []).join('；')
   }
 }
@@ -1104,7 +1104,6 @@ const buildGroupAgg = (g: ExcelGroupedAggregateResult, res: ExcelNlQueryResult) 
     })
     return obj
   })
-  const span = g.row_excel_spans
   // Phase 3C：排序与 TOP-N 信息全部来自后端（前端只展示，绝不排序）
   const sortLabel = g.sorted
     ? `${g.order_by_label} ${g.order_dir === 'desc' ? '↓ 从高到低' : '↑ 从低到高'}`
@@ -1133,7 +1132,8 @@ const buildGroupAgg = (g: ExcelGroupedAggregateResult, res: ExcelNlQueryResult) 
     topLabel,
     sorted: !!g.sorted,
     summaryLabel,
-    spanLabel: span ? `匹配 Excel 行区间：${span.first} ~ ${span.last}` : '',
+    // 相邻 P2：优先真实连续段（3、12、18~19）；无 runs 时回退既有包络文案
+    spanLabel: matchedRowsLine(g),
     // 第 3 项 P2（G5）：条件放宽说明（与表格/单聚合卡片同一格式；放宽≠最终条件，
     // 最终执行条件仍以 filtersLabel 为准）
     relaxedLabel: groupRelaxedLabel(res),

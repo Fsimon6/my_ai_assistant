@@ -522,6 +522,10 @@ class AnalysisResult:
                 # 无命中 / 执行器未提供时为 None；被上限裁剪时 row_excel_truncated=True。
                 'row_excel_spans': getattr(self.step1, 'row_excel_span', None),
                 'row_excel_truncated': getattr(self.step1, 'row_excel_truncated', False),
+                'matched_row_runs': getattr(self.step1, 'matched_row_runs', None) or [],
+                'matched_row_run_count': getattr(self.step1, 'matched_row_run_count', 0),
+                'matched_row_runs_truncated': getattr(self.step1, 'matched_row_runs_truncated',
+                                                      False),
                 'rows': [r.to_dict(self.step1.operation) for r in self.step1.rows],
                 'sort_description': self.step1.sort_description(),
                 'source': self.step1_source,
@@ -680,7 +684,13 @@ def format_analysis_summary(result: AnalysisResult,
         f'- 第 1 步排序：' + (s1.sort_description() if s1.is_sorted else '无（数据库返回顺序）'),
         f'- 第 1 步来源：{result.step1_source}',
     ]
-    if s1.row_excel_span:
+    # 相邻 P2：优先**真实连续段**（3、12、18~19）；拿不到 runs 时回退既有包络行
+    _runs_text = excel_aggregate.format_matched_row_runs(
+        s1.matched_row_runs, s1.matched_row_run_count, s1.matched_row_runs_truncated,
+        s1.matched_rows)
+    if _runs_text:
+        lines.append(f'- 第 1 步匹配 Excel 行：{_runs_text}（共 {s1.matched_rows} 行）')
+    elif s1.row_excel_span:
         lines.append(f'- 第 1 步匹配 Excel 行区间：{s1.row_excel_span["first"]} ~ {s1.row_excel_span["last"]}')
     lines.append('- 筛选条件：' + (
         '；'.join(excel_aggregate._filter_text(f) for f in s1.filters) if s1.filters else '无（全表）'))

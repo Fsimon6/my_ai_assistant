@@ -4,8 +4,10 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
+  formatMatchedRuns,
   groupRelaxedLabel,
   matchedRowsLabel,
+  matchedRowsLine,
   multiStepSpanLabel,
   multiStepStep2InputLabel,
   multiStepStep2SourceLabel,
@@ -135,6 +137,72 @@ describe('相邻 P2 matchedRowsLabel（全部命中 Excel 行，真实连续段�
     expect(matchedRowsLabel({ matched_row_runs: runs, matched_row_run_count: 87,
                               matched_row_runs_truncated: true, total_matches: 447 }))
       .toBe('全部命中 Excel 行：共 447 个命中行，分布在 87 段｜范围 1 ~ 15')
+  })
+})
+
+describe('相邻 P2 formatMatchedRuns / matchedRowsLine（真实连续段，不伪造连续）', () => {
+  it('连续命中 -> 单段区间；单行 -> 单值', () => {
+    expect(formatMatchedRuns({ matched_row_runs: [[3, 449]] })).toBe('3 ~ 449')
+    expect(formatMatchedRuns({ matched_row_runs: [[7, 7]] })).toBe('7')
+  })
+
+  it('离散命中 -> 保留不连续性（绝不写成包络）', () => {
+    const r = { matched_row_runs: [[3, 3], [12, 12], [18, 19]] }
+    expect(formatMatchedRuns(r)).toBe('3、12、18~19')
+    expect(formatMatchedRuns(r)).not.toContain('3~19')
+    expect(formatMatchedRuns(r)).not.toContain('3 ~ 19')
+  })
+
+  it('段数被 cap 截断 -> 明说命中行数与段数', () => {
+    const runs = [[1, 1], [3, 3], [5, 5], [7, 7], [9, 9], [11, 11], [13, 13], [15, 15]]
+    expect(formatMatchedRuns({ matched_row_runs: runs, matched_row_run_count: 87,
+                               matched_row_runs_truncated: true, matched_rows: 447 }))
+      .toBe('共 447 个命中行，分布在 87 段｜范围 1 ~ 15')
+  })
+
+  it('空结果 / 缺字段 -> 空串（不显示、不猜）', () => {
+    expect(formatMatchedRuns({ matched_row_runs: [] })).toBe('')
+    expect(formatMatchedRuns({})).toBe('')
+    expect(formatMatchedRuns(undefined)).toBe('')
+  })
+
+  it('matchedRowsLine：有 runs 用真实连续段；无 runs 回退既有包络文案', () => {
+    expect(matchedRowsLine({ matched_row_runs: [[3, 3], [12, 12], [18, 19]] }))
+      .toBe('匹配 Excel 行：3、12、18~19')
+    // 旧快照（无 runs）-> 与既有包络输出逐字一致
+    expect(matchedRowsLine({ row_excel_spans: { first: 3, last: 19 } }))
+      .toBe('匹配 Excel 行区间：3 ~ 19')
+    expect(matchedRowsLine({ row_excel_spans: { first: 3, last: 19 }, row_excel_truncated: true }))
+      .toBe('匹配 Excel 行区间：3 ~ 19（行号已按上限裁剪）')
+    expect(matchedRowsLine({})).toBe('')
+  })
+
+  it('withCount 时按 matched_rows 追加计数（单值统计/多步叙述的既有形状）', () => {
+    expect(matchedRowsLine({ matched_row_runs: [[3, 3], [12, 12], [18, 19]], matched_rows: 4 },
+                           { withCount: true })).toBe('匹配 Excel 行：3、12、18~19（共 4 行）')
+  })
+
+  it('spanPrefix：单值统计回退时保持既有「匹配 Excel 行：a ~ b（共 N 行）」措辞', () => {
+    expect(matchedRowsLine({ row_excel_spans: { first: 3, last: 21 }, matched_rows: 19 },
+                           { withCount: true, spanPrefix: '匹配 Excel 行' }))
+      .toBe('匹配 Excel 行：3 ~ 21（共 19 行）')
+  })
+})
+
+describe('相邻 P2 multiStepSpanLabel（第 1 步行：真实连续段优先，旧快照回退包络）', () => {
+  it('有 runs -> 真实连续段（不再用 3 ~ 19 表达离散命中）', () => {
+    const s1 = { matched_row_runs: [[3, 3], [12, 12], [18, 19]],
+                 matched_row_run_count: 3, matched_row_runs_truncated: false,
+                 row_excel_spans: { first: 3, last: 19 } }
+    expect(multiStepSpanLabel(s1)).toBe('匹配 Excel 行：3、12、18~19')
+  })
+
+  it('无 runs（旧快照）-> 逐字沿用既有包络文案', () => {
+    expect(multiStepSpanLabel({ row_excel_spans: { first: 3, last: 21 } }))
+      .toBe('匹配 Excel 行区间：3 ~ 21')
+    expect(multiStepSpanLabel({ row_excel_spans: { first: 3, last: 21 }, row_excel_truncated: true }))
+      .toBe('匹配 Excel 行区间：3 ~ 21（行号已按上限裁剪）')
+    expect(multiStepSpanLabel({ row_excel_spans: null })).toBe('')
   })
 })
 

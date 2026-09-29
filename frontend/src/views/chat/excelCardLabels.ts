@@ -5,12 +5,61 @@
  * 兼容：旧历史快照缺少这些**可选增量字段**时优雅降级（返回空串或省略子句），不报错。
  */
 
-/** G1：第 1 步的「匹配 Excel 行区间」（来自分组执行器逐行命中的真实行号）。 */
-export function multiStepSpanLabel(step1: any): string {
-  const span = step1?.row_excel_spans
+/**
+ * 相邻 P2：命中行的**真实最大连续段**文本（单一实现，表格 / 单值统计 / 分组统计 / 多步共用）。
+ *
+ * 与后端 `aggregate.format_matched_row_runs` 完全同规则；数据只来自后端字段：
+ *   * 单段连续 -> `3 ~ 449`（单行 -> `7`）
+ *   * 多段不连续 -> `3、12、18~19`（**绝不**折叠成包络 `3~19`）
+ *   * 段数被 cap 截断 -> `共 4 个命中行，分布在 87 段｜范围 1 ~ 15`
+ *   * 无 runs（旧快照 / 执行层未提供）-> 空串（调用方回退既有包络文案或省略）
+ */
+export function formatMatchedRuns(r: any): string {
+  const runs = Array.isArray(r?.matched_row_runs) ? r.matched_row_runs : []
+  if (!runs.length) return ''
+  const fmt = (pair: any[]) => (pair[0] === pair[1] ? `${pair[0]}` : `${pair[0]}~${pair[1]}`)
+  if (r?.matched_row_runs_truncated === true) {
+    const seg = typeof r?.matched_row_run_count === 'number' ? r.matched_row_run_count : runs.length
+    const total = typeof r?.matched_rows === 'number' ? r.matched_rows
+      : (typeof r?.total_matches === 'number' ? r.total_matches : '')
+    return `共 ${total} 个命中行，分布在 ${seg} 段｜范围 ${runs[0][0]} ~ ${runs[runs.length - 1][1]}`
+  }
+  if (runs.length === 1) {
+    const [a, b] = runs[0]
+    return a === b ? `${a}` : `${a} ~ ${b}`
+  }
+  return runs.map(fmt).join('、')
+}
+
+/**
+ * 相邻 P2：卡片/叙述统一的「匹配 Excel 行」行。
+ *
+ * **优先真实连续段**；拿不到 runs 时回退既有包络文案（`匹配 Excel 行区间：a ~ b`，可带裁剪标注）。
+ * `withCount` 为真时追加「（共 N 行）」（单值统计/多步叙述沿用既有形状）。
+ */
+export function matchedRowsLine(r: any,
+                                options?: { prefix?: string; withCount?: boolean;
+                                            spanPrefix?: string }): string {
+  const prefix = options?.prefix || '匹配 Excel 行'
+  const runsText = formatMatchedRuns(r)
+  if (runsText) {
+    const count = options?.withCount && typeof r?.matched_rows === 'number'
+      ? `（共 ${r.matched_rows} 行）` : ''
+    return `${prefix}：${runsText}${count}`
+  }
+  // 回退：保持各卡片**既有**的包络措辞（单值统计原本就是「匹配 Excel 行：a ~ b」）
+  const spanPrefix = options?.spanPrefix || `${prefix}区间`
+  const span = r?.row_excel_spans
   if (!span || typeof span.first !== 'number' || typeof span.last !== 'number') return ''
-  const base = `匹配 Excel 行区间：${span.first} ~ ${span.last}`
-  return step1?.row_excel_truncated ? `${base}（行号已按上限裁剪）` : base
+  const count = options?.withCount && typeof r?.matched_rows === 'number'
+    ? `（共 ${r.matched_rows} 行）` : ''
+  const base = `${spanPrefix}：${span.first} ~ ${span.last}${count}`
+  return r?.row_excel_truncated ? `${base}（行号已按上限裁剪）` : base
+}
+
+/** G1：第 1 步的「匹配 Excel 行」（真实连续段优先；无 runs 时沿用既有包络文案，逐字不变）。 */
+export function multiStepSpanLabel(step1: any): string {
+  return matchedRowsLine(step1)
 }
 
 /** G2：第 2 步输入说明。`numeric_rows` 缺失（旧快照）时省略该子句；为 0 时如实显示。 */
@@ -68,22 +117,8 @@ export function tableRowRangeLabel(r: any): string {
  *   * 无 runs（旧快照 / 命中行未随本页返回）-> 空串（宁可不显示，也不猜）
  */
 export function matchedRowsLabel(r: any): string {
-  const runs = Array.isArray(r?.matched_row_runs) ? r.matched_row_runs : []
-  if (!runs.length) return ''
-  const fmt = (pair: any[]) => (pair[0] === pair[1] ? `${pair[0]}` : `${pair[0]}~${pair[1]}`)
-  if (r?.matched_row_runs_truncated === true) {
-    const seg = typeof r?.matched_row_run_count === 'number' ? r.matched_row_run_count : runs.length
-    const total = typeof r?.total_matches === 'number' ? r.total_matches : ''
-    const first = runs[0][0]
-    const last = runs[runs.length - 1][1]
-    return `全部命中 Excel 行：共 ${total} 个命中行，分布在 ${seg} 段｜范围 ${first} ~ ${last}`
-  }
-  if (runs.length === 1) {
-    const [a, b] = runs[0]
-    // 单段：与项目既有"匹配 Excel 行区间：3 ~ 21 / 本页 Excel 行号：3 ~ 7"同格式
-    return a === b ? `全部命中 Excel 行：${a}` : `全部命中 Excel 行：${a} ~ ${b}`
-  }
-  return `全部命中 Excel 行：${runs.map(fmt).join('、')}`
+  const runsText = formatMatchedRuns(r)
+  return runsText ? `全部命中 Excel 行：${runsText}` : ''
 }
 
 /**

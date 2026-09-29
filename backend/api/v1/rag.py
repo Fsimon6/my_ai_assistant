@@ -736,15 +736,19 @@ EXCEL_HISTORY_MAX_ROWS = 500
 _RESULT_KEYS = ('offset', 'limit', 'returned_count', 'total_matches', 'total_rows_in_sheet',
                 'has_more', 'next_offset', 'sheet_index', 'sheet_name',
                 'matched_row_runs', 'matched_row_run_count', 'matched_row_runs_truncated')
+#: 相邻 P2（2026-09-29）：``matched_row_runs`` 系列 = 命中行的**真实最大连续段**
+#: （单值统计 / 分组统计 / multi_step 第 1 步共用同一折叠函数），替代只看首末行号的包络表达。
+#: 三者都是 **schema v1 的可选增量字段**：旧快照缺失时卡片/叙述自动回退既有包络文案。
+_ROW_RUN_KEYS = ('matched_row_runs', 'matched_row_run_count', 'matched_row_runs_truncated')
 _AGG_KEYS = ('operation', 'operation_label', 'column', 'column_index', 'column_letter',
              'column_numeric_in_sheet', 'value', 'value_display', 'matched_rows', 'numeric_rows',
              'empty_rows', 'non_numeric_rows', 'total_rows_in_sheet', 'row_excel_spans',
-             'sheet_index', 'sheet_name', 'definition')
+             'sheet_index', 'sheet_name', 'definition') + _ROW_RUN_KEYS
 _GROUP_KEYS = ('kind', 'operation', 'operation_label', 'column', 'column_index', 'column_letter',
                'column_numeric_in_sheet', 'total_groups', 'returned_groups', 'top_n', 'order_by',
                'order_by_column', 'order_by_label', 'order_dir', 'order_dir_label', 'sorted',
                'sort_description', 'truncated_by_top_n', 'matched_rows', 'total_rows_in_sheet',
-               'row_excel_spans', 'sheet_index', 'sheet_name', 'definition')
+               'row_excel_spans', 'sheet_index', 'sheet_name', 'definition') + _ROW_RUN_KEYS
 #: multi_step 的 step 白名单 = 分组结果键 + 步骤专有键。
 #: 第 3 项 P2：G1 需要 ``row_excel_spans``（已在 _GROUP_KEYS 中）、``row_excel_truncated``；
 #: G2 需要 ``numeric_rows``（**第 2 步输入中可数值化的个数**，由执行器用与求值同一条数值化

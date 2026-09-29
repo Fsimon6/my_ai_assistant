@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   groupRelaxedLabel,
   matchedRowsLabel,
+  matchedRowsLine,
   multiStepSpanLabel,
   multiStepStep2InputLabel,
   multiStepStep2SourceLabel,
@@ -329,6 +330,53 @@ describe('restoreExcelHistory', () => {
     expect(out.excelTable).toBeTruthy()
     expect(matchedRowsLabel(calls.result![0])).toBe('')
     expect(tableRowRangeLabel(calls.result![0])).toContain('本页 Excel 行号')   // 既有行仍在
+  })
+
+  it('相邻 P2：aggregate / group 的真实连续段随恢复透传（实时==历史）', () => {
+    const { builders, calls } = makeBuilders()
+    const runs = { matched_row_runs: [[3, 3], [12, 12], [18, 19]],
+                   matched_row_run_count: 3, matched_row_runs_truncated: false }
+
+    const outA = restoreExcelHistory(
+      { source: 'excel', excel: snapshot('aggregate', { ...PAYLOADS.aggregate, ...runs,
+                                                        matched_rows: 4 }) }, builders)
+    expect(outA.excelAgg).toBeTruthy()
+    expect(matchedRowsLine(calls.aggregate![0], { withCount: true, spanPrefix: '匹配 Excel 行' }))
+      .toBe('匹配 Excel 行：3、12、18~19（共 4 行）')
+
+    const outG = restoreExcelHistory(
+      { source: 'excel', excel: snapshot('group_aggregate', { ...PAYLOADS.group_aggregate, ...runs,
+                                                              matched_rows: 4 }) }, builders)
+    expect(outG.excelGroupAgg).toBeTruthy()
+    expect(matchedRowsLine(calls.group![0])).toBe('匹配 Excel 行：3、12、18~19')
+  })
+
+  it('相邻 P2：multi_step 第 1 步真实连续段随恢复透传（不写成 3 ~ 19）', () => {
+    const { builders, calls } = makeBuilders()
+    const snap = snapshot('multi_step', {
+      ...PAYLOADS.multi_step,
+      step1: { ...PAYLOADS.multi_step.step1,
+               matched_row_runs: [[3, 3], [12, 12], [18, 19]],
+               matched_row_run_count: 3, matched_row_runs_truncated: false }
+    })
+    const out = restoreExcelHistory({ source: 'excel', excel: snap }, builders)
+    expect(out.excelMultiStep).toBeTruthy()
+    const step1 = calls.multi![0].step1
+    expect(step1.matched_row_runs).toEqual([[3, 3], [12, 12], [18, 19]])
+    expect(multiStepSpanLabel(step1)).toBe('匹配 Excel 行：3、12、18~19')
+  })
+
+  it('相邻 P2：旧快照（无 runs）-> 正常恢复并逐字沿用既有包络文案', () => {
+    const { builders, calls } = makeBuilders()
+    const aggPayload = { ...PAYLOADS.aggregate } as Record<string, any>
+    delete aggPayload.matched_row_runs
+    delete aggPayload.matched_row_run_count
+    delete aggPayload.matched_row_runs_truncated
+    const out = restoreExcelHistory(
+      { source: 'excel', excel: snapshot('aggregate', aggPayload) }, builders)
+    expect(out.excelAgg).toBeTruthy()
+    expect(matchedRowsLine(calls.aggregate![0], { withCount: true, spanPrefix: '匹配 Excel 行' }))
+      .toBe('匹配 Excel 行：3 ~ 21（共 19 行）')          // 回退：与旧实现逐字一致
   })
 
   it('实时与历史使用同一 builder（注入）—— 相同 payload 得到相同视图模型', () => {
