@@ -731,8 +731,11 @@ EXCEL_HISTORY_SCHEMA_VERSION = 1
 #: 超出时截断并置 history_truncated=True，前端必须显式提示，绝不假装结果完整。
 EXCEL_HISTORY_MAX_ROWS = 500
 
+#: 相邻 P2（2026-09-29）：``matched_row_runs`` 系列是**可选增量字段**（全部命中行的真实
+#: 最大连续段），旧快照缺字段时前端不显示该行；schema_version 保持 1，无 migration、不回填。
 _RESULT_KEYS = ('offset', 'limit', 'returned_count', 'total_matches', 'total_rows_in_sheet',
-                'has_more', 'next_offset', 'sheet_index', 'sheet_name')
+                'has_more', 'next_offset', 'sheet_index', 'sheet_name',
+                'matched_row_runs', 'matched_row_run_count', 'matched_row_runs_truncated')
 _AGG_KEYS = ('operation', 'operation_label', 'column', 'column_index', 'column_letter',
              'column_numeric_in_sheet', 'value', 'value_display', 'matched_rows', 'numeric_rows',
              'empty_rows', 'non_numeric_rows', 'total_rows_in_sheet', 'row_excel_spans',

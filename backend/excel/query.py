@@ -38,7 +38,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from backend.excel import calculation
 from backend.excel.representation import ColumnMeta, SheetRepresentation, WorkbookRepresentation
@@ -137,6 +137,30 @@ class StructuredQueryRequest:
     calc_filter: Optional[Dict[str, Any]] = None      # {'operator','value'} 对计算值比较
 
 
+#: 「全部命中 Excel 行」最多返回多少**连续段**（防止碎片化命中把 payload 撑爆）
+MAX_MATCHED_ROW_RUNS = 8
+
+
+def collapse_row_runs(nums: Sequence[int], cap: int = MAX_MATCHED_ROW_RUNS) -> Tuple[List[List[int]], int, bool]:
+    """把**已升序**的 Excel 行号折叠成「最大连续段」（相邻差 1 视为连续）。
+
+    返回 ``(runs, run_count, truncated)``：
+      * runs：最多 ``cap`` 段，每段 ``[first, last]``（单行时 first == last）；
+      * run_count：**真实**段数（即使 runs 被截断也准确）；
+      * truncated：runs 是否被截断（段数 > cap）。
+
+    说明（相邻 P2 设计要点）：这里**只做真实折叠**，绝不把不相邻的行合并成一段；
+    因此前端可以如实表达"不连续命中"（例：``3、12、18~19``），而不是误导性的包络 ``3~19``。
+    """
+    runs: List[List[int]] = []
+    for n in nums:
+        if runs and n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    return runs[:cap], len(runs), len(runs) > cap
+
+
 @dataclass
 class StructuredQueryResult:
     document_id: str
@@ -144,7 +168,7 @@ class StructuredQueryResult:
     sheet_name: str
     columns: List[Dict[str, Any]]                # 投影列元信息（含 excel_column_letter）
     rows: List[List[Any]]                        # 投影后的数据行（保持原始顺序）
-    row_excel_numbers: List[int]                 # 每行对应的 Excel 原始行号（1-based）
+    row_excel_numbers: List[int]                 # 每行对应的 Excel 原始行号（1-based）；**仅本页**
     row_ranges: List[str]                        # 例如 "A226:J226"（按投影列跨度）
     total_rows_in_sheet: int
     total_matches: int
@@ -154,6 +178,10 @@ class StructuredQueryResult:
     has_more: bool
     next_offset: Optional[int]
     applied_filters: List[Dict[str, Any]]
+    # 相邻 P2：**全部命中行**的 Excel 行分布（真实最大连续段，非包络；不含分页）
+    matched_row_runs: Optional[List[List[int]]] = None
+    matched_row_run_count: int = 0
+    matched_row_runs_truncated: bool = False
     # Phase 4B：计算字段信息（已解析到真实列；无计算字段时为 None）
     calculation: Optional[Dict[str, Any]] = None
     calc_filter: Optional[Dict[str, Any]] = None
@@ -175,6 +203,9 @@ class StructuredQueryResult:
             'has_more': self.has_more,
             'next_offset': self.next_offset,
             'applied_filters': self.applied_filters,
+            'matched_row_runs': self.matched_row_runs or [],
+            'matched_row_run_count': self.matched_row_run_count,
+            'matched_row_runs_truncated': self.matched_row_runs_truncated,
             'calculation': self.calculation,
             'calc_filter': self.calc_filter,
         }
@@ -702,6 +733,10 @@ def execute_query(
         )
 
     total_matches = len(matched_rows)
+    # 相邻 P2：把**全部命中行**（分页前）的真实 Excel 行号折叠成最大连续段（零额外查询、
+    # 不改变 rows/total_matches/排序/过滤/分页；只是把已有真实信息暴露给结果 payload）
+    matched_row_runs, matched_row_run_count, matched_row_runs_truncated = \
+        collapse_row_runs(matched_excel_rows)
 
     # 4) 分页切片（offset 超过总数 -> 空结果，不是错误）
     start = request.offset
@@ -749,6 +784,9 @@ def execute_query(
         has_more=has_more,
         next_offset=(start + returned_count) if has_more else None,
         applied_filters=applied_filters,
+        matched_row_runs=matched_row_runs,
+        matched_row_run_count=matched_row_run_count,
+        matched_row_runs_truncated=matched_row_runs_truncated,
         calculation=calc.to_dict() if calc is not None else None,
         calc_filter=dict(calc_filter) if calc_filter is not None else None,
     )

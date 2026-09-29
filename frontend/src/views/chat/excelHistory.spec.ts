@@ -8,6 +8,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   groupRelaxedLabel,
+  matchedRowsLabel,
   multiStepSpanLabel,
   multiStepStep2InputLabel,
   multiStepStep2SourceLabel,
@@ -303,6 +304,31 @@ describe('restoreExcelHistory', () => {
     expect(label).toContain(`（${step2.input_rows} 个分组的聚合值）`)
     expect(label).toContain('不会重新回到原始 Excel 数据行')
     expect(label).not.toContain('TOP')
+  })
+
+  it('相邻 P2：全部命中行的连续段随历史恢复透传（实时==历史）', () => {
+    const { builders, calls } = makeBuilders()
+    const snap = { ...snapshot('result', PAYLOADS.result),
+                   payload: { ...PAYLOADS.result, matched_row_runs: [[3, 3], [12, 12], [18, 19]],
+                              matched_row_run_count: 3, matched_row_runs_truncated: false } }
+    const out = restoreExcelHistory({ source: 'excel', excel: snap }, builders)
+    expect(out.excelTable).toBeTruthy()
+    const payload = calls.result![0]
+    expect(payload.matched_row_runs).toEqual([[3, 3], [12, 12], [18, 19]])
+    expect(matchedRowsLabel(payload)).toBe('全部命中 Excel 行：3、12、18~19')
+  })
+
+  it('相邻 P2：旧快照缺新字段 -> 正常恢复、不显示"全部命中行"（不猜）', () => {
+    const { builders, calls } = makeBuilders()
+    const legacy = { ...PAYLOADS.result } as Record<string, any>
+    delete legacy.matched_row_runs
+    delete legacy.matched_row_run_count
+    delete legacy.matched_row_runs_truncated
+    const out = restoreExcelHistory({ source: 'excel', excel: snapshot('result', legacy) },
+                                    builders)
+    expect(out.excelTable).toBeTruthy()
+    expect(matchedRowsLabel(calls.result![0])).toBe('')
+    expect(tableRowRangeLabel(calls.result![0])).toContain('本页 Excel 行号')   // 既有行仍在
   })
 
   it('实时与历史使用同一 builder（注入）—— 相同 payload 得到相同视图模型', () => {

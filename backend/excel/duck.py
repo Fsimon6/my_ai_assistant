@@ -770,6 +770,16 @@ def query_duckdb_representation(
             'is_calculated': True,
         })
 
+    # 相邻 P2：全部命中行的 Excel 行分布（最大连续段）。
+    # DuckDB 路径只取回**本页**行（count_sql + page_sql），因此仅在"本页即全部命中"
+    # （offset=0 且无更多页）时才可如实折叠；否则留空 —— **绝不**用本页行号外推全量分布，
+    # 也不额外发 SQL（保持"零额外查询、不改分页"）。
+    if request.offset == 0 and not has_more:
+        matched_runs, matched_run_count, matched_runs_truncated = \
+            excel_query.collapse_row_runs(excel_rows)
+    else:
+        matched_runs, matched_run_count, matched_runs_truncated = [], 0, False
+
     return excel_query.StructuredQueryResult(
         document_id=representation.document_id,
         sheet_index=sheet.sheet_index,
@@ -786,6 +796,9 @@ def query_duckdb_representation(
         has_more=has_more,
         next_offset=(request.offset + returned_count) if has_more else None,
         applied_filters=applied,
+        matched_row_runs=matched_runs,
+        matched_row_run_count=matched_run_count,
+        matched_row_runs_truncated=matched_runs_truncated,
         calculation=calc.to_dict() if calc is not None else None,
         calc_filter=({'operator': plan.calc_filter[0], 'value': plan.calc_filter[1]}
                      if plan.calc_filter else None),

@@ -209,6 +209,10 @@
                       </el-table-column>
                     </el-table>
                     <div v-else class="excel-answer-note">没有匹配的行（0 条）</div>
+                    <!-- 相邻 P2：先给"全部命中行"分布（真实连续段），再给"本页"范围 -->
+                    <div v-if="message.excelTable.matchedRowsRangeLabel" class="excel-answer-note">
+                      {{ message.excelTable.matchedRowsRangeLabel }}
+                    </div>
                     <div class="excel-answer-note">{{ message.excelTable.rowRangeLabel }}</div>
                   </div>
 
@@ -609,6 +613,7 @@ import { restoreExcelHistory } from './excelHistory'
 // 第 3 项 P2：卡片文案纯函数（G1 行区间 / G2 可数值化个数 / G5 条件放宽说明 / R1 本页行号 / R4 第 2 步来源）
 import {
   groupRelaxedLabel,
+  matchedRowsLabel,
   multiStepSpanLabel,
   multiStepStep2InputLabel,
   multiStepStep2SourceLabel,
@@ -996,6 +1001,8 @@ const buildExcelTable = (r: ExcelQueryResult, documentName: string, continued = 
   })
   // R1：行范围说明由纯函数给出（数值与分页逻辑不变，仅把「本页」语义写明）
   const rowRangeLabel = tableRowRangeLabel(r)
+  // 相邻 P2：全部命中行的 Excel 行分布（真实最大连续段；无数据时不显示）
+  const matchedRowsRangeLabel = matchedRowsLabel(r)
   // Phase 4B：计算字段口径（标签与说明全部由后端给出）
   const calc = r.calculation || null
   const calcLabel = calc
@@ -1013,6 +1020,7 @@ const buildExcelTable = (r: ExcelQueryResult, documentName: string, continued = 
     document: documentName,
     sheet: r.sheet_name,
     rowRangeLabel,
+    matchedRowsRangeLabel,
     continued,
     // 让用户能直接核对"过滤条件是否正确"
     filtersLabel: formatFilters(r.applied_filters),

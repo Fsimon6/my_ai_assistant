@@ -58,6 +58,35 @@ export function tableRowRangeLabel(r: any): string {
 }
 
 /**
+ * 相邻 P2：表格卡片的「全部命中 Excel 行」说明（真实最大连续段，**不伪造连续**）。
+ *
+ * 数据来自后端 `matched_row_runs` / `matched_row_run_count` / `matched_row_runs_truncated`
+ * （由执行器把"全部命中行"的物理行号折叠成最大连续段；本页行号另见 tableRowRangeLabel）：
+ *   * 单段连续 -> `全部命中 Excel 行：3 ~ 449`
+ *   * 多段不连续 -> `全部命中 Excel 行：3、12、18~19`（保留真实不连续性）
+ *   * 段数被截断 -> `全部命中 Excel 行：共 447 个命中行，分布在 87 段｜范围 3 ~ 449`
+ *   * 无 runs（旧快照 / 命中行未随本页返回）-> 空串（宁可不显示，也不猜）
+ */
+export function matchedRowsLabel(r: any): string {
+  const runs = Array.isArray(r?.matched_row_runs) ? r.matched_row_runs : []
+  if (!runs.length) return ''
+  const fmt = (pair: any[]) => (pair[0] === pair[1] ? `${pair[0]}` : `${pair[0]}~${pair[1]}`)
+  if (r?.matched_row_runs_truncated === true) {
+    const seg = typeof r?.matched_row_run_count === 'number' ? r.matched_row_run_count : runs.length
+    const total = typeof r?.total_matches === 'number' ? r.total_matches : ''
+    const first = runs[0][0]
+    const last = runs[runs.length - 1][1]
+    return `全部命中 Excel 行：共 ${total} 个命中行，分布在 ${seg} 段｜范围 ${first} ~ ${last}`
+  }
+  if (runs.length === 1) {
+    const [a, b] = runs[0]
+    // 单段：与项目既有"匹配 Excel 行区间：3 ~ 21 / 本页 Excel 行号：3 ~ 7"同格式
+    return a === b ? `全部命中 Excel 行：${a}` : `全部命中 Excel 行：${a} ~ ${b}`
+  }
+  return `全部命中 Excel 行：${runs.map(fmt).join('、')}`
+}
+
+/**
  * R4：第 2 步的数据来源说明（自然中文，动态带出**本步实际输入的分组数**）。
  *
  * 保留原语义（关键正确性声明）：第 2 步只对第 1 步产出的**聚合结果**再计算，

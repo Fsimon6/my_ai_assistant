@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   groupRelaxedLabel,
+  matchedRowsLabel,
   multiStepSpanLabel,
   multiStepStep2InputLabel,
   multiStepStep2SourceLabel,
@@ -98,6 +99,42 @@ describe('R1 tableRowRangeLabel（本页行号语义）', () => {
       .toBe('本页 Excel 行号 3 ~ 5｜共命中 19 行，本次返回 3 行（第 1~3 条，offset=0, limit=5）')
     expect(tableRowRangeLabel(page(0, [3, 4, 5])))
       .not.toContain('单次显示上限')
+  })
+})
+
+describe('相邻 P2 matchedRowsLabel（全部命中 Excel 行，真实连续段）', () => {
+  it('连续命中 -> 单段区间', () => {
+    expect(matchedRowsLabel({ matched_row_runs: [[3, 449]], matched_row_run_count: 1,
+                              matched_row_runs_truncated: false, total_matches: 447 }))
+      .toBe('全部命中 Excel 行：3 ~ 449')
+  })
+
+  it('不连续命中 -> 保留真实不连续性（绝不合并成包络）', () => {
+    const label = matchedRowsLabel({ matched_row_runs: [[3, 3], [12, 12], [18, 19]],
+                                     matched_row_run_count: 3,
+                                     matched_row_runs_truncated: false, total_matches: 4 })
+    expect(label).toBe('全部命中 Excel 行：3、12、18~19')
+    expect(label).not.toContain('3 ~ 19')      // 不得伪造连续范围
+  })
+
+  it('单行 -> 单值', () => {
+    expect(matchedRowsLabel({ matched_row_runs: [[7, 7]], matched_row_run_count: 1,
+                              matched_row_runs_truncated: false, total_matches: 1 }))
+      .toBe('全部命中 Excel 行：7')
+  })
+
+  it('空结果 / 无字段（旧快照或本页非全量）-> 空串（不显示该行）', () => {
+    expect(matchedRowsLabel({ matched_row_runs: [], matched_row_run_count: 0,
+                              matched_row_runs_truncated: false })).toBe('')
+    expect(matchedRowsLabel({})).toBe('')
+    expect(matchedRowsLabel(undefined)).toBe('')
+  })
+
+  it('段数被截断 -> 明确"共 N 个命中行、分布在 M 段"（不假装列全）', () => {
+    const runs = [[1, 1], [3, 3], [5, 5], [7, 7], [9, 9], [11, 11], [13, 13], [15, 15]]
+    expect(matchedRowsLabel({ matched_row_runs: runs, matched_row_run_count: 87,
+                              matched_row_runs_truncated: true, total_matches: 447 }))
+      .toBe('全部命中 Excel 行：共 447 个命中行，分布在 87 段｜范围 1 ~ 15')
   })
 })
 
