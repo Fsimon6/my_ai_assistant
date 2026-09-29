@@ -674,8 +674,14 @@ def build_validated_query(
     return payload
 
 
-def format_summary(result: 'excel_query.StructuredQueryResult', filename: str) -> str:
-    """由 Python 生成结果摘要（不经过 LLM，避免编造事实）。"""
+def format_summary(result: 'excel_query.StructuredQueryResult', filename: str,
+                   relaxed_notes: Optional[Sequence[str]] = None) -> str:
+    """由 Python 生成结果摘要（不经过 LLM，避免编造事实）。
+
+    R2：表格叙述此前**没有**筛选条件行，也没有区分"放宽过程"。
+    现在：有筛选时输出「筛选条件」（= **最终执行条件**）；执行层确有放宽（``relaxed_notes``
+    非空）时再输出一行「筛选过程」。无筛选 -> 不输出「筛选条件：无」，保持简洁。
+    """
     col_names = [c['name'] for c in result.columns]
     # 文案规范（批次 A）：面向用户不暴露 offset/limit 这类分页实现参数，改用"第 a~b 条"。
     if result.returned_count:
@@ -704,11 +710,17 @@ def format_summary(result: 'excel_query.StructuredQueryResult', filename: str) -
                  f'（计算值为空的行不匹配任何比较，不会当作 0）')
     if result.row_excel_numbers:
         head += f'\n- 本页 Excel 行号：{result.row_excel_numbers[0]} ~ {result.row_excel_numbers[-1]}'
+    # R2：有筛选才输出"筛选条件"（最终执行条件）；放宽过程只在真实发生（relaxed_notes 非空）时输出
+    if result.applied_filters:
+        head += '\n- 筛选条件：' + '；'.join(
+            excel_aggregate._filter_text(f) for f in result.applied_filters)
+    head += excel_aggregate.format_relaxed_notes(relaxed_notes)
     head += _cap_notice(result)
     return head
 
 
-def format_pagination_summary(result: 'excel_query.StructuredQueryResult', filename: str, mode: str) -> str:
+def format_pagination_summary(result: 'excel_query.StructuredQueryResult', filename: str, mode: str,
+                              relaxed_notes: Optional[Sequence[str]] = None) -> str:
     """由 Python 生成「继续分页」的摘要（不经过 LLM）。"""
     col_names = [c['name'] for c in result.columns]
     mode_label = {
@@ -740,6 +752,11 @@ def format_pagination_summary(result: 'excel_query.StructuredQueryResult', filen
     )
     if result.row_excel_numbers:
         head += f'\n- 本页 Excel 行号：{result.row_excel_numbers[0]} ~ {result.row_excel_numbers[-1]}'
+    # R2：有筛选才输出"筛选条件"（最终执行条件）；放宽过程只在真实发生（relaxed_notes 非空）时输出
+    if result.applied_filters:
+        head += '\n- 筛选条件：' + '；'.join(
+            excel_aggregate._filter_text(f) for f in result.applied_filters)
+    head += excel_aggregate.format_relaxed_notes(relaxed_notes)
     head += _cap_notice(result)
     return head
 
@@ -2267,8 +2284,8 @@ def _run_pagination(turn: TurnIntent, ctx: 'ExcelQueryContext') -> Dict[str, Any
 
     return {
         'status': STATUS_OK,
-        'message': format_pagination_summary(result, rep.filename, turn.action)
-                   + (''.join('\n- 提示：' + n for n in relax_notes) if relax_notes else ''),
+        'message': format_pagination_summary(result, rep.filename, turn.action,
+                                             relaxed_notes=relax_notes),
         'turn': turn.to_dict(),
         'continued': True,
         'engine': engine_used,
@@ -3838,13 +3855,15 @@ def _run_aggregate_turn(
         notes.append(f'已沿用上一轮的分组字段（{", ".join(resolved_group_by)}）')
     if order_inherited:
         notes.append('已沿用上一轮的排序与 TOP-N 设置')
-    notes.extend(relax_notes)
+    # R2：放宽说明由摘要的「筛选过程」行**单独**承载（不混进通用提示，避免同一解释重复出现）
 
     is_grouped = isinstance(result, excel_aggregate.GroupedAggregateResult)
     if is_grouped:
-        message = excel_aggregate.format_group_aggregate_summary(result, rep.filename)
+        message = excel_aggregate.format_group_aggregate_summary(
+            result, rep.filename, relaxed_notes=relax_notes)
     else:
-        message = excel_aggregate.format_aggregate_summary(result, rep.filename)
+        message = excel_aggregate.format_aggregate_summary(
+            result, rep.filename, relaxed_notes=relax_notes)
     if notes:
         message += ''.join('\n- 提示：' + n for n in notes)
 
@@ -5327,8 +5346,7 @@ async def _run_nl_query_impl(
 
     return {
         'status': STATUS_OK,
-        'message': format_summary(result, doc['filename'])
-                   + (''.join('\n- 提示：' + n for n in relax_notes) if relax_notes else ''),
+        'message': format_summary(result, doc['filename'], relaxed_notes=relax_notes),
         'intent': intent.to_dict(),
         'turn': turn.to_dict(),
         'continued': False,

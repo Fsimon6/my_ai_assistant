@@ -656,8 +656,14 @@ def _run_step2_duckdb(
 # ----------------------------------------------------------------------------
 # 摘要（Python 生成，前端只展示）
 # ----------------------------------------------------------------------------
-def format_analysis_summary(result: AnalysisResult) -> str:
-    """两阶段分析摘要（含两步来源追溯，全部由 Python 生成）。"""
+def format_analysis_summary(result: AnalysisResult,
+                            relaxed_notes: Optional[Sequence[str]] = None) -> str:
+    """两阶段分析摘要（含两步来源追溯，全部由 Python 生成）。
+
+    ``relaxed_notes``：执行层的放宽说明（R2）。第 1 步的筛选条件若真的发生过
+    「唯一前缀放宽」，就在「筛选条件」之后输出**一次**「筛选过程」，
+    并把放宽说明并入第 1 步的说明里（不重复打印多遍）。
+    """
     s1 = result.step1
     group_names = '、'.join(g['name'] for g in s1.group_by)
     op1_label = excel_aggregate.OPERATION_LABELS.get(s1.operation, s1.operation)
@@ -678,6 +684,9 @@ def format_analysis_summary(result: AnalysisResult) -> str:
         lines.append(f'- 第 1 步匹配 Excel 行区间：{s1.row_excel_span["first"]} ~ {s1.row_excel_span["last"]}')
     lines.append('- 筛选条件：' + (
         '；'.join(excel_aggregate._filter_text(f) for f in s1.filters) if s1.filters else '无（全表）'))
+    _relax = excel_aggregate.format_relaxed_notes(relaxed_notes)   # R2：放宽过程（只输出一次）
+    if _relax:
+        lines.append(_relax.lstrip('\n'))
     lines.append('- 中间结果（第 1 步返回的每个分组的聚合值，顺序即数据库返回顺序）：')
     if not s1.rows:
         lines.append('    （没有匹配的数据行，因此没有任何分组）')

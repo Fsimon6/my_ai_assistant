@@ -1328,8 +1328,27 @@ def execute_aggregate_python(
 # ----------------------------------------------------------------------------
 # 摘要（Python 生成，不经过 LLM）
 # ----------------------------------------------------------------------------
-def format_aggregate_summary(result: AggregateResult, filename: str) -> str:
-    """生成统计结果摘要（含来源与口径，保证可追溯）。"""
+def format_relaxed_notes(notes: Optional[Sequence[str]]) -> str:
+    """把**执行层真实产生的** ``relaxed_filters`` 说明渲染成叙述行（R2）。
+
+    原则（绝不编造解释）：
+      * 只有执行层确实做了「唯一前缀放宽」时（``relaxed_filters`` 非空）才输出；
+      * 说明文字**原样**取自执行层，不在展示层重新解析用户文本、不硬编码任何值；
+      * 无放宽 -> 返回空串（调用方不追加任何行）。
+    """
+    items = [str(n).strip() for n in (notes or []) if str(n).strip()]
+    if not items:
+        return ''
+    return '\n- 筛选过程：' + '；'.join(items)
+
+
+def format_aggregate_summary(result: AggregateResult, filename: str,
+                             relaxed_notes: Optional[Sequence[str]] = None) -> str:
+    """生成统计结果摘要（含来源与口径，保证可追溯）。
+
+    ``relaxed_notes``：执行层的放宽说明（R2）。非空时在「筛选条件」（= **最终执行条件**）
+    之后追加一行「筛选过程」（= **放宽过程**），两者语义分开、不混淆。
+    """
     op_label = OPERATION_LABELS.get(result.operation, result.operation)
     lines = [
         f'已对「{filename}」的 Sheet「{result.sheet_name}」执行统计。',
@@ -1361,7 +1380,7 @@ def format_aggregate_summary(result: AggregateResult, filename: str) -> str:
         lines.append('- 筛选条件：' + '；'.join(_filter_text(f) for f in result.filters))
     else:
         lines.append('- 筛选条件：无（全表）')
-    return '\n'.join(lines)
+    return '\n'.join(lines) + format_relaxed_notes(relaxed_notes)
 
 
 def _filter_text(f: Dict[str, Any]) -> str:
@@ -1679,8 +1698,13 @@ def _build_group_result(
     )
 
 
-def format_group_aggregate_summary(result: GroupedAggregateResult, filename: str) -> str:
-    """分组统计摘要（Python 生成，含来源与口径，不经过 LLM）。"""
+def format_group_aggregate_summary(result: GroupedAggregateResult, filename: str,
+                                   relaxed_notes: Optional[Sequence[str]] = None) -> str:
+    """分组统计摘要（Python 生成，含来源与口径，不经过 LLM）。
+
+    ``relaxed_notes``：执行层的放宽说明（R2）。非空时紧跟在「筛选条件」（最终执行条件）
+    之后输出「筛选过程」（放宽过程），两者分开表述。
+    """
     group_names = [g['name'] for g in result.group_by]
     op_label = OPERATION_LABELS.get(result.operation, result.operation)
     is_count = result.operation == OPERATION_COUNT
@@ -1717,6 +1741,9 @@ def format_group_aggregate_summary(result: GroupedAggregateResult, filename: str
             f'- 匹配 Excel 行区间：{result.row_excel_span["first"]} ~ {result.row_excel_span["last"]}'
         )
     lines.append('- 筛选条件：' + ('；'.join(_filter_text(f) for f in result.filters) if result.filters else '无（全表）'))
+    _relax = format_relaxed_notes(relaxed_notes)          # R2：放宽过程（仅真实发生时才输出）
+    if _relax:
+        lines.append(_relax.lstrip('\n'))
 
     lines.append('- 结果（顺序即数据库返回顺序，前端不再排序）：' if result.is_sorted
                  else '- 结果（未做排序，顺序为数据库返回顺序）：')

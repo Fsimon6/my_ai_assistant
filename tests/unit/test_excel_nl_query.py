@@ -532,7 +532,9 @@ def test_p2_prefix_relaxation_when_eq_has_no_exact_match(small_rep):
     assert out['result']['total_matches'] == 4          # 与「包含 SF」一致
     assert out['query']['filters'][0]['operator'] == 'contains'
     assert out['relaxed_filters'] and '前缀放宽' in out['relaxed_filters'][0]
-    assert '提示' in out['message']
+    # R2（2026-09-29）：放宽说明改为与「筛选条件」相邻的「筛选过程」行（不再混进通用"提示"）
+    assert '筛选过程：' + out['relaxed_filters'][0] in out['message']
+    assert '- 筛选条件：' in out['message']
     # 上下文保存的必须是放宽后的条件，保证「下一页」语义一致
     ctx = nl.ExcelQueryContext(**out['new_context'])
     assert ctx.filters[0]['operator'] == 'contains'
