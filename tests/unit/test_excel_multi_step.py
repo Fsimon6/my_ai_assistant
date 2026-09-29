@@ -669,8 +669,12 @@ def test_nl_analysis_action_direct(small_rep):
     assert m['step1']['returned_groups'] == 10
     assert m['step2']['value'] == pytest.approx(GT_TOP10_SKU_TOTAL, **TOL)
     assert m['value_display'] == '267.61'
-    assert m['step1']['source'] and 'representation' in m['step1']['source']
-    assert 'Step 1' in m['step2']['source_text']
+    # 批次 A（R5/R4）：面向用户文案不再出现内部词（representation / Step 1），语义不变
+    assert m['step1']['source'] == ms.SOURCE_STEP1_TEXT == '原始 Excel 数据（先筛选后分组）'
+    assert 'representation' not in m['step1']['source']
+    assert '第 1 步的结果' in m['step2']['source_text']
+    assert '不会重新回到原始 Excel 数据行' in m['step2']['source_text']
+    assert 'Step 1' not in m['step2']['source_text']
 
 
 @pytest.mark.parametrize('llm_turn,expected_source', [
@@ -858,4 +862,7 @@ def test_nl_summary_contains_both_steps(small_rep):
     msg = out['message']
     assert '第 1 步' in msg and '第 2 步' in msg
     assert '267.61' in msg
-    assert 'Step 1 的 TOP-N 结果' in msg
+    # 批次 A（R4/R5）：来源说明改为自然中文，且不出现内部措辞
+    assert '第 2 步来源：第 1 步的结果' in msg
+    assert '不会重新回到原始 Excel 数据行' in msg
+    assert 'Step 1' not in msg and 'TOP-' not in msg and 'representation' not in msg

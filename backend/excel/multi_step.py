@@ -82,8 +82,23 @@ ERR_STEP_TYPE_INVALID = 'step_type_invalid'
 ERR_INTERMEDIATE_TOO_LARGE = 'intermediate_too_large'
 
 #: 来源说明（可追溯，前端直接展示）
-SOURCE_STEP1_TEXT = '原始 Excel 数据（representation，先筛选后分组）'
-SOURCE_STEP2_TEXT = 'Step 1 的 TOP-N 结果（本阶段不回到原始行）'
+#: 文案规范（2026-09-29 批次 A）：面向用户，一律用「第 1 步 / 第 2 步」，
+#: 不出现内部实现词（representation / Step 1 / TOP-N / 分页参数）。
+SOURCE_STEP1_TEXT = '原始 Excel 数据（先筛选后分组）'
+
+
+def step2_source_text(input_groups: Optional[int] = None) -> str:
+    """第 2 步数据来源说明（**单一来源**，卡片/摘要/快照共用同一措辞）。
+
+    语义（必须保留）：第 2 步只对第 1 步产出的**聚合结果**再计算，不会重新回到原始 Excel 数据行。
+    ``input_groups`` 给出实际参与第 2 步的分组数时带出动态数量（不写死 N）。
+    """
+    amount = (f'（{input_groups} 个分组的聚合值）' if input_groups is not None
+              else '（第 1 步返回的分组聚合值）')
+    return f'第 1 步的结果{amount}，不会重新回到原始 Excel 数据行'
+
+
+SOURCE_STEP2_TEXT = step2_source_text()
 
 
 # ----------------------------------------------------------------------------
@@ -465,7 +480,7 @@ class AnalysisResult:
             first += f'，截取前 {self.step1.top_n} 个分组'
         second = (
             f'第 2 步：对上述 {self.step2_matched} 个分组的**聚合值**再执行 {op2}'
-            f'（数据来源：Step 1 结果，不回原始行）'
+            f'（数据来源：第 1 步的结果，不会重新回到原始 Excel 数据行）'
         )
         return f'{first}；{second}'
 
@@ -605,6 +620,8 @@ def execute_analysis(
         step2_matched=len(values),
         step2_numeric_rows=numeric_rows,
         engine=engine_name,
+        # 批次 A（R4）：来源说明带出本步实际输入的分组数（与摘要/前端卡片同一措辞来源）
+        step2_source=step2_source_text(len(values)),
     )
     return result, engine_name
 
@@ -652,7 +669,8 @@ def format_analysis_summary(result: AnalysisResult) -> str:
         f'- 第 1 步：按「{group_names}」分组，操作 {op1_label}'
         + (f'，目标列 {s1.column}' if s1.column else '')
         + f'｜分组数 {s1.total_groups} 个'
-        + (f' → TOP-{s1.top_n} 截取前 {s1.returned_groups} 个' if s1.is_truncated else ''),
+        + (f' → 取前 {s1.top_n} 名（本次返回 {s1.returned_groups} 个分组）'
+           if s1.is_truncated else ''),
         f'- 第 1 步排序：' + (s1.sort_description() if s1.is_sorted else '无（数据库返回顺序）'),
         f'- 第 1 步来源：{result.step1_source}',
     ]
@@ -669,7 +687,7 @@ def format_analysis_summary(result: AnalysisResult) -> str:
             lines.append(f'    {key} → {excel_aggregate.format_number(r.value, is_count=is_count1)}')
     lines.append(f'- 第 2 步：操作 {op2_label}｜输入 {result.step2_matched} 个分组'
                  f'（其中可数值化 {result.step2_numeric_rows} 个）')
-    lines.append(f'- 第 2 步来源：{result.step2_source}')
+    lines.append(f'- 第 2 步来源：{step2_source_text(result.step2_matched)}')
     lines.append(f'- **最终结果：{result.step2_value_display}**')
     lines.append(f'- 分析口径：{result.definition()}')
     return '\n'.join(lines)

@@ -195,7 +195,7 @@ def _step1_message_top_n(out: Dict[str, Any]) -> Optional[int]:
     注：回传的 ``turn`` 是**LLM 原始计划**；执行用的是经过 user-authority 校正后的
     ``raw_steps`` 副本，因此以文案 + 数值为准（数值本身可区分 top3 与 top4+）。
     """
-    m = re.search(r'TOP-(\d+)', str(out.get('message') or ''))
+    m = re.search(r'取前 (\d+) 名', str(out.get('message') or ''))
     return int(m.group(1)) if m else None
 
 

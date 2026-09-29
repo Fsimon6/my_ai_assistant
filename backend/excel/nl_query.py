@@ -677,10 +677,17 @@ def build_validated_query(
 def format_summary(result: 'excel_query.StructuredQueryResult', filename: str) -> str:
     """由 Python 生成结果摘要（不经过 LLM，避免编造事实）。"""
     col_names = [c['name'] for c in result.columns]
+    # 文案规范（批次 A）：面向用户不暴露 offset/limit 这类分页实现参数，改用"第 a~b 条"。
+    if result.returned_count:
+        seq_start = result.offset + 1
+        seq_end = result.offset + result.returned_count
+        returned_line = f'- 本次返回：{result.returned_count} 行（第 {seq_start}~{seq_end} 条）\n'
+    else:
+        returned_line = '- 本次返回：0 行\n'
     head = (
         f'已从「{filename}」的 Sheet「{result.sheet_name}」中执行结构化查询。\n'
         f'- 命中总数：{result.total_matches} 行（该 Sheet 共 {result.total_rows_in_sheet} 行）\n'
-        f'- 本次返回：{result.returned_count} 行（offset={result.offset}, limit={result.limit}）\n'
+        f'{returned_line}'
         f'- 返回列：{", ".join(col_names)}'
     )
     # Phase 4B：计算字段与计算值筛选必须显式告知（口径可核对）
@@ -696,7 +703,7 @@ def format_summary(result: 'excel_query.StructuredQueryResult', filename: str) -
         head += (f'\n- 计算值筛选：{result.calculation["label"]} {op_label} {cf["value"]}'
                  f'（计算值为空的行不匹配任何比较，不会当作 0）')
     if result.row_excel_numbers:
-        head += f'\n- Excel 行号：{result.row_excel_numbers[0]} ~ {result.row_excel_numbers[-1]}'
+        head += f'\n- 本页 Excel 行号：{result.row_excel_numbers[0]} ~ {result.row_excel_numbers[-1]}'
     head += _cap_notice(result)
     return head
 
@@ -732,7 +739,7 @@ def format_pagination_summary(result: 'excel_query.StructuredQueryResult', filen
         + body
     )
     if result.row_excel_numbers:
-        head += f'\n- Excel 行号：{result.row_excel_numbers[0]} ~ {result.row_excel_numbers[-1]}'
+        head += f'\n- 本页 Excel 行号：{result.row_excel_numbers[0]} ~ {result.row_excel_numbers[-1]}'
     head += _cap_notice(result)
     return head
 
