@@ -697,6 +697,7 @@ def format_summary(result: 'excel_query.StructuredQueryResult', filename: str) -
                  f'（计算值为空的行不匹配任何比较，不会当作 0）')
     if result.row_excel_numbers:
         head += f'\n- Excel 行号：{result.row_excel_numbers[0]} ~ {result.row_excel_numbers[-1]}'
+    head += _cap_notice(result)
     return head
 
 
@@ -732,7 +733,21 @@ def format_pagination_summary(result: 'excel_query.StructuredQueryResult', filen
     )
     if result.row_excel_numbers:
         head += f'\n- Excel 行号：{result.row_excel_numbers[0]} ~ {result.row_excel_numbers[-1]}'
+    head += _cap_notice(result)
     return head
+
+
+def _cap_notice(result: 'excel_query.StructuredQueryResult') -> str:
+    """「单次显示上限」提示（P1）：还有更多命中行时**必须明说**，绝不假装结果完整。
+
+    背景（2026-09-29 审计）：默认上限是 50 条；枚举查询已提升到 ``MAX_LIMIT``（500）。
+    当 ``total_matches`` 仍大于本次返回量时（`has_more=True`），告诉用户"数据库里不止这些"，
+    并复用既有分页机制（说「下一页」）继续获取。
+    """
+    if not getattr(result, 'has_more', False):
+        return ''
+    return (f'\n- 注意：结果超过单次显示上限（{result.limit} 条），本次仅返回前 {result.returned_count} 条'
+            f'（共命中 {result.total_matches} 行）；可继续说「下一页」继续获取（不会丢失数据）')
 
 
 # ============================================================================
@@ -1528,6 +1543,11 @@ async def llm_parse_turn(
             parts.append(chunk)
     data = parse_llm_json(''.join(parts))
     turn = turn_intent_from_dict(data)
+    # P1（2026-09-29）：明确枚举查询（用户未指定条数）默认返回上限提到 MAX_NL_LIMIT（500），
+    # 普通查询仍为默认 50；分析/统计路径不受影响（见 apply_enumeration_limit 的边界）。
+    _enum_notes = apply_enumeration_limit(turn, user_message)
+    if _enum_notes:
+        logger.info('[nl] 枚举默认返回上限（P1）：%s', '; '.join(_enum_notes))
     logger.info('[nl] turn=%s', json.dumps(turn.to_dict(), ensure_ascii=False)[:600])
     return turn
 
@@ -1578,6 +1598,95 @@ _PLAIN_LIST_RE = re.compile(
     r'有哪些|有哪几个|列出|列一下|列举|显示|展示|看看|查看|给我看|查看一下|筛选|过滤'
     r'|下一页|上一页|再来\s*\d+\s*条|继续看|往下看|往前看'
 )
+
+
+#: 「所有 / 全部」等**全量枚举**说法（与项目既有「全部 SKU = 保留所有数据行、不去重」语义一致）
+_ENUM_ALL_RE = re.compile(
+    r'所有|全部|全量|全体|每种|每类|每一个|各个|每条|每一条|所有行|全部行',
+    re.IGNORECASE,
+)
+
+#: 「哪些 / 哪几个」列表问句（只用于**枚举判定**；不并入 `_PLAIN_LIST_RE`，
+#: 以免改变统计兜底路由：例如「哪些物流商订单最多？」仍必须归统计链路）
+_ENUM_WHICH_RE = re.compile(r'哪(?:些|几个|几条|几行|几个订单|些订单)', re.IGNORECASE)
+
+#: 分页/翻页说法（**不是**全量枚举；出现即不提升 limit，避免影响既有分页语义）
+_ENUM_PAGE_RE = re.compile(
+    r'下一页|上一页|翻页|继续看|继续翻|往下看|往前看|再来\s*\d+\s*条|再给\s*\d+\s*条',
+    re.IGNORECASE,
+)
+
+#: 用户**显式指定条数**的说法（出现时绝不被枚举规则覆盖；也不与"条件里的数字"混淆）：
+#: 「前20 / 头10 / 20条 / 十个 / top20 / 最多50 / 至多50 / 限制 50」。
+#: ⚠️ 刻意**不包含**裸数字（如「数量大于 3 的订单有哪些」中的 3 是筛选值，不是条数）。
+_EXPLICIT_COUNT_RE = re.compile(
+    r'前\s*(?:\d{1,4}|[一二三四五六七八九十百两]{1,3})'
+    r'|头\s*(?:\d{1,4}|[一二三四五六七八九十百两]{1,3})'
+    r'|\d{1,4}\s*(?:条|个|行|项|款|列|名|位)'
+    r'|[一二三四五六七八九十百两]{1,3}\s*(?:条|个|行|项|款|列|名|位)'
+    r'|top\s*\d{1,4}'
+    r'|最多\s*(?:\d{1,4}|[一二三四五六七八九十百两]{1,3})'
+    r'|至多\s*(?:\d{1,4}|[一二三四五六七八九十百两]{1,3})'
+    r'|限制\s*(?:为|在|到)?\s*\d{1,4}',
+    re.IGNORECASE,
+)
+
+
+def is_full_enumeration(message: str) -> bool:
+    """确定性判定：用户是否在要求「把符合条件的数据行**全部列出来**」（纯词元，不看 LLM）。
+
+    目标语义（与既有「全部 SKU = 保留所有数据行」一致）：
+      * 触发：既有 `_PLAIN_LIST_RE` 的列表说法（有哪些 / 列出 / 显示 / 把…列出来 …）
+        或 `_ENUM_ALL_RE` 的全量词（所有 / 全部 / 全量 …）；
+      * 不触发（宁可不判，也不误判）：
+        - 用户**显式指定条数**（「列出前20个订单」「20条」「最多50条」）-> 由用户数量决定；
+        - 分页/翻页说法（「下一页」「再来20条」）-> 走既有分页机制，不在此提升上限；
+        - **聚合/分组/排序/TOP-N 语义**（复用 `detect_signals` 的既有信号：求和/平均/最值/
+          分组/排序词/`top_n`）-> 归统计链路；
+        - 空文本。
+      注：这里刻意**不用** `looks_statistical`（它把「几个」这类**计数词**也算统计），
+      否则「哪几个SKU的金额大于10」这类**带筛选值的列表问句**会被漏判。
+    """
+    if not message:
+        return False
+    text = nl_norm.to_halfwidth(message)
+    if _EXPLICIT_COUNT_RE.search(text) or _ENUM_PAGE_RE.search(text):
+        return False
+    sig = nl_norm.detect_signals(text)
+    if (sig.sum_ or sig.avg or sig.min_ or sig.max_ or sig.group
+            or sig.top_n is not None or nl_norm.ORDER_ANY_RE.search(text)
+            or nl_norm.ORDER_ANY_RE.search(sig.normalized)):
+        return False
+    return bool(_PLAIN_LIST_RE.search(text) or _ENUM_ALL_RE.search(text)
+                or _ENUM_WHICH_RE.search(text))
+
+
+def apply_enumeration_limit(turn: 'TurnIntent', user_message: str) -> List[str]:
+    """**枚举默认返回上限**（P1，2026-09-29）：用户明确要求"全部列出"且**未指定条数**时，
+    把 new_query 的 limit 从默认 50 提升到 `MAX_NL_LIMIT`（500，仍受上限保护）。
+
+    边界（严格）：
+      * 只作用于 ``action == new_query``（分析 / 统计 / 排行路径**完全不碰**，Stage 2A authority 不变）；
+      * 只在 ``limit_explicit is False``（LLM/用户都没显式给条数）时提升；
+      * 只在 `is_full_enumeration(user_message)` 为真时提升（显式数量 / TOP-N / 统计语义都不触发）；
+      * 提升不超过 `MAX_NL_LIMIT`（>500 行仍截断到 500，由 `_cap_notice` 明确提示 + 既有
+        `has_more/next_offset` 分页机制继续可用）。
+    返回说明列表（供 logger / 测试断言）。
+    """
+    intent = getattr(turn, 'intent', None)
+    if turn.action != ACTION_NEW_QUERY or intent is None:
+        return []
+    if intent.query_type != INTENT_STRUCTURED:
+        return []
+    if getattr(intent, 'limit_explicit', False):
+        return []
+    if not is_full_enumeration(user_message):
+        return []
+    if intent.limit >= MAX_NL_LIMIT:
+        return []
+    note = ('明确枚举查询（用户未指定条数）-> limit=%d（原 %d）' % (MAX_NL_LIMIT, intent.limit))
+    intent.limit = MAX_NL_LIMIT
+    return [note]
 
 
 def looks_like_statistical_query(message: str) -> bool:

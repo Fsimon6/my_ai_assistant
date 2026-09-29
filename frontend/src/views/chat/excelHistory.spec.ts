@@ -275,8 +275,10 @@ describe('restoreExcelHistory', () => {
     const out = restoreExcelHistory({ source: 'excel', excel: snapshot('result', PAYLOADS.result) },
                                     builders)
     expect(out.excelTable).toBeTruthy()
+    // 该快照 has_more=true（还有更多命中行）-> 追加"超过单次显示上限"提示（P1）
     expect(tableRowRangeLabel(calls.result![0]))
-      .toBe('本页 Excel 行号 3 ~ 3｜共命中 19 行，本次返回 1 行（第 1~1 条，offset=0, limit=50）')
+      .toBe('本页 Excel 行号 3 ~ 3｜共命中 19 行，本次返回 1 行（第 1~1 条，offset=0, limit=50）'
+            + '｜结果超过单次显示上限（50 条），可继续说「下一页」继续获取')
   })
 
   it('R1：旧快照缺 offset/returned_count 时仍可恢复且不产生 NaN', () => {

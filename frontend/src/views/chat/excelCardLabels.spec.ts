@@ -85,6 +85,20 @@ describe('R1 tableRowRangeLabel（本页行号语义）', () => {
     expect(label).toBe('本页 Excel 行号 3 ~ 4｜共命中 2 行，本次返回 2 行（第 1~2 条，offset=0, limit=undefined）')
     expect(label.includes('NaN')).toBe(false)
   })
+
+  it('P1：还有更多命中行（has_more=true）必须明说"超过单次显示上限"', () => {
+    const label = tableRowRangeLabel({ ...page(0, [3, 4, 5]), has_more: true })
+    expect(label).toContain('结果超过单次显示上限（5 条）')
+    expect(label).toContain('可继续说「下一页」继续获取')
+    expect(label).toContain('共命中 19 行')          // 总数仍然如实显示
+  })
+
+  it('P1 对照：has_more=false / 缺该字段时不追加提示', () => {
+    expect(tableRowRangeLabel({ ...page(0, [3, 4, 5]), has_more: false }))
+      .toBe('本页 Excel 行号 3 ~ 5｜共命中 19 行，本次返回 3 行（第 1~3 条，offset=0, limit=5）')
+    expect(tableRowRangeLabel(page(0, [3, 4, 5])))
+      .not.toContain('单次显示上限')
+  })
 })
 
 describe('R4 multiStepStep2SourceLabel（自然中文 + 动态数量）', () => {

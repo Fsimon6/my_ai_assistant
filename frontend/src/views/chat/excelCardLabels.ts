@@ -31,9 +31,13 @@ export function groupRelaxedLabel(res: any): string {
 /**
  * R1：表格卡片底部的行范围说明。
  *
- * 语义澄清（本轮只改措辞，数值与分页逻辑完全不变）：`row_excel_numbers` 只覆盖
+ * 语义澄清（只改措辞，数值与分页逻辑完全不变）：`row_excel_numbers` 只覆盖
  * **当前页返回的行**，因此首/末行号必须写明是「**本页** Excel 行号」，避免与
  * 「共命中 N 行」并读时被误认为"全部命中的行号都在这段区间内"。
+ *
+ * P1（2026-09-29）：当后端仍有更多命中行（`has_more === true`）时**必须明说**
+ * "结果超过单次显示上限"，避免用户误以为"数据库里只有这些"；继续获取沿用既有
+ * 分页机制（对助手说「下一页」）。仅当 `has_more === true` 时追加，旧快照/无该字段时不显示。
  */
 export function tableRowRangeLabel(r: any): string {
   const nums = r?.row_excel_numbers || []
@@ -42,11 +46,15 @@ export function tableRowRangeLabel(r: any): string {
   const total = typeof r?.total_matches === 'number' ? r.total_matches : 0
   const seqStart = offset + 1
   const seqEnd = offset + returned
+  const capNotice = r?.has_more === true
+    ? `｜结果超过单次显示上限（${r?.limit} 条），可继续说「下一页」继续获取`
+    : ''
   if (!nums.length) {
     return `无匹配行（起点为第 ${seqStart} 条，共命中 ${total} 行）`
   }
   return `本页 Excel 行号 ${nums[0]} ~ ${nums[nums.length - 1]}｜共命中 ${total} 行，`
     + `本次返回 ${returned} 行（第 ${seqStart}~${seqEnd} 条，offset=${offset}, limit=${r?.limit}）`
+    + capNotice
 }
 
 /**
