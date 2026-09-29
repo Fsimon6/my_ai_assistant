@@ -1,7 +1,7 @@
 """
 AI角色API路由
 """
-from typing import List
+from typing import List, Tuple
 from fastapi import APIRouter, HTTPException, Depends, Query
 from requests import Session
 
@@ -253,32 +253,54 @@ async def get_character_stats(
     )
 
 
+def _latest_window(total: int, offset: int = 0, limit: int = 10) -> Tuple[int, int]:
+    """把对话历史参数解释为**从最新往回数**的窗口，返回半开区间 ``(start, end)``。
+
+    P1（2026-09-29）：修「历史接口取错窗口」——原来用 ``history[offset:offset+limit]``
+    取的是**最早** N 条；当会话消息数超过 limit 时，**最新消息被裁掉**，用户重新进入对话会
+    以为"刚产生的记录丢失了"（真实案例：conv 38 共 108 条、前端 limit=100 → 最新 8 条消失）。
+
+    新语义（返回顺序仍为**旧→新**，前端无需 reverse）：
+      * ``offset=0`` -> **最新 limit 条**（例：total=108, limit=100 -> 第 9..108 条）；
+      * ``offset`` 表示"跳过最新的 offset 条"（``offset=100`` -> 再往前 100 条），
+        以便将来实现"加载更早的历史"；
+      * 恒有 ``0 <= start <= end <= total``；``offset >= total`` -> 空区间
+        （**绝不**产生负索引切片）。
+
+    注意：``limit`` / ``offset`` 的入参校验仍由 FastAPI 查询参数声明负责（ge/le），此处不重复校验。
+    """
+    end = max(total - max(int(offset), 0), 0)
+    start = max(end - max(int(limit), 0), 0)
+    return start, end
+
+
 @router.get("/{character_id}/conversations")
 async def get_character_conversations(
         character_id: str,
-        limit: int = Query(10, ge=1, le=100, description='限制返回数量'),
-        offset: int = Query(0, ge=0, description='偏移量'),
+        limit: int = Query(10, ge=1, le=100, description='限制返回数量（取最新 N 条）'),
+        offset: int = Query(0, ge=0, description='跳过最新 N 条（0=最新）'),
         current_user: User = Depends(get_current_active_user),
         db: Session = Depends(get_db)
 ):
     """
     获取当前用户与某角色的对话历史（第二十阶段：从 conversations/texts 表读取）
     :param character_id: 角色ID
-    :param limit: 限制返回数量
-    :param offset: 偏移量
+    :param limit: 限制返回数量（**取最新 N 条**；返回顺序仍是旧→新）
+    :param offset: 跳过最新 N 条（0 = 最新；用于将来加载更早的历史）
     """
     character = character_service.get_character(character_id, user_id=current_user.id)
     if character is None:
         raise HTTPException(status_code=404, detail='角色不存在')
 
-    # 读取该 (用户, 角色) 的当前对话历史（conversations/texts 表）
+    # 读取该 (用户, 角色) 的当前对话历史（conversations/texts 表，service 返回**完整**历史、旧→新）
     conv_id = conversation_service.get_existing_conversation_id(current_user.id, character.id)
     conversations = []
     total = 0
     if conv_id is not None:
         history = conversation_service.get_history(conv_id)
         total = len(history)
-        conversations = history[offset:offset + limit]
+        start, end = _latest_window(total, offset, limit)
+        conversations = history[start:end]
 
     return api_response.success(
         data={
