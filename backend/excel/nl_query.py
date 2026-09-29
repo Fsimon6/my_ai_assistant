@@ -13,6 +13,7 @@
 只在其之上做「自然语言 → 参数」的翻译与校验。
 """
 
+import contextvars
 import json
 import logging
 import re
@@ -51,6 +52,57 @@ STATUS_ERROR = 'error'
 DEFAULT_NL_LIMIT = excel_query.DEFAULT_LIMIT      # 50
 MAX_NL_LIMIT = excel_query.MAX_LIMIT              # 500
 MAX_CATALOG_COLUMNS = 120                         # prompt 中每个 Sheet 最多列出的列数
+
+
+# ----------------------------------------------------------------------------
+# Stage 4 性能（request-local 复用）：同一次 NL 请求内 representation 只读盘一次
+# ----------------------------------------------------------------------------
+class _RequestRepresentations:
+    """**一次请求内**的 representation 复用容器（request-local）。
+
+    严格边界（不是缓存系统）：
+      * 生命周期 = 一次 ``run_nl_query`` 调用：随请求创建、退出即失效，
+        **绝不跨请求 / 跨用户**复用（不放进程级 dict、无 TTL / LRU / 磁盘缓存）；
+      * key 只由 ``document_id`` 决定，与原先 ``store.load_representation(document_id)``
+        的调用参数**逐字一致** —— 因此不会改变 user/document 归属校验语义；
+      * 读不到（``None``）**不缓存**：行为与原来每次读盘完全一致（不留脏数据）；
+      * 只消除"同一请求内对同一个文件的重复 JSON 解析"这一已被 instrumentation
+        证实的重复成本（普通查询 3 次 -> 1 次；multi-step 4 次 -> 1 次）。
+    """
+
+    def __init__(self) -> None:
+        self._items: Dict[str, WorkbookRepresentation] = {}
+        self.disk_loads = 0        # 真实读盘次数
+        self.reuses = 0            # 命中复用次数
+
+    def load(self, document_id: Optional[str]) -> Optional[WorkbookRepresentation]:
+        if not document_id:
+            return None
+        cached = self._items.get(document_id)
+        if cached is not None:
+            self.reuses += 1
+            return cached
+        from backend.excel import store as excel_store
+        rep = excel_store.load_representation(document_id)
+        if rep is None:
+            return None            # 失败不缓存：与原实现等价（下次仍读盘）
+        self.disk_loads += 1
+        self._items[document_id] = rep
+        return rep
+
+
+#: 当前请求的复用容器（contextvars：每个请求/任务独立，请求结束 reset，不跨请求泄漏）
+_REQUEST_REPS: 'contextvars.ContextVar[Optional[_RequestRepresentations]]' = \
+    contextvars.ContextVar('excel_request_reps', default=None)
+
+
+def _load_rep(document_id: Optional[str]) -> Optional[WorkbookRepresentation]:
+    """加载 representation（request-local 复用；不在请求上下文内时等价于直接读盘）。"""
+    reps = _REQUEST_REPS.get()
+    if reps is None:
+        from backend.excel import store as excel_store
+        return excel_store.load_representation(document_id)
+    return reps.load(document_id)
 
 # 中文数字 -> 阿拉伯数字（用于「五店」->「5店」这类口语表达）
 _CN_DIGITS = {
@@ -2221,13 +2273,12 @@ def _run_pagination(turn: TurnIntent, ctx: 'ExcelQueryContext') -> Dict[str, Any
     - 数据仍来自 representation.json（Phase 1B Structured Query）；
     - 不重新猜文件/列，也不调用 LLM 取数。
     """
-    from backend.excel import store as excel_store
 
     plan = compute_page(turn, ctx)
     if plan.error:
         return _clarify(plan.error, stage='pagination')
 
-    rep = excel_store.load_representation(ctx.document_id)
+    rep = _load_rep(ctx.document_id)
     if rep is None:
         return {
             'status': STATUS_ERROR,
@@ -3588,7 +3639,6 @@ def _run_aggregate_turn(
     - 用户已明确给出文件/条件/分组时按用户的来（refers_to_previous=false）。
     - 继承来的 filters 与用户本轮额外给出的 filters 之间是 AND。
     """
-    from backend.excel import store as excel_store
 
     agg = turn.aggregate or AggregateIntent()
     # Phase 4B：非法计算字段必须明确告知（绝不静默降级为普通统计）
@@ -3647,7 +3697,7 @@ def _run_aggregate_turn(
     doc_hint = document_override or _u_doc or agg.document
     rep: Optional[WorkbookRepresentation] = None
     if not doc_hint and inherited_doc_id:
-        rep = excel_store.load_representation(inherited_doc_id)
+        rep = _load_rep(inherited_doc_id)
         if rep is None:
             return {'status': STATUS_ERROR,
                     'message': f'上一轮的表格文件「{inherited_filename}」已不存在，请重新发起查询。'}
@@ -3660,7 +3710,7 @@ def _run_aggregate_turn(
                     doc_candidates, stage='document',
                 )
             return _clarify('无法确定要对哪个表格做统计。', stage='document')
-        rep = excel_store.load_representation(doc['document_id'])
+        rep = _load_rep(doc['document_id'])
         if rep is None:
             return {'status': STATUS_ERROR, 'message': f'表格文件「{doc["filename"]}」的表示数据缺失，请重新上传。'}
 
@@ -4336,12 +4386,10 @@ def _resolve_sheet_for_message(intent: Any,
     Sheet：给了名字就按名字解析，否则只有单 Sheet 才确定。
     任何一步不唯一都返回 (None, None)，由调用方保持原路径（澄清/报错）。
     """
-    from backend.excel import store as excel_store
-
     doc, _candidates = resolve_document(catalog, getattr(intent, 'document', None))
     if doc is None:
         return None, None
-    rep = excel_store.load_representation(doc['document_id'])
+    rep = _load_rep(doc['document_id'])
     if rep is None:
         return None, None
     sheet_hint = getattr(intent, 'sheet', None)
@@ -4505,7 +4553,6 @@ def _run_analysis_turn(
     - 本轮只给第 2 步 / 明确指代上一轮 → 沿用上一轮的第 1 步（分组、排序、TOP-N 全部不变）；
     - 两者都没有 → clarify，绝不猜。
     """
-    from backend.excel import store as excel_store
     from backend.excel.query_context import AnalysisContext
 
     intent = turn.analysis or AnalysisIntent()
@@ -4577,7 +4624,7 @@ def _run_analysis_turn(
     doc_hint = document_override or _u_doc or intent.document
     rep: Optional[WorkbookRepresentation] = None
     if not doc_hint and inherited_doc_id:
-        rep = excel_store.load_representation(inherited_doc_id)
+        rep = _load_rep(inherited_doc_id)
         if rep is None:
             return {'status': STATUS_ERROR,
                     'message': f'上一轮的表格文件「{inherited_filename}」已不存在，请重新发起查询。'}
@@ -4590,7 +4637,7 @@ def _run_analysis_turn(
                     doc_candidates, stage='document',
                 )
             return _clarify('无法确定要对哪个表格做分析。', stage='document')
-        rep = excel_store.load_representation(doc['document_id'])
+        rep = _load_rep(doc['document_id'])
         if rep is None:
             return {'status': STATUS_ERROR, 'message': f'表格文件「{doc["filename"]}」的表示数据缺失，请重新上传。'}
 
@@ -4837,21 +4884,32 @@ async def run_nl_query(
     在 `_run_nl_query_impl` 之外套一层**执行器日志**：
     每次请求都会留下「action -> executor -> status」的证据，便于排查
     "报告说统计通过、浏览器却看到普通查询" 这类路由问题。
+
+    Stage 4 性能：本函数内安装 **request-local** representation 复用容器
+    （`_RequestRepresentations`）——同一次请求内同一文件只读盘一次
+    （普通查询 3 -> 1，multi-step 4 -> 1），退出即 reset，**不跨请求复用**。
     """
-    outcome = await _run_nl_query_impl(
-        user_message, catalog,
-        llm=llm,
-        context=context,
-        aggregate_context=aggregate_context,
-        analysis_context=analysis_context,
-        intent_override=intent_override,
-        pagination_override=pagination_override,
-        aggregate_override=aggregate_override,
-        analysis_override=analysis_override,
-        document_override=document_override,
-        user_id=user_id,
-        session_key=session_key,
-    )
+    reps = _RequestRepresentations()
+    reps_token = _REQUEST_REPS.set(reps)
+    try:
+        outcome = await _run_nl_query_impl(
+            user_message, catalog,
+            llm=llm,
+            context=context,
+            aggregate_context=aggregate_context,
+            analysis_context=analysis_context,
+            intent_override=intent_override,
+            pagination_override=pagination_override,
+            aggregate_override=aggregate_override,
+            analysis_override=analysis_override,
+            document_override=document_override,
+            user_id=user_id,
+            session_key=session_key,
+        )
+    finally:
+        _REQUEST_REPS.reset(reps_token)
+        logger.info('[nl] representation 读盘 %d 次（请求内复用 %d 次，documents=%d）',
+                    reps.disk_loads, reps.reuses, len(reps._items))
     turn = outcome.get('turn') or {}
     logger.info(
         '[nl] route action=%s source=%s executor=%s status=%s | %s',
@@ -5309,9 +5367,8 @@ async def _run_nl_query_impl(
             )
         return _clarify('无法确定要查询哪个表格文件。', stage='document')
 
-    # 载入 representation（Phase 1A 产物；不重解析原文件）
-    from backend.excel import store as excel_store
-    rep = excel_store.load_representation(doc['document_id'])
+    # 载入 representation（Phase 1A 产物；不重解析原文件；请求内复用，见 _load_rep）
+    rep = _load_rep(doc['document_id'])
     if rep is None:
         return {'status': STATUS_ERROR, 'message': f'表格文件「{doc["filename"]}」的表示数据缺失，请重新上传。'}
 
