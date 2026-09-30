@@ -419,10 +419,22 @@ async def delete_documents(
 
         # 同步清理归属于当前用户的 Excel 附件（原文件 + representation），避免孤儿文件
         cleaned_artifacts = 0
+        released_resources = 0
         for doc_id in req.document_ids:
-            if excel_store.load_representation(doc_id, user_id=current_user.id) is not None:
-                if excel_store.delete_artifacts(doc_id):
-                    cleaned_artifacts += 1
+            # 归属校验（非本人 / 不存在的文档一律不动，保持既有隔离语义）
+            if excel_store.load_representation(doc_id, user_id=current_user.id) is None:
+                continue
+            if excel_store.delete_artifacts(doc_id):
+                cleaned_artifacts += 1
+            # Stage 4：文档已删除 -> 精确释放该文档的 DuckDB 内存资源
+            # （只移除这一个 document_id；失败只记录，不影响"删除成功"这一业务结果）
+            try:
+                from backend.excel import duck as duck_engine
+                if duck_engine.release_document(doc_id):
+                    released_resources += 1
+            except Exception as re:  # noqa: BLE001 - 释放内存失败不能反过来隐藏删除结果
+                logger.warning('释放 DuckDB 文档资源失败（删除仍成功）：document_id=%s %s',
+                               doc_id, re)
 
         return {
             'success': True,
@@ -430,6 +442,7 @@ async def delete_documents(
             'delete_ids': req.document_ids,
             'deleted_count': deleted_count,
             'deleted_artifacts': cleaned_artifacts,
+            'released_duckdb_resources': released_resources,
             'timestamp': datetime.now().isoformat()
         }
 

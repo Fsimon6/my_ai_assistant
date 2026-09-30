@@ -676,6 +676,31 @@ class DuckTableRegistry:
                 self._dbs.move_to_end(key)
         return db
 
+    def remove_document(self, document_id: str) -> bool:
+        """**精确**释放某个文档的内存资源（删除文档时调用；幂等）。
+
+        行为保证：
+          * 只移除 ``document_id`` 对应的那一个 ``_DocDatabase`` —— 其它文档（及其表）
+            完全不受影响（绝不使用全局 reset 偷懒）；
+          * 先在本 registry 的锁内摘除（此后不会有新的使用者拿到它），
+            再取得该库自己的 ``lock`` 后 ``close()``：与 ``ensure_table`` / 查询执行
+            使用的是**同一把文档锁**，因此不会在 execute 中途关闭连接；
+          * 文档不在缓存中时返回 ``False``（不抛异常，重复删除天然幂等）。
+
+        并发边界（与既有 LRU 淘汰同源，本轮不扩大范围）：删除与"正在执行的查询"之间
+        仍存在固有竞态（查询已推进到 execute 之后才可能拿到关闭的库）；生产调用点是
+        用户显式删除接口，与查询不在同一请求内，风险与现状一致。
+        """
+        key = f'{document_id}'
+        with self._lock:
+            db = self._dbs.pop(key, None)
+        if db is None:
+            return False
+        with db.lock:
+            db.close()
+        logger.info('DuckDB 已释放文档资源：document_id=%s', document_id)
+        return True
+
     def clear(self) -> None:
         with self._lock:
             for db in self._dbs.values():
@@ -699,6 +724,14 @@ def get_registry() -> DuckTableRegistry:
             if _registry is None:
                 _registry = DuckTableRegistry()
     return _registry
+
+
+def release_document(document_id: str) -> bool:
+    """释放某个文档的 DuckDB 内存资源（删除文档时调用）。
+
+    只影响该 ``document_id``；DuckDB 不可用时注册表为空，返回 ``False``（不抛异常）。
+    """
+    return get_registry().remove_document(document_id)
 
 
 def reset_registry() -> None:
