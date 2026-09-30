@@ -25,6 +25,35 @@ class LLMConfig:
     timeout: int = 30
 
 
+def resolve_request_timeout(config: 'LLMConfig') -> float:
+    """LLM 请求超时（秒）—— 只用项目**已有**配置，不新增 env / 配置层。
+
+    优先级：
+      1. 环境配置的 ``LLM_TIMEOUT``（``backend.config.config``；当前仅 ``ProductionConfig``
+         定义了它，值为 30）；
+      2. ``LLMConfig.timeout``（LLM 统一配置对象的既有字段，默认 30）；
+      3. 兜底 30。
+
+    注：pydantic ``backend.config.settings.settings`` **没有** ``LLM_TIMEOUT`` 字段
+    （``extra='ignore'``，env 也不会注入），因此这里按"环境配置类"读取；两个来源当前
+    都为 30，故运行时数值与既有默认一致，只是**真正传给了 transport 层**。
+    """
+    try:
+        from backend.config import config as env_config
+        env_value = getattr(env_config, 'LLM_TIMEOUT', None)
+        if env_value is not None:
+            return float(env_value)
+    except Exception:  # noqa: BLE001 - 配置缺失不应影响 client 创建
+        logger.debug('读取环境 LLM_TIMEOUT 失败（回退 LLMConfig.timeout）', exc_info=True)
+    value = getattr(config, 'timeout', None)
+    if value is not None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning('LLMConfig.timeout 非数值（%r），回退 30s', value)
+    return 30.0
+
+
 class BaseLLM(ABC):
     """大模型基类"""
 
@@ -81,10 +110,16 @@ class OpenAILikeLLM(BaseLLM):
             )
             # Ollama / local 不需要 API Key
             api_key = self.config.api_key or 'not-needed'
+            # Stage 4：把项目既有 timeout 真正接到 transport 层
+            # （配置来源见 resolve_request_timeout；不新增任何配置项）
+            self.request_timeout = resolve_request_timeout(self.config)
             self.client = AsyncOpenAI(
                 api_key=api_key,
                 base_url=base_url,
+                timeout=self.request_timeout,
             )
+            logger.info('LLM client 已就绪：provider=%s model=%s timeout=%ss',
+                        self.config.provider, self.config.model, self.request_timeout)
         except ImportError:
             raise ImportError('请安装openai：pip install openai')
 
