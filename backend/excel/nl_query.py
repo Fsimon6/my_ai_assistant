@@ -3197,6 +3197,46 @@ def _enforce_user_metric_column(
                   % (want, column or '空', operation)]
 
 
+#: F4（2026-09-30）：**去重计数**问法（「有多少种 / 几种 / 多少类 / 多少款」）。
+#: 系统契约固定 COUNT = 符合筛选条件的数据**行数**、不实现 COUNT(DISTINCT)
+#: （见 `backend/excel/aggregate.py` 顶部与 COUNT 分支）；因此这类问句**不**由计数权威接管，
+#: 保持既有「交给 LLM 判定」的行为 —— 绝不把「有多少种」机械地当成 COUNT(*) 行数。
+_DISTINCT_COUNT_ASK_RE = re.compile(r'(?:多少|几)\s*(?:种|类|款)')
+
+#: F4（2026-09-30）：计数表达式**紧邻之后**的「计数目标」片段（可有量词）。
+#: 只用于判断"数的是不是某一列的取值"，不参与任何 operation 判定。
+_COUNT_TARGET_RE = re.compile(
+    r'(?:有多少|几)\s*(?:个|名|款|种|类|条|笔|单|行|位|只|项)?\s*([A-Za-z\u4e00-\u9fff]{1,10})')
+
+
+def _counts_column_values(message: str, sheet: Optional['SheetRepresentation']) -> bool:
+    """该问句是否在数**某一列的不同取值**（即需要 COUNT(DISTINCT) 才能回答）。
+
+    为什么需要这个延期边界（F4，2026-09-30）：
+      系统契约固定 COUNT = 数据**行数**、**不实现去重**（`aggregate.py` 顶部）；
+      而「有多少个SKU」数的是 SKU 列的**不同取值**（行数 19 ≠ 去重数），
+      「有多少物流商」同理。本轮**不为它们 invent 任何产品语义、也不新增 DISTINCT 能力**，
+      而是让计数权威**不接管** —— 保持既有「交给 LLM 判定」的行为
+      （既不静默返回行数，也不假装已经解决）。
+
+    判据（**复用既有列解析**，不新造解析器）：计数表达式紧邻之后的目标片段能否在真实
+    schema 上解析成列/维度 —— 「有多少个SKU」-> SKU ID ✓、「有多少物流商」-> 物流商 ✓；
+    而数据行计数问法的目标片段**不是任何列**：「有多少订单 / 有几单 / 有多少条订单行」
+    -> 订单 / 单 / 订单行（均不可解析）-> 正常接管。
+    """
+    if not message or sheet is None:
+        return False
+    m = _COUNT_TARGET_RE.search(nl_norm.to_halfwidth(message))
+    if m is None:
+        return False
+    frag = m.group(1)
+    if not frag:
+        return False
+    if nl_norm.longest_resolvable_column(frag, sheet.column_names, COLUMN_ALIASES):
+        return True
+    return bool(nl_norm.longest_resolvable_column(frag, sheet.column_names, DIMENSION_ALIASES))
+
+
 def _user_operation_from_signals(
     signals: Optional['nl_norm.IntentSignals'],
 ) -> Optional[str]:
@@ -3543,7 +3583,16 @@ def _enforce_user_aggregate_params(
              的「最多」是**选哪个分组**的依据，不是 ``MAX`` 聚合（实测会退化成
              「MAX 需要指定一个数值列」并错误澄清）；
           ③ 文本能**唯一解析出度量列**（`_deterministic_rank_metric`）—— 无度量时
-             「最多/最少」不构成数值聚合口径（条数语义由既有 COUNT 规则负责，§八）；
+             「最多/最少」不构成数值聚合口径（条数语义由既有 COUNT 规则负责，§八）。
+             **F4（2026-09-30）**：该门槛本是拦住「无度量时的 最多/最少 -> MAX/MIN」，
+             而 **COUNT(\*) 不依赖任何数值列**，硬套它会让「有多少订单」这类纯计数问句
+             完全失去 operation authority（LLM 给 sum 就直接 SUM，实测 1550 而非 19）。
+             因此当 `_user_operation_from_signals` 明确给出 **count**（口径未混用）时同样放行。
+             **延期边界（不接管）**：数「某一列的不同取值」的问法 —— 「有多少种 / 几种 /
+             多少款」(`_DISTINCT_COUNT_ASK_RE`) 与「有多少个SKU / 有多少物流商」
+             (`_counts_column_values`) —— 它们需要 COUNT(DISTINCT)，而系统契约固定
+             COUNT = 行数且不实现去重（见 `aggregate.py` 顶部）；本轮**不 invent 其产品语义**，
+             保持既有「交给 LLM 判定」的行为（也不静默返回行数）；
       * group_by 只在**非 TOP-N** 语境生效（同上，避免与 ranking unit 的 group_by 冲突）——
         覆盖的正是「各物流商…总和」这类普通分组统计；且**只有当 LLM 给出的分组值本身
         可解析**时才替换（不可解析 = 乱码 / 注入串 -> 交给既有澄清路径，绝不"洗白"）；
@@ -3560,9 +3609,22 @@ def _enforce_user_aggregate_params(
     _which = bool(nl_norm.WHICH_RE.search(_text))
 
     # ---- ① operation ----
+    # F4（2026-09-30）：**计数口径不依赖度量列**。原门槛只认 `_deterministic_rank_metric`
+    # （其本意是拦住"无度量时的 最多/最少 -> MAX/MIN"，见 ③），于是「有多少订单」这类
+    # 纯计数问句在 LLM 给 sum 时无人纠正（实测 1550，正确 19）。这里在**同一个**权威分支内
+    # 放行计数口径：`_user_operation_from_signals` 只有在文本有明确计数词、且未与数值口径
+    # 混用时才返回 count（混用 -> None，不猜）。
+    # **延期边界**：数「某一列取值」的问法（有多少个SKU / 有多少物流商 / 有多少种…）需要
+    # COUNT(DISTINCT)，系统无该能力且本轮不 invent 语义 -> **不接管**（保持候选），
+    # 见 `_counts_column_values` / `_DISTINCT_COUNT_ASK_RE`。
+    _metric_col = _deterministic_rank_metric(message, sheet)
+    _text_op = _user_operation_from_signals(signals)
+    _count_authority = (_text_op == excel_aggregate.OPERATION_COUNT
+                        and not _DISTINCT_COUNT_ASK_RE.search(_text)
+                        and not _counts_column_values(message, sheet))
     if (enforce_operation and signals is not None and signals.top_n is None and not _which
-            and _deterministic_rank_metric(message, sheet) is not None):
-        want_op = _user_operation_from_signals(signals)
+            and (_metric_col is not None or _count_authority)):
+        want_op = _text_op
         if want_op is not None and want_op != agg.operation:
             notes.append('统计口径=%s（以用户文本为准；LLM 给的是 %s）'
                          % (want_op, agg.operation or '空'))
