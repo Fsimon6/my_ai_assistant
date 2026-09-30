@@ -83,7 +83,7 @@
     <!-- 页脚 -->
     <el-footer class="footer">
       <div class="footer-content">
-        <span> 2024 My AI Assistant. All rights reserved.</span>
+        <span> 2026 My AI Assistant. All rights reserved.</span>
         <div class="footer-links">
           <a href="#">关于</a>
           <a href="#">帮助</a>
