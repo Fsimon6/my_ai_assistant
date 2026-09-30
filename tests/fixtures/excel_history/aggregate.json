@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "kind": "aggregate",
+  "document": {
+    "document_id": "golden-synth",
+    "filename": "golden_small.xlsx"
+  },
+  "sheet": {
+    "sheet_index": 0,
+    "sheet_name": "OrderSKUList"
+  },
+  "engine": "duckdb",
+  "inherited_from": "",
+  "relaxed_filters": [
+    "「Shipping Provider Name」中没有与「SF」完全相等的值；已按前缀放宽为「包含 SF」（该列唯一符合的值是「SF International」）"
+  ],
+  "continued": false,
+  "history_truncated": false,
+  "payload": {
+    "operation": "sum",
+    "operation_label": "SUM（求和）",
+    "column": "Order Amount",
+    "column_index": 3,
+    "column_letter": "D",
+    "column_numeric_in_sheet": 17,
+    "value": 280.0,
+    "value_display": "280",
+    "matched_rows": 4,
+    "numeric_rows": 3,
+    "empty_rows": 1,
+    "non_numeric_rows": 0,
+    "total_rows_in_sheet": 19,
+    "row_excel_spans": {
+      "first": 3,
+      "last": 19
+    },
+    "sheet_index": 0,
+    "sheet_name": "OrderSKUList",
+    "definition": "对「Order Amount」列中**可数值化**的单元格求和；空值与非数值单元格不计入（也不当作 0）",
+    "matched_row_runs": [
+      [
+        3,
+        3
+      ],
+      [
+        12,
+        12
+      ],
+      [
+        18,
+        19
+      ]
+    ],
+    "matched_row_run_count": 3,
+    "matched_row_runs_truncated": false,
+    "row_excel_numbers": [
+      3,
+      12,
+      18,
+      19
+    ],
+    "applied_filters": [
+      {
+        "column": "Shipping Provider Name",
+        "operator": "contains",
+        "value": "SF"
+      }
+    ],
+    "filters": [
+      {
+        "column": "Shipping Provider Name",
+        "operator": "contains",
+        "value": "SF"
+      }
+    ],
+    "calculation": null
+  }
+}

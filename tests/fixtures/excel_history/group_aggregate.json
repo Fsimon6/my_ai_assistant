@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "kind": "group_aggregate",
+  "document": {
+    "document_id": "golden-synth",
+    "filename": "golden_small.xlsx"
+  },
+  "sheet": {
+    "sheet_index": 0,
+    "sheet_name": "OrderSKUList"
+  },
+  "engine": "duckdb",
+  "inherited_from": "",
+  "relaxed_filters": [],
+  "continued": false,
+  "history_truncated": false,
+  "payload": {
+    "kind": "group_aggregate",
+    "operation": "sum",
+    "operation_label": "SUM（求和）",
+    "column": "Order Amount",
+    "column_index": 3,
+    "column_letter": "D",
+    "column_numeric_in_sheet": 17,
+    "total_groups": 3,
+    "returned_groups": 3,
+    "top_n": null,
+    "order_by": "aggregate_value",
+    "order_by_column": null,
+    "order_by_label": "Order Amount 合计",
+    "order_dir": "desc",
+    "order_dir_label": "从高到低（降序）",
+    "sorted": true,
+    "sort_description": "已按「Order Amount 合计」降序排列（相同值时按分组字段升序稳定排序）",
+    "truncated_by_top_n": false,
+    "matched_rows": 19,
+    "total_rows_in_sheet": 19,
+    "row_excel_spans": {
+      "first": 3,
+      "last": 21
+    },
+    "sheet_index": 0,
+    "sheet_name": "OrderSKUList",
+    "definition": "先按「Shipping Provider Name」分组，再对每个分组对「Order Amount」列中**可数值化**的单元格求和；空值与非数值单元格不计入（也不当作 0）；结果按「Order Amount 合计」降序排序（相同值时按分组字段升序稳定排序）",
+    "matched_row_runs": [
+      [
+        3,
+        21
+      ]
+    ],
+    "matched_row_run_count": 1,
+    "matched_row_runs_truncated": false,
+    "group_by": [
+      {
+        "name": "Shipping Provider Name",
+        "index": 5
+      }
+    ],
+    "rows": [
+      {
+        "group_key": [
+          "Yanwen Express"
+        ],
+        "group_display": [
+          "Yanwen Express"
+        ],
+        "value": 920.0,
+        "value_display": "920",
+        "matched_rows": 8,
+        "numeric_rows": 7,
+        "empty_rows": 0,
+        "non_numeric_rows": 1,
+        "group": [
+          {
+            "column": "Shipping Provider Name",
+            "value": "Yanwen Express",
+            "display": "Yanwen Express",
+            "is_null": false
+          }
+        ]
+      },
+      {
+        "group_key": [
+          "JS Express International"
+        ],
+        "group_display": [
+          "JS Express International"
+        ],
+        "value": 350.0,
+        "value_display": "350",
+        "matched_rows": 7,
+        "numeric_rows": 7,
+        "empty_rows": 0,
+        "non_numeric_rows": 0,
+        "group": [
+          {
+            "column": "Shipping Provider Name",
+            "value": "JS Express International",
+            "display": "JS Express International",
+            "is_null": false
+          }
+        ]
+      },
+      {
+        "group_key": [
+          "SF International"
+        ],
+        "group_display": [
+          "SF International"
+        ],
+        "value": 280.0,
+        "value_display": "280",
+        "matched_rows": 4,
+        "numeric_rows": 3,
+        "empty_rows": 1,
+        "non_numeric_rows": 0,
+        "group": [
+          {
+            "column": "Shipping Provider Name",
+            "value": "SF International",
+            "display": "SF International",
+            "is_null": false
+          }
+        ]
+      }
+    ],
+    "row_excel_numbers": [],
+    "applied_filters": [],
+    "filters": [],
+    "calculation": null
+  }
+}

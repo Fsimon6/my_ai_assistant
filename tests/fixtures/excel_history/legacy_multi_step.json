@@ -1,0 +1,168 @@
+{
+  "schema_version": 1,
+  "kind": "multi_step",
+  "document": {
+    "document_id": "golden-synth",
+    "filename": "golden_small.xlsx"
+  },
+  "sheet": {
+    "sheet_index": 0,
+    "sheet_name": "OrderSKUList"
+  },
+  "engine": "duckdb",
+  "inherited_from": "",
+  "relaxed_filters": [],
+  "continued": false,
+  "history_truncated": false,
+  "payload": {
+    "kind": "multi_step",
+    "engine": "duckdb",
+    "filename": "golden_small.xlsx",
+    "sheet_index": 0,
+    "sheet_name": "OrderSKUList",
+    "definition": "第 1 步：按「SKU ID」分组，对每个分组 SUM（求和）（目标列 Order Amount），按「Order Amount 合计」降序排列，截取前 3 个分组；第 2 步：对上述 3 个分组的**聚合值**再执行 SUM（求和）（数据来源：第 1 步的结果，不会重新回到原始 Excel 数据行）",
+    "max_steps": 2,
+    "step_count": 2,
+    "value": 1400.0,
+    "value_display": "1400",
+    "step1": {
+      "operation": "sum",
+      "operation_label": "SUM（求和）",
+      "column": "Order Amount",
+      "total_groups": 5,
+      "returned_groups": 3,
+      "top_n": 3,
+      "order_by": "aggregate_value",
+      "order_by_label": "Order Amount 合计",
+      "order_dir": "desc",
+      "sorted": true,
+      "sort_description": "已按「Order Amount 合计」降序排列（相同值时按分组字段升序稳定排序），并截取前 3 个分组",
+      "truncated_by_top_n": true,
+      "matched_rows": 19,
+      "total_rows_in_sheet": 19,
+      "row_excel_spans": {
+        "first": 3,
+        "last": 21
+      },
+      "type": "group_aggregate",
+      "source": "原始 Excel 数据（先筛选后分组）",
+      "row_excel_truncated": false,
+      "group_by": [
+        {
+          "name": "SKU ID",
+          "index": 1
+        }
+      ],
+      "rows": [
+        {
+          "group_key": [
+            "100000000000000005"
+          ],
+          "group_display": [
+            "100000000000000005"
+          ],
+          "value": 1000.0,
+          "value_display": "1000",
+          "matched_rows": 9,
+          "numeric_rows": 7,
+          "empty_rows": 1,
+          "non_numeric_rows": 1,
+          "group": [
+            {
+              "column": "SKU ID",
+              "value": "100000000000000005",
+              "display": "100000000000000005",
+              "is_null": false
+            }
+          ]
+        },
+        {
+          "group_key": [
+            "100000000000000004"
+          ],
+          "group_display": [
+            "100000000000000004"
+          ],
+          "value": 270.0,
+          "value_display": "270",
+          "matched_rows": 3,
+          "numeric_rows": 3,
+          "empty_rows": 0,
+          "non_numeric_rows": 0,
+          "group": [
+            {
+              "column": "SKU ID",
+              "value": "100000000000000004",
+              "display": "100000000000000004",
+              "is_null": false
+            }
+          ]
+        },
+        {
+          "group_key": [
+            "100000000000000003"
+          ],
+          "group_display": [
+            "100000000000000003"
+          ],
+          "value": 130.0,
+          "value_display": "130",
+          "matched_rows": 2,
+          "numeric_rows": 2,
+          "empty_rows": 0,
+          "non_numeric_rows": 0,
+          "group": [
+            {
+              "column": "SKU ID",
+              "value": "100000000000000003",
+              "display": "100000000000000003",
+              "is_null": false
+            }
+          ]
+        }
+      ],
+      "applied_filters": [],
+      "filters": [],
+      "calculation": null
+    },
+    "step2": {
+      "operation": "sum",
+      "operation_label": "SUM（求和）",
+      "type": "aggregate",
+      "source": "step_1",
+      "source_text": "第 1 步的结果（3 个分组的聚合值），不会重新回到原始 Excel 数据行",
+      "input_rows": 3,
+      "numeric_rows": 3,
+      "group_by": [],
+      "rows": [],
+      "applied_filters": [],
+      "filters": []
+    },
+    "step2_input_values": [
+      1000.0,
+      270.0,
+      130.0
+    ],
+    "plan": {
+      "max_steps": 2,
+      "steps": [
+        {
+          "type": "group_aggregate",
+          "operation": "sum",
+          "column": "Order Amount",
+          "group_by": [
+            "SKU ID"
+          ],
+          "order_by": "aggregate_value",
+          "order_dir": "desc",
+          "top_n": 3
+        },
+        {
+          "type": "aggregate",
+          "operation": "sum",
+          "column": "aggregate_value"
+        }
+      ]
+    }
+  }
+}

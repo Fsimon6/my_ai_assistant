@@ -62,6 +62,9 @@ uploads/
 *.xlsx
 *.xls
 *.xlsm
+# Stage 5 例外：**完全合成、去标识化**的 Golden 测试 fixture 必须入库
+# （真实业务 Excel 与 data/ 下的上传产物仍然被上面的规则忽略，绝不入库）
+!tests/fixtures/excel/*.xlsx
 
 # ============================================================
 # 日志与临时产物
