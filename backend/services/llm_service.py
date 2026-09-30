@@ -11,6 +11,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+#: 远端 embedding 单次请求的**条数上限**（2026-09-30）。
+#: 唯一 batch boundary 位于 ``OpenAILikeLLM.generate_embeddings``：任何一次可能传入数百条
+#: 文本的上传（TXT/MD/DOCX/PDF 的 chunk、Excel 摘要 chunk）都只在这里分片，其它层不要再分批。
+EMBEDDING_BATCH_SIZE = 20
+
+
 @dataclass
 class LLMConfig:
     """LLM配置类"""
@@ -180,17 +186,41 @@ class OpenAILikeLLM(BaseLLM):
         """生成 OpenAI 兼容 embedding（必须走 embeddings 端点，绝不能误用 chat completions）
 
         模型优先级：显式传入 > config.embedding_model(settings.EMBEDDING_MODEL) > 兜底默认。
+
+        **分片（2026-09-30，唯一 batch boundary）**：远端 embedding API 对单次 ``input`` 条数
+        有上限，而上传链路（TXT/MD/DOCX/PDF 的 chunk、Excel 摘要 chunk）可能一次传入数百条，
+        因此这里统一按 ``EMBEDDING_BATCH_SIZE``（<=20）**顺序分批**调用，并按输入顺序合并；
+        ``embeddings[i]`` 严格对应 ``texts[i]``。
+
+        为什么放在这一层：本函数是**唯一**"接收完整 texts 列表 + 直接调用远端 embedding API"
+        的入口（`VectorStoreManager.add_documents` -> Chroma `add_texts` ->
+        `AIAssistantEmbeddings.embed_documents` -> 这里），因此 Excel / RAG / VectorStore
+        **不得**各自再实现一层 batch，避免多层分片。
+
+        失败处理：任何一批失败都记录 batch 序号 / 总批数 / 批大小 / 异常原因后**原样抛出**，
+        绝不"部分成功 + 静默继续"（也绝不打印 API Key、被嵌入文本或向量内容）。
         """
         model = model or self.config.embedding_model or 'text-embedding-3-small'
-        try:
-            response = await self.client.embeddings.create(
-                model=model,
-                input=texts,
-            )
-            return [data.embedding for data in response.data]
-        except Exception as e:
-            logger.error(f'生成embedding失败：{e}')
-            raise
+        if not texts:
+            return []
+        batches = [texts[i:i + EMBEDDING_BATCH_SIZE]
+                   for i in range(0, len(texts), EMBEDDING_BATCH_SIZE)]
+        embeddings: List[List[float]] = []
+        for index, batch in enumerate(batches, start=1):
+            try:
+                response = await self.client.embeddings.create(model=model, input=batch)
+            except Exception as e:
+                logger.error(
+                    '生成embedding失败（batch=%d total=%d size=%d model=%s）：%s: %s',
+                    index, len(batches), len(batch), model, type(e).__name__, e)
+                raise
+            data = list(getattr(response, 'data', None) or [])
+            if len(data) != len(batch):
+                raise ValueError(
+                    'embedding 返回数量与输入不一致（batch=%d/%d size=%d 实得=%d）'
+                    % (index, len(batches), len(batch), len(data)))
+            embeddings.extend(item.embedding for item in data)
+        return embeddings
 
 class LLMFactory:
     """LLM工厂类（配置统一来自 settings）"""
