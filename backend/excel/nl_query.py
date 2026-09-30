@@ -4313,6 +4313,29 @@ class _EmptyIntent:
     sheet = None
 
 
+#: F3（2026-09-30）：**由自然语言解析派生**的两步计划来源 —— 这些计划的第 1 步口径必须与
+#: 用户原文对齐。调用方**显式给定**的计划（override / 手工构造）不在此列，原样执行。
+_NLP_ANALYSIS_SOURCES = ('analysis_guard', 'aggregate_upgrade')
+
+
+def _is_nlp_produced_analysis(turn: Optional[TurnIntent]) -> bool:
+    """该两步计划是否**由自然语言解析派生**（因此需要按用户原文校正第 1 步口径）。
+
+    覆盖（修复后由 `_run_analysis_turn` 的**执行入口**统一调用，见该函数内 F3 注释）：
+      * A 第一轮解析：`turn_intent_from_dict` 会把 LLM 原始 JSON 写入 ``turn.raw``；
+      * C analysis_guard 第二轮解析（``source='analysis_guard'``，``raw`` 为空）；
+      * D 确定性升级（``source='aggregate_upgrade'``，由用户文本 + 统计意图派生）。
+
+    显式 override（调用方直接构造 ``TurnIntent``，既无 ``raw`` 也无上述 ``source``）
+    **不在此列** —— 调用方给什么就执行什么，保持既有语义不变。
+    """
+    if turn is None or turn.action != ACTION_ANALYSIS or turn.analysis is None:
+        return False
+    if isinstance(turn.raw, dict) and turn.raw:
+        return True
+    return (turn.source or '') in _NLP_ANALYSIS_SOURCES
+
+
 def _repair_analysis_plan_from_text(turn: TurnIntent, message: str,
                                     catalog: List[Dict[str, Any]],
                                     signals: Optional['nl_norm.IntentSignals'] = None) -> List[str]:
@@ -4332,8 +4355,8 @@ def _repair_analysis_plan_from_text(turn: TurnIntent, message: str,
     plan = turn.analysis
     if turn.action != ACTION_ANALYSIS or plan is None:
         return notes
-    if not isinstance(turn.raw, dict) or not turn.raw:
-        return notes                                  # 只修复 LLM 产出的计划
+    if not _is_nlp_produced_analysis(turn):
+        return notes                                  # 只修复自然语言解析派生的计划
     if len(plan.steps) != 2:
         return notes                                  # 只处理标准两步
     step1 = plan.steps[0]
@@ -4577,6 +4600,20 @@ def _run_analysis_turn(
         inherited_sheet_index = analysis_context.sheet_index
         inherited_sheet_name = analysis_context.sheet_name
         inherited_plan = analysis_context.plan
+
+    # F3（2026-09-30）：第 1 步口径的**用户权威必须在执行入口统一落一次**。
+    # 为什么不能只靠 1.5 的那次调用：`analysis_guard`（2.3）与确定性升级
+    # （`aggregate_upgrade`，2.3）会产出**新的**计划，其 `raw` 为空 / 生成时机晚于 1.5，
+    # 于是绕过 `_repair_analysis_plan_from_text`（实测：守卫路径 step1.operation=count
+    # -> 最终 15，正确 1400）。这里复用**同一个**修复函数（不新造平行权威），
+    # 对已经正确的计划是幂等 no-op；显式 override 的计划不在此列（`_is_nlp_produced_analysis`）。
+    # 位置必须在 `_analysis_steps_for_execution` **之前**：该函数会浅拷贝每一步，
+    # 之后再修改 `turn.analysis.steps` 不会影响实际执行。
+    if _is_nlp_produced_analysis(turn):
+        _plan_notes = _repair_analysis_plan_from_text(turn, user_message, catalog,
+                                                      nl_norm.detect_signals(user_message))
+        if _plan_notes:
+            logger.info('[nl] 两步计划第 1 步口径（F3 统一边界）：%s', '; '.join(_plan_notes))
 
     raw_steps = _analysis_steps_for_execution(intent, inherited_plan)
     if raw_steps and not _has_group_step(raw_steps):

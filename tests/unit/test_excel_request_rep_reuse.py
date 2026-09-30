@@ -6,6 +6,10 @@
   * multi-step：**4 次**
 优化后：**1 次**（同一请求内同一 document_id 只读盘一次）。
 
+F3（2026-09-30）后：两步分析的执行入口新增一个调用点（`_run_analysis_turn` 需要真实
+schema 才能校正第 1 步口径），因此"关掉复用"的基线变为 **3 / 5**；**生产路径仍为 1 次**
+（新增调用命中请求内复用，不产生额外读盘）。
+
 硬性边界（本文件同时是回归护栏）：
   * 只在**请求内**复用（无全局 dict / 无 TTL / 无 LRU / 无跨请求缓存）；
   * 不改变 user / document 归属校验（memo 只在同一 document_id 上复用同一份结果）；
@@ -218,14 +222,21 @@ def test_multi_step_loads_once_and_plan_unchanged(big_rep, monkeypatch):
 
 
 def test_baseline_reproduces_pre_optimization_counts(big_rep, monkeypatch):
-    """对照实验：关掉复用后，读盘次数回到优化前的 3 / 4 次。"""
+    """对照实验：关掉复用后，读盘次数回到"无请求内复用"的量级（普通 3 / multi-step 5）。
+
+    注（F3，2026-09-30）：两步分析的**执行入口**新增了一次 `_load_rep`
+    （`_run_analysis_turn` -> `_repair_analysis_plan_from_text` 需要真实 schema 才能按
+    用户原文校正第 1 步口径，见 `test_excel_analysis_guard_authority.py`），
+    因此"关掉复用"的基线由 4 次变为 5 次。
+    生产路径不受影响：同一 document 仍是**请求内复用**（本文件所有 `count == 1` 断言不变）。
+    """
     _out, counter = _run(big_rep, '列出订单号和物流商', _turn_table(limit=500), monkeypatch,
                          baseline=True)
-    assert counter.count == 3
+    assert counter.count == 3                    # 普通查询：未新增调用点
     monkeypatch.undo()
     _out2, counter2 = _run(big_rep, '订单金额最高的前3个SKU的销售额总和', _turn_multi_step(),
                            monkeypatch, baseline=True)
-    assert counter2.count == 4
+    assert counter2.count == 5
 
 
 # ==========================================================================
