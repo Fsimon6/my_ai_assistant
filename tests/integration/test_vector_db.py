@@ -1,48 +1,73 @@
 """
-集成测试：向量数据库测试（适配现有 VectorStoreManager）
+集成测试：向量数据库（适配当前 VectorStoreManager）
+
+6A-6（2026-10-08）修复点（**只改测试，不改生产代码**）：
+  1. embedding 全部替换为**本地确定性假实现**（`FakeEmbeddings`），
+     测试不再调用远程 embedding API（原 `mock_embeddings` fixture 从未被
+     `vector_manager` 依赖，等于没生效；且其 `embed_query(self)` 签名与
+     LangChain 实际调用的 `embed_query(text)` 不符）；
+  2. 临时目录改用 pytest 的 `tmp_path`，并在 teardown 里尽力释放 Chroma 客户端，
+     不再手工 `shutil.rmtree`（原写法在 Windows 上因 Chroma 文件锁报
+     `PermissionError: [WinError 32] ... data_level0.bin`）；
+  3. 删除用例对齐**当前真实 API**：`delete_documents(document_ids=[...], user_id=None)`
+     返回删除数量，且按 `metadata.document_id` 匹配（原测试传 `ids=` 并断言 `is True`，
+     且 metadata 里没有 document_id，必然失败）。
+
+测试目标不变：仍真实验证当前 `VectorStoreManager` 的
+add / search / delete / collection_info / persistence 行为。
 """
-import pytest
-import tempfile
-import shutil
 import asyncio
+
+import pytest
 
 from backend.services.vector_service import VectorStoreManager
 
-
-@pytest.fixture
-def temp_vector_db():
-    """临时向量数据库目录"""
-    temp_dir = tempfile.mkdtemp()
-    yield temp_dir
-    shutil.rmtree(temp_dir)
+DIM = 384
 
 
-@pytest.fixture
-def vector_manager(temp_vector_db):
-    """VectorStoreManager 实例"""
-    # 注意：VectorStoreManager 的 __init__ 会创建 Chroma 实例，需要异步初始化？但当前代码是同步的。
-    # 为了测试，我们直接实例化，但需要确保 embed_documents 方法不会实际调用外部 API。
-    # 可以打补丁替换 embeddings 为 mock。
-    manager = VectorStoreManager(persist_directory=temp_vector_db)
-    return manager
+class FakeEmbeddings:
+    """确定性假 embedding（不联网、可复现）。"""
+
+    def _vec(self, text: str):
+        seed = sum(ord(c) for c in text) or 1
+        return [((seed * (i + 1)) % 997) / 997.0 for i in range(DIM)]
+
+    def embed_documents(self, texts):
+        return [self._vec(t) for t in texts]
+
+    def embed_query(self, text):
+        return self._vec(text)
 
 
 @pytest.fixture
-def mock_embeddings(monkeypatch):
-    """模拟 embeddings，避免真实调用"""
-    class MockEmbeddings:
-        def embed_documents(self, texts):
-            # 返回固定维度的模拟向量（384维）
-            import numpy as np
-            return [np.random.randn(384).tolist() for _ in texts]
+def fake_embeddings(monkeypatch):
+    """在 VectorStoreManager 构造前，把生产 embedding 类替换为本地假实现。
 
-        def embed_query(self):
-            import numpy as np
-            return np.random.randn(384).tolist()
+    `VectorStoreManager.__init__` 通过模块全局名 `AIAssistantEmbeddings()`
+    实例化 embedding，因此 patch 模块属性即可生效。
+    """
+    monkeypatch.setattr(
+        "backend.services.vector_service.AIAssistantEmbeddings", FakeEmbeddings)
+    return FakeEmbeddings
 
-    monkeypatch.setattr("backend.services.vector_service.AIAssistantEmbeddings", MockEmbeddings)
-    # 注意：VectorStoreManager 初始化时创建了 self.embeddings = AIAssistantEmbeddings()
-    # 因此需要在使用 vector_manager fixture 之前打补丁，或者直接在 fixture 内替换。
+
+def _release(manager) -> None:
+    """尽力释放 Chroma 客户端（避免 Windows 下文件锁影响临时目录清理）。"""
+    try:
+        client = getattr(manager.vector_store, "_client", None)
+        system = getattr(client, "_system", None)
+        if system is not None:
+            system.stop()
+    except Exception:                                   # noqa: BLE001 - 清理失败不影响结论
+        pass
+
+
+@pytest.fixture
+def vector_manager(tmp_path, fake_embeddings):
+    """VectorStoreManager 实例（独立临时目录 + 假 embedding）"""
+    manager = VectorStoreManager(persist_directory=str(tmp_path / "chroma"))
+    yield manager
+    _release(manager)
 
 
 class TestVectorDB:
@@ -51,63 +76,31 @@ class TestVectorDB:
     def test_add_documents(self, vector_manager):
         """测试添加文档"""
         documents = [
-            {
-                "id": "doc1",
-                "content": "这是第一个测试文档",
-                "metadata": {"source": "test1", "page": 1}
-            },
-            {
-                "id": "doc2",
-                "content": "这是第二个测试文档",
-                "metadata": {"source": "test2", "page": 2}
-            }
+            {"id": "doc1", "content": "这是第一个测试文档",
+             "metadata": {"document_id": "doc1", "source": "test1", "page": 1}},
+            {"id": "doc2", "content": "这是第二个测试文档",
+             "metadata": {"document_id": "doc2", "source": "test2", "page": 2}},
         ]
 
-        # 由于 add_documents 是异步方法，需要运行事件循环
-        async def add():
-            ids = await vector_manager.add_documents(documents)
-            return ids
-
-        ids = asyncio.run(add())
-        assert len(ids) == 2
+        ids = asyncio.run(vector_manager.add_documents(documents))
         assert ids == ["doc1", "doc2"]
 
-        # 验证集合信息
         info = vector_manager.get_collection_info()
         assert info["total_documents"] == 2
 
     def test_search(self, vector_manager):
         """测试相似度搜索"""
-        # 先添加文档
         documents = [
-            {
-                "id": "doc1",
-                "content": "机器学习是人工智能的一个分支",
-                "metadata": {"source": "test1"}
-            },
-            {
-                "id": "doc2",
-                "content": "深度学习是机器学习的一个子集",
-                "metadata": {"source": "test2"}
-            },
-            {
-                "id": "doc3",
-                "content": "自然语言处理涉及文本理解",
-                "metadata": {"source": "test3"}
-            }
+            {"id": "doc1", "content": "机器学习是人工智能的一个分支",
+             "metadata": {"document_id": "doc1", "source": "test1"}},
+            {"id": "doc2", "content": "深度学习是机器学习的一个子集",
+             "metadata": {"document_id": "doc2", "source": "test2"}},
+            {"id": "doc3", "content": "自然语言处理涉及文本理解",
+             "metadata": {"document_id": "doc3", "source": "test3"}},
         ]
+        asyncio.run(vector_manager.add_documents(documents))
 
-        async def add():
-            await vector_manager.add_documents(documents)
-
-        asyncio.run(add())
-
-        # 搜索
-        async def search():
-            results = await vector_manager.search(query="人工智能", k=2)
-            return results
-
-        results = asyncio.run(search())
+        results = asyncio.run(vector_manager.search(query="人工智能", k=2))
         assert len(results) == 2
         for res in results:
             assert "content" in res
@@ -116,60 +109,61 @@ class TestVectorDB:
             assert "id" in res
 
     def test_delete_documents(self, vector_manager):
-        """测试删除文档"""
+        """测试按 document_id 删除（当前 API：返回删除数量）"""
         documents = [
-            {
-                "id": "doc_to_delete",
-                "content": "要删除的内容",
-                "metadata": {"source": "test"}
-            }
+            {"id": "vec_1", "content": "要删除的内容",
+             "metadata": {"document_id": "doc_to_delete", "source": "test"}},
         ]
+        asyncio.run(vector_manager.add_documents(documents))
+        assert vector_manager.get_collection_info()["total_documents"] == 1
 
-        async def add_and_delete():
-            await vector_manager.add_documents(documents)
-            # 验证存在
-            info_before = vector_manager.get_collection_info()
-            assert info_before["total_documents"] == 1
+        removed = asyncio.run(
+            vector_manager.delete_documents(document_ids=["doc_to_delete"]))
+        assert removed == 1
+        assert vector_manager.get_collection_info()["total_documents"] == 0
 
-            # 删除
-            success = await vector_manager.delete_documents(ids=["doc_to_delete"])
-            assert success is True
+    def test_delete_documents_respects_user_id(self, vector_manager):
+        """删除必须按 user_id 隔离：他人 document_id 不可删除"""
+        documents = [
+            {"id": "vec_owner1", "content": "用户1的文档",
+             "metadata": {"document_id": "d1", "user_id": 1}},
+            {"id": "vec_owner2", "content": "用户2的文档",
+             "metadata": {"document_id": "d2", "user_id": 2}},
+        ]
+        asyncio.run(vector_manager.add_documents(documents))
 
-            # 验证删除后
-            info_after = vector_manager.get_collection_info()
-            assert info_after["total_documents"] == 0
+        removed = asyncio.run(
+            vector_manager.delete_documents(document_ids=["d2"], user_id=1))
+        assert removed == 0
+        assert vector_manager.get_collection_info()["total_documents"] == 2
 
-        asyncio.run(add_and_delete())
+        removed = asyncio.run(
+            vector_manager.delete_documents(document_ids=["d2"], user_id=2))
+        assert removed == 1
+        assert vector_manager.get_collection_info()["total_documents"] == 1
 
     def test_collection_info(self, vector_manager):
         """测试获取集合信息"""
         info = vector_manager.get_collection_info()
-        assert "total_documents" in info
-        assert "collection_name" in info
-        assert "persist_directory" in info
-        assert info["total_documents"] == 0  # 初始应为0
+        assert info["total_documents"] == 0
+        assert info["collection_name"] == "ai_assistant_docs"
+        assert info["persist_directory"] == vector_manager.persist_directory
 
-    def test_persistence(self, temp_vector_db):
-        """测试数据持久化"""
-        # 创建第一个管理器并添加数据
-        manager1 = VectorStoreManager(persist_directory=temp_vector_db)
+    def test_persistence(self, tmp_path, fake_embeddings):
+        """测试数据持久化：第二个管理器应能读到第一个写入的数据"""
+        persist_dir = str(tmp_path / "chroma")
 
-        async def add():
-            docs = [{"id": "persist_doc", "content": "持久化测试", "metadata": {}}]
-            await manager1.add_documents(docs)
+        manager1 = VectorStoreManager(persist_directory=persist_dir)
+        asyncio.run(manager1.add_documents(
+            [{"id": "persist_doc", "content": "持久化测试",
+              "metadata": {"document_id": "persist_doc"}}]))
 
-        asyncio.run(add())
+        # 注意：不要在两个 manager 之间 stop() Chroma 全局 system ——
+        # chromadb 的 system 是**进程级单例**，停掉后同进程再建客户端会
+        # 报 "Could not connect to tenant default_tenant"。释放统一放到测试末尾。
+        manager2 = VectorStoreManager(persist_directory=persist_dir)
+        assert manager2.get_collection_info()["total_documents"] == 1
 
-        # 创建第二个管理器（应该加载已有数据）
-        manager2 = VectorStoreManager(persist_directory=temp_vector_db)
-        info = manager2.get_collection_info()
-        assert info["total_documents"] == 1
-
-        # 验证能搜索到
-        async def search():
-            results = await manager2.search(query="持久化", k=1)
-            return results
-
-        results = asyncio.run(search())
+        results = asyncio.run(manager2.search(query="持久化", k=1))
         assert len(results) == 1
         assert results[0]["content"] == "持久化测试"

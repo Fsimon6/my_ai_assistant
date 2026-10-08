@@ -6,8 +6,7 @@ import asyncio
 import tempfile
 import os
 from pathlib import Path
-from typing import Generator, AsyncGenerator, Dict, Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Dict, Any
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -106,29 +105,6 @@ def test_user() -> Dict[str, Any]:
 
 
 @pytest.fixture
-def authenticated_client(client, test_user):
-    """已认证的测试客户端"""
-    # 注册用户
-    register_response = client.post("/auth/register", json=test_user)
-
-    # 登录获取令牌
-    login_response = client.post(
-        "/api/v1/auth/login",
-        json={
-            "email": test_user["email"],
-            "password": test_user["password"],
-        }
-    )
-
-    token = login_response.json()["access_token"]
-
-    # 设置认证头
-    client.headers.update({"Authorization": f"Bearer {token}"})
-
-    return client
-
-
-@pytest.fixture
 def temp_test_file():
     """创建临时测试文件"""
     with tempfile.NamedTemporaryFile(
@@ -145,86 +121,3 @@ def temp_test_file():
     # 清理
     if os.path.exists(f.name):
         os.unlink(f.name)
-
-
-@pytest.fixture
-def sample_pdf_data():
-    """PDF测试数据"""
-    return {
-        'filename': 'test(空).pdf',
-        'content': 'Sample PDF content',
-        'pages': 3,
-        'metadata': {
-            "author": "Test Author",
-            "title": "Test Document",
-        }
-    }
-
-
-@pytest.fixture
-def test_document_data():
-    """测试文档数据"""
-    return {
-        'title': '测试文档',
-        'content': '这是一个测试文档的内容，包含一些技术术语和描述',
-        'metadata': {
-            'source': 'test',
-            'language': 'zh',
-            'category': 'test'
-        }
-    }
-
-
-@pytest.fixture
-def rag_service_mock():
-    """Mock RAG服务"""
-    with patch("backend.services.rag_service.RAGService") as mock:
-        mock_instance = MagicMock()
-        mock.return_value = mock_instance
-        mock_instance.query.return_value = {
-            'answer': 'This is a mock answer',
-            'sources': [
-                {
-                    'content': 'Source document content',
-                    'metadata': {'source': 'test'}
-                }
-            ],
-            'confidence': 0.85
-        }
-
-        yield mock_instance
-
-
-@pytest.fixture(scope="session")
-def test_vector_db():
-    """测试向量数据库"""
-    import chromadb
-    from chromadb.config import Settings
-
-    # 使用临时目录
-    temp_dir = tempfile.mkdtemp()
-    client = chromadb.Client(Settings(
-        chroma_db_impl='duckdb+parquet',
-        persist_directory=temp_dir,
-        anonymize_telemetry=False
-    ))
-
-    # 创建测试集合
-    collection = client.create_collection(name='test_documents')
-    yield collection, client
-
-    # 清理
-    client.clear_system_cache()
-    client = None
-
-
-@pytest.fixture
-def async_client():
-    """异步测试客户端"""
-    from httpx import AsyncClient
-
-    async def get_client():
-        async with AsyncClient(app=app, base_url='http://test') as ac:
-            yield ac
-
-    return get_client
