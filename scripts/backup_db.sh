@@ -47,8 +47,6 @@ fi
 # 备份配置文件
 echo " 备份配置文件..."
 CONFIG_FILES=(
-  "backend/.env"
-  "backend/config.py"
   "docker-compose.yml"
   ".env"
 )

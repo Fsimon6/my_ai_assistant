@@ -93,7 +93,6 @@ my_ai_assistant/
 │   │   ├── retry.py           # 重试装饰器
 │   │   └── security.py        # 安全工具
 │   ├── main.py                # FastAPI 入口
-│   ├── config.py              # 配置类
 │   └── requirements.txt       # Python 依赖
 ├── frontend/                   # 前端代码
 │   ├── src/
