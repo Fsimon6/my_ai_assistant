@@ -6,7 +6,7 @@ services:
   backend-dev:
     build:
       context: ./backend
-      dockerfile: Dockerfile.dev
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     environment:
@@ -99,7 +99,7 @@ services:
 
   # ¼à¿Ø·þÎñ
   prometheus:
-    image: prom/prometheus:lastest
+    image: prom/prometheus:latest
     ports:
       - "9090:9090"
     volumes:
@@ -113,7 +113,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:lastest
+    image: grafana/grafana:latest
     ports:
       - "3000:3000"
     volumes:
@@ -129,4 +129,3 @@ volumes:
   pgadmin_data:
   prometheus_data:
   grafana_data:
-l

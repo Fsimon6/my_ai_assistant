@@ -69,7 +69,7 @@ install-backend:
 
 install-frontend:
 	@echo "$(BLUE)安装前端依赖...$(NC)"
-	cd frontend && pip npm install
+	cd frontend && npm install
 	@echo "$(GREEN)前端依赖安装完成$(NC)"
 
 # 开发环境
@@ -81,14 +81,14 @@ dev-backend:
 
 dev-frontend:
 	@echo "$(BLUE)启动前端开发服务器...$(NC)"
-	cd frontend && python npm run dev
+	cd frontend && npm run dev
 
 # 代码质量
 lint: lint-backend lint-frontend
 
 lint-backend:
 	@echo "$(BLUE)检查后端代码...$(NC)"
-	cd backend && python -m flake8 . --count --select=E9,F63,F7,F82 --show-source --ststistics
+	cd backend && python -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
 	cd backend && python -m flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
 lint-frontend:
@@ -115,7 +115,7 @@ test: test-backend test-frontend
 
 test-backend:
 	@echo "$(BLUE)运行后端测试...$(NC)"
-	cd backend && python -m pytest tests/ -v --cov=. --cov-report=html
+	python -m pytest tests/unit -v --cov=backend --cov-report=html
 
 test-frontend:
 	@echo "$(BLUE)运行前端测试...$(NC)"
@@ -123,15 +123,15 @@ test-frontend:
 
 coverage:
 	@echo "$(BLUE)生成测试覆盖率报告...$(NC)"
-	cd backend && python -m pytest tests/ --cov=. --cov-report=html --cov-report=xml
-	@echo "$(GREEN)覆盖率报告已生成：backend/htmlcov/index.html$(NC)"
+	python -m pytest tests/unit --cov=backend --cov-report=html --cov-report=xml
+	@echo "$(GREEN)覆盖率报告已生成：htmlcov/index.html$(NC)"
 
 # 构建
 build: build-backend build-frontend
 
 build-backend:
 	@echo "$(BLUE)构建后端...$(NC)"
-	cd backend && python -m py_compile**/*.py
+	cd backend && python -m compileall -q .
 
 build-frontend:
 	@echo "$(BLUE)构建前端...$(NC)"

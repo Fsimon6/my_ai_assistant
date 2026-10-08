@@ -23,7 +23,7 @@ repos:
     rev: 5.13.2
     hooks:
       - id: isort
-        args: ['--profile", "black']
+        args: ['--profile', 'black']
 
   # Python´úÂë¼ì²é
   - repo: https://github.com/PyCQA/flake8
@@ -62,7 +62,7 @@ repos:
     hooks:
       - id: pytest-backend
         name: PyTest Backend
-        entry: bash -c 'cd backend && python -m pytest tests/unit/ -v --tb=short'
+        entry: bash -c 'python -m pytest tests/unit -v --tb=short'
         language: system
         pass_filenames: false
         files: ^backend/.*\.py$
