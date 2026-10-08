@@ -5,8 +5,8 @@ import router from "@/router";
 
 // 创建axios实例
 const request: AxiosInstance = axios.create({
-  // 生产构建中 import.meta.env.DEV 为 false，回退为空（同源相对 /api）；仅开发回退到 localhost:8000
-  baseURL: import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:8000' : ''),
+  // 生产构建中 import.meta.env.DEV 为 false，回退为空（同源相对 /api）；仅开发回退到 127.0.0.1:8021（本副本开发端口）
+  baseURL: import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8021' : ''),
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json'

@@ -17,7 +17,8 @@
     "lint:eslint": "eslint . --fix --cache",
     "format": "prettier --write --experimental-cli src/",
     "format:check": "prettier --check --experimental-cli src/",
-    "test:unit": "vitest run src"
+    "test:unit": "vitest run src",
+    "test:integration": "vitest run tests/integration"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",

@@ -18,9 +18,11 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',  // FastAPI后端地址
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, '')
+        // 本副本 Windows 开发后端为 8021；Docker 容器内部仍是 8000（勿同步修改）。
+        target: 'http://127.0.0.1:8021',
+        changeOrigin: true
+        // 后端路由前缀本身就是 /api/v1，无需 rewrite；
+        // 原 rewrite 会把 /api/v1 剥成 /v1 导致 404，故删除。
       }
     }
   },

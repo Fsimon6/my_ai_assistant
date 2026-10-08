@@ -151,7 +151,7 @@ cd frontend
 npm run dev
 ```
 
-Vite 已配置代理：`/api` → `http://127.0.0.1:8000`（见 `frontend/vite.config.ts`）。
+Vite 已配置代理：`/api` → `http://127.0.0.1:8021`（见 `frontend/vite.config.ts`；开发期前端使用绝对地址 `VITE_API_BASE_URL`，代理为备用路径）。
 
 ### 6. 访问
 
@@ -161,6 +161,24 @@ Vite 已配置代理：`/api` → `http://127.0.0.1:8000`（见 `frontend/vite.c
 | 后端 API | http://localhost:8000 |
 | Swagger 文档 | http://localhost:8000/docs |
 | 健康检查 | http://localhost:8000/health |
+
+### 7. 当前 Windows 副本（本仓库）：开发端口 8021 / 5181
+
+上表为**默认端口**；本仓库在 Windows 上的日常开发与浏览器验收统一使用下面的端口，避免与另一个独立项目（8000 / 5173）互相串台：
+
+```bash
+# 后端：在仓库根目录执行（使用根目录 .venv；需要根目录存在 .env）
+.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8021 --reload
+
+# 前端：在 frontend/ 目录执行
+npm run dev -- --host 127.0.0.1 --port 5181 --strictPort
+```
+
+- `8021` / `5181` 是**当前 Windows 副本**的开发端口；`8000` / `5173` 属另一个独立项目，请勿混用。
+- **Docker 容器内部端口保持 `8000` 不变**（容器内 backend 服务与 healthcheck 均按 8000 设计），不要把容器端口改成 8021。
+- Vite 的**默认**端口仍是 `5173`（`frontend/vite.config.ts`），上面的 `--port 5181` 是命令行覆盖。
+- 根 `.env` **不需要**添加 `PORT`：后端监听端口完全由 uvicorn 的 `--port` 决定。
+- 启动一律在**当前项目根目录**、使用根目录的 `.venv`（`backend.main:app` 需以仓库根为工作目录）。
 
 ---
 
@@ -190,6 +208,8 @@ python -m pytest tests/unit/test_excel_nl_language.py -q     # 单文件
 cd frontend
 npm run lint          # oxlint + eslint
 npm run type-check    # vue-tsc
+npm run test:unit     # 单元测试（vitest run src，不需要后端）
+npm run test:integration  # 集成测试（真实 HTTP，需先启动后端；默认 http://127.0.0.1:8021，可用 E2E_API_BASE 覆盖）
 npm run build         # 生产构建
 ```
 

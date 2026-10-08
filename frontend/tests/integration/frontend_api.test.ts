@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest'
 
-const API_BASE = 'http://localhost:8000' // 应与后端实际地址一致
+// 集成测试：真实 HTTP 调用，需先启动后端（本副本默认 8021）。
+// 覆盖方式：E2E_API_BASE=http://127.0.0.1:8021 npm run test:integration
+const API_BASE = process.env.E2E_API_BASE ?? 'http://127.0.0.1:8021'
 
 describe('后端API集成测试', () => {
   it('健康检查接口', async () => {
