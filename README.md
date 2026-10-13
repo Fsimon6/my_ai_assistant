@@ -209,7 +209,10 @@ cd frontend
 npm run lint          # oxlint + eslint
 npm run type-check    # vue-tsc
 npm run test:unit     # 单元测试（vitest run src，不需要后端）
-npm run test:integration  # 集成测试（真实 HTTP，需先启动后端；默认 http://127.0.0.1:8021，可用 E2E_API_BASE 覆盖）
+npm run test:integration          # 集成测试（真实 HTTP）：自动编排隔离后端（临时 SQLite + 临时 Chroma），
+                                  # 默认只验证认证边界与受保护只读接口，不消耗真实 LLM 配额
+npm run test:integration:external # 低层调试：对接已运行的后端，需自备 E2E_API_BASE 与 E2E_AUTH_TOKEN
+E2E_ALLOW_LLM=1 npm run test:integration   # 可选：真实 RAG 查询（消耗 1 次 Embedding + 1 次 Chat）
 npm run build         # 生产构建
 ```
 
