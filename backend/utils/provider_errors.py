@@ -63,6 +63,14 @@ _RULES = (
     )),
 )
 
+#: 本地存储/向量库类异常的特征词（Chroma / SQLite / 文件系统）。
+#: 这些词只会出现在本地持久化错误里、不会出现在外部 provider 报文中，因此用它做守卫：
+#: 既能把本地存储错误归到 INTERNAL_ERROR(500)，又能保证 provider 分类行为完全不变。
+_LOCAL_STORAGE_KEYS = (
+    'chroma', 'sqlite', 'disk i/o', 'database is locked', 'readonly database',
+    'unable to open database file', 'no space left', 'disk full',
+)
+
 #: 密钥/令牌样式的片段（日志与细节里一律脱敏）
 _SECRET_RE = re.compile(r'(sk-[A-Za-z0-9._\-]{6,}|Bearer\s+[A-Za-z0-9._\-]{6,})', re.IGNORECASE)
 #: 原始细节保留长度上限
@@ -213,6 +221,13 @@ def classify_upload_error(exc: Any) -> ClassifiedError:
         return classify_parse_error(exc)
 
     text = sanitize_secret_text(exc).lower()
+    if _contains(text, _LOCAL_STORAGE_KEYS):
+        # 本地向量库/存储错误（Chroma / SQLite / 文件系统）必须落 INTERNAL_ERROR(500)，
+        # 不能被下面的 provider 关键字（含 'chroma'）误判成外部服务错误(502)。
+        return ClassifiedError(
+            INTERNAL_ERROR,
+            '本地向量库或存储写入失败，本次上传未完成，请检查磁盘空间与数据目录权限后重试。',
+            500, 'internal', sanitize_secret_text(exc))
     if 'embedding' in text or 'embed' in text or '向量' in text or 'chroma' in text:
         return classify_provider_error(exc)
     if any(k in text for k in ('解析', 'parse', '无法读取', '不是有效的', 'unsupported')):
