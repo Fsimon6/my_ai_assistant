@@ -38,10 +38,11 @@ class RagService:
     def __init__(self):
         self.llm = get_llm()
         self.vector_store = get_vector_store_manager()
-        self.document_processor = DocumentProcessor(
-            chunk_size=800,
-            chunk_overlap=150
-        )
+        # 分块参数唯一来源：document_service.DocumentProcessor 的默认值
+        # （chunk_size=1000 / chunk_overlap=200）；process_and_store_document 以无参方式构造它
+        # （见本文件下方 processor = DocumentProcessor()）。
+        # 此处原有的 800/150 实例从未被任何代码读取（"配置定义 A / 实际调用 B"），
+        # 已在 6A-8 P3 删除以消除歧义；请勿在此新增第二套分块配置。
         self.cache = get_cache_service()
         logger.info(' RAG服务初始化（带缓存）')
 
