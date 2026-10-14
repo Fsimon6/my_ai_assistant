@@ -273,6 +273,13 @@ def test_api_success_shape_unchanged(monkeypatch, tmp_path):
 def test_unsupported_file_type_still_400(monkeypatch, tmp_path):
     from backend.api.v1 import rag as rag_api
 
+    # 隔离：本用例只验证"非法扩展名 -> 400"，与向量库无关。
+    # 但端点会在扩展名校验之前就调用 get_rag_service()（backend/api/v1/rag.py:58），
+    # 若不替换，就会惰性构造真实 RagService -> VectorStoreManager，
+    # 从而打开真实 ./data/chroma_db（backend/services/vector_service.py:84）。
+    # 与同文件 :227 的既有隔离方式一致。
+    monkeypatch.setattr(rag_api, 'get_rag_service', lambda: SimpleNamespace())
+
     class FakeUpload:
         filename = 'x.exe'
 
