@@ -139,6 +139,28 @@ ALLOWED_MIME = {
 }
 
 
+#: 上传落盘的块大小（1MB）：流式读取，避免整份文件常驻内存（6A-8 P4）。
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+async def _read_upload_chunk(upload_file, size: int) -> bytes:
+    """按块读取上传内容；保持改动前的分支顺序与 await 语义。
+
+    - ``UploadFile``（异步 read）：``await upload_file.read(size)``；
+    - 其它带 ``.file.read`` 的对象：同步 ``read(size)``；
+    - 两者都没有：``ValueError``（与改动前一致）。
+
+    读到 EOF 时返回空 ``bytes``，由调用方结束循环。
+    """
+    if hasattr(upload_file, 'read'):
+        chunk = await upload_file.read(size)
+        return chunk if chunk is not None else b''
+    if hasattr(upload_file, 'file') and hasattr(upload_file.file, 'read'):
+        chunk = upload_file.file.read(size)
+        return chunk if chunk is not None else b''
+    raise ValueError('upload_file 对象不支持读取')
+
+
 async def save_uploaded_file(upload_file) -> str:
     """保存上传的文件到临时目录（含扩展名/MIME/大小校验）"""
     original_filename = getattr(upload_file, 'filename', 'uploaded_file')
@@ -170,24 +192,32 @@ async def save_uploaded_file(upload_file) -> str:
         filename = f'{uuid.uuid4().hex} {file_ext}'
         file_path = upload_dir / filename
 
-        # 读取内容
-        if hasattr(upload_file, 'read'):
-            content = await upload_file.read()
-        elif hasattr(upload_file, 'file') and hasattr(upload_file.file, 'read'):
-            content = upload_file.file.read()
-        else:
-            raise ValueError('upload_file 对象不支持读取')
-
-        # 3) 大小限制
-        if len(content) > MAX_UPLOAD_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f'文件过大，最大允许 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB',
-            )
-
-        # 保存文件
-        with open(file_path, 'wb') as f:
-            f.write(content)
+        # 读取内容（流式：逐块读入并直接落盘，避免整份文件常驻内存）
+        # 6A-8 P4：原实现用一次性 read（不带 size）把整个文件读成 bytes——超限文件也要先
+        # 吃满内存才判 413；现改为边读边写边累计，超限立刻中止并删除半成品。
+        total_bytes = 0
+        try:
+            with open(file_path, 'wb') as f:
+                while True:
+                    chunk = await _read_upload_chunk(upload_file, UPLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    # 3) 大小限制（与原实现同一边界：> MAX_UPLOAD_BYTES 才算超限）
+                    if total_bytes > MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f'文件过大，最大允许 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB',
+                        )
+                    f.write(chunk)
+        except BaseException:
+            # 超限 / 写入失败 / IO 异常 / 任务取消：一律删除已创建的半成品临时文件
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+            except OSError as cleanup_err:
+                logger.debug(f'清理半成品上传文件失败：{file_path}, {cleanup_err}')
+            raise
         logger.info(f'文件被保存到：{file_path}')
         return str(file_path)
 
