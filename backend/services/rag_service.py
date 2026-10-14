@@ -81,6 +81,23 @@ class RagService:
             processor = DocumentProcessor()
             chunks = processor.process_file(file_path)
 
+            # 空内容保护（第二阶段回归发现）：
+            # 空文件 / 纯空白 / 无可提取文本的 PDF 等会解析出 0 个 chunk。此时若继续调用
+            # embedding，空向量列表会触发 embedding 数量校验异常，最终被分类成
+            # EMBEDDING_PROVIDER_ERROR(502)，对用户是**误导性错误**（看起来像外部服务故障）。
+            # 这里提前以 400 + 明确中文原因返回，且不写任何向量。
+            if not chunks:
+                logger.warning('文件中未解析出任何文本内容，已拒绝：%s', os.path.basename(file_path))
+                return {
+                    'success': False,
+                    'error': '未从文件中解析出任何文本内容',
+                    'error_code': 'DOCUMENT_PARSE_FAILED',
+                    'message': '文件内容为空或无法提取文本（例如空白文件、纯图片型 PDF）。'
+                               '该文件未被保存，请确认文件内容后重新上传。',
+                    'http_status': 400,
+                    'filename': os.path.basename(file_path),
+                }
+
             # 生成单文档级 id（覆盖本次上传的所有 chunk，用于“文档 → 向量”生命周期管理）
             document_id = uuid.uuid4().hex
 

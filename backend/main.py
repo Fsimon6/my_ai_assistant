@@ -360,15 +360,12 @@ async def speak_to_character_stream(
         }
     )
 
-@app.post("/api/v1/characters/{character_id}/speak")
-async def speak_to_character(request: SpeakRequest, character_id: str):
-    """普通对话接口（非流式）"""
-    return {
-        'success': True,
-        'response': f'这是角色{character_id}的回复：{request.message}',
-        'character_id': character_id,
-        'timestamp': datetime.now().isoformat()
-    }
+# 说明（R-1/R-2 修复）：此处原有一个**假实现**的非流式 /speak 端点
+# （固定返回 "这是角色{id}的回复：{msg}"）。由于 app 级路由先于 include_router 注册，
+# 它**遮蔽**了 backend/api/v1/characters.py 中真正带鉴权/归属校验的实现，
+# 使后者永远不可达。该假桩已删除，非流式 /speak 恢复为 characters 路由实现。
+# 注意：该端点当前仍为 legacy 规则型实现（非 LLM），且前端聊天固定走
+# /speak/stream（Chat.vue 中 useStream = true），不依赖此端点。
 
 # ======== 基础API路由 ========
 # 导入API路由（统一使用 backend 包结构，避免运行目录/扁平导入问题）

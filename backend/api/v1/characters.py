@@ -173,7 +173,7 @@ async def delete_character(
     )
 
 
-@router.post("/{chatacter_id}/speak", response_model=SpeakResponse)
+@router.post("/{character_id}/speak", response_model=SpeakResponse)
 async def speak_to_character(
         character_id: str,
         request: SpeakRequest,
@@ -181,7 +181,7 @@ async def speak_to_character(
         db = Depends(get_db)
 ):
     """与AI角色对话（需要登录，仅限本人）"""
-    result = character_service.speak(character_id, request.text, user_id=current_user.id)
+    result = character_service.speak(character_id, request.message, user_id=current_user.id)
 
     if not result['success']:
         raise HTTPException(status_code=400, detail=result.get('error', '对话失败'))

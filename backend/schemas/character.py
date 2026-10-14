@@ -89,9 +89,13 @@ class CharacterDetailResponse(CharacterResponse):
 
 
 class SpeakRequest(BaseModel):
-    """对话请求模式"""
-    text: str = Field(..., min_length=1, max_length=1000, description='用户消息')
-    character_id: str = Field(..., description='角色ID')
+    """非流式对话请求模式（R-1/R-2 修复）
+
+    与**唯一真实客户端** `frontend/src/api/character.ts` 的请求体 `{message}` 对齐。
+    原实现要求 body 内再传一次 `character_id`（而路径参数已提供），且字段名为 `text`，
+    与前端形态不符；此前被 main.py 的假桩遮蔽而未被发现，假桩删除后会直接 422。
+    """
+    message: str = Field(..., min_length=1, max_length=1000, description='用户消息')
 
 
 class SpeakResponse(BaseModel):
