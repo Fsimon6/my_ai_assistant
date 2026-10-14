@@ -615,7 +615,10 @@ const handleFileUploaded = async (fileData: any) => {
     const detail = error?.response?.data?.detail
     const rawMessage = typeof detail === 'string' ? detail : detail?.message
     const errorCode = typeof detail === 'object' && detail ? detail.error_code : ''
-    const text = rawMessage || (error?.response ? '文件上传失败' : '网络错误，请检查后端服务是否启动')
+    // 稳定性补丁：无 response 时不能一律说"后端未启动"——上传已单独放宽超时，
+    // 但极端大文件仍可能超时/连接中断，此时服务端可能仍在继续处理，故文案需覆盖超时语义。
+    const noResponseText = '上传请求超时或连接中断，服务端可能仍在处理中，请稍后刷新知识库确认'
+    const text = rawMessage || (error?.response ? '文件上传失败' : noResponseText)
 
     // 回写失败结果：上传列表不再显示"上传成功"
     fileData.done?.(false, errorCode ? `${text}（${errorCode}）` : text)

@@ -390,8 +390,12 @@ export const ragApi = {
     if (metadata) {
       formData.append('metadata', JSON.stringify(metadata))
     }
+    // 稳定性补丁：上传在服务端会顺序做多次 embedding（每批 <=20 条），大文件（TXT/MD/DOCX/PDF）
+    // 总耗时远超默认 30s；这里为该接口单独放宽超时（与 nlQueryExcel 的 180000 保持一致），
+    // 避免客户端先超时终止、而服务端仍在继续处理。仅此接口，不影响其它请求。
     const res = await api.post('/rag/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' }
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 180000
     })
     return res as unknown as RagUploadResult
   },
