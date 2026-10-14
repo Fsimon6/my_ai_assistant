@@ -516,7 +516,7 @@
       <!-- 文件上传区域 -->
       <div v-if="showFileUpload"
            class="file-upload-area">
-        <FileUploader @file-uploaded="handleFileUploaded" />
+        <FileUploader mode="attach" @file-uploaded="handleFileUploaded" />
       </div>
 
       <!-- 输入框 -->
@@ -1554,11 +1554,12 @@ const translateToEnglish = () => {
   inputMessage.value = `请将以下内容翻译成英文：${inputMessage.value}`
 }
 
-// 处理文件上传
+// 处理文件附件（P5-F1：attach 模式，不显示"上传成功"）
 const handleFileUploaded = (fileData: any) => {
   inputMessage.value += `[文件：${fileData.name}]\n${fileData.content}`
   showFileUpload.value = false
-  // 该路径只是把文件内容插入输入框（不走后端上传），因此直接回报成功
+  // 该路径只把文件内容插入输入框（不调用 /rag/upload，无解析 / embedding / Chroma 写入），
+  // 因此以 attach 语义回报成功：组件会提示"已添加到输入框"而非"上传成功"。
   fileData.done?.(true)
 }
 

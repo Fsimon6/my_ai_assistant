@@ -71,6 +71,10 @@ class RagService:
                 file_size=file_size,
             )
 
+        # 6A-8 P5-F2：临时文件清理收敛为 finally 兜底（成功路径本身不变）。
+        # except Exception 不覆盖 CancelledError（客户端断开 / --reload 重启 / shutdown），
+        # 原实现在这些情况下既不会清理临时文件、也不会清理半成品向量，故补 except BaseException + finally。
+        document_id = ''
         try:
             # 处理文档
             from backend.services.document_service import DocumentProcessor
@@ -124,7 +128,6 @@ class RagService:
         except Exception as e:
             # 失败清理：embedding/向量写入失败时已落盘的临时文件即为半成品，
             # 需删除避免孤儿文件；向量侧按 document_id 尽力清理。
-            document_id = locals().get('document_id') or ''
             if document_id:
                 await self._cleanup_failed_upload(document_id, file_path, user_id)
             else:
@@ -143,6 +146,23 @@ class RagService:
                 'http_status': classified.http_status,
                 'filename': os.path.basename(file_path)
             }
+        except BaseException:
+            # 取消类异常（CancelledError / KeyboardInterrupt / SystemExit）不属于 Exception，
+            # 必须显式清理后再**原样抛出**——绝不能被吞掉、也绝不伪装成正常返回。
+            try:
+                if document_id:
+                    await self._cleanup_failed_upload(document_id, file_path, user_id)
+            except Exception as cleanup_err:  # noqa: BLE001 - 清理失败不得覆盖原始取消异常
+                logger.warning(f'取消路径清理失败（忽略，finally 仍兜底删除临时文件）：{cleanup_err}')
+            raise
+        finally:
+            # 兜底：无论成功 / 失败 / 取消，都不允许临时文件残留。
+            # 此处只做同步文件操作，避免在取消流程中再引入新的挂起点。
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except OSError as fe:
+                logger.debug(f'兜底清理临时文件失败：{file_path}, 错误：{fe}')
 
     async def _process_excel_document(
         self,
@@ -226,6 +246,20 @@ class RagService:
                 'http_status': classified.http_status,
                 'filename': os.path.basename(file_path),
             }
+        except BaseException:
+            # 取消类异常不属于 Exception：清理后原样抛出（同 process_and_store_document 的说明）。
+            try:
+                await self._cleanup_failed_upload(document_id, file_path, user_id)
+            except Exception as cleanup_err:  # noqa: BLE001 - 清理失败不得覆盖原始取消异常
+                logger.warning(f'取消路径清理失败（忽略，finally 仍兜底删除临时文件）：{cleanup_err}')
+            raise
+        finally:
+            # 兜底：无论成功 / 失败 / 取消，都不允许临时文件残留。
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except OSError as fe:
+                logger.debug('兜底清理临时表格文件失败：%s, 错误：%s', file_path, fe)
 
     async def _cleanup_failed_upload(
         self,

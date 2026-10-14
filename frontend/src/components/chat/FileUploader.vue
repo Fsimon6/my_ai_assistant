@@ -15,7 +15,7 @@
           <UploadFilled/>
         </el-icon>
         <p class="drop-text">
-          拖放文件到此处，或<em>点击上传</em>
+          拖放文件到此处，或<em>{{ isAttachMode ? '点击添加' : '点击上传' }}</em>
         </p>
         <p class="drop-hint">
           支持 PDF、TXT、DOCX、MD、XLSX、XLS、CSV、TSV 文件，最大 10MB
@@ -69,7 +69,7 @@
             size="small"
             @click="uploadFile(index)"
           >
-            上传
+            {{ isAttachMode ? '添加' : '上传' }}
           </el-button>
 
           <el-button
@@ -111,7 +111,7 @@
         :disabled="!hasFiles || isUploading"
         @click="uploadAll"
       >
-        {{ isUploading ? '上传中...' : `上传文件 (${files.length})` }}
+        {{ uploadButtonText }}
       </el-button>
 
       <el-button
@@ -180,6 +180,14 @@ const isSpreadsheet = (ext: string) => SPREADSHEET_EXTS.includes(ext)
 // 文件大小限制（10MB）
 const MAX_FILE_SIZE = 10 * 1024 * 1024
 
+// 语义模式（P5-F1）：'upload' = 真正调用后端上传接口（知识库页）；
+// 'attach' = 仅作为对话附件插入输入框（Chat 页：不调用 /rag/upload，无解析 / embedding / Chroma 写入）。
+// 目的：Chat 页附件不再显示"上传成功"，避免用户误以为文档已进入知识库。
+const props = withDefaults(defineProps<{ mode?: 'upload' | 'attach' }>(), {
+  mode: 'upload'
+})
+const isAttachMode = computed(() => props.mode === 'attach')
+
 // 响应式数据
 const files = ref<UploadFile[]>([])
 const isDragOver = ref(false)
@@ -193,6 +201,11 @@ const acceptTypes = computed(() => {
 })
 const hasFiles = computed(() => files.value.length > 0)
 const pendingFiles = computed(() => files.value.filter(f => f.status === 'pending'))
+// 主按钮文案（按语义模式区分"上传文件"与"添加附件"）
+const uploadButtonText = computed(() => {
+  if (isUploading.value) return isAttachMode.value ? '处理中...' : '上传中...'
+  return isAttachMode.value ? `添加附件 (${files.value.length})` : `上传文件 (${files.value.length})`
+})
 
 // 文件图标映射
 const fileIcons = {
@@ -309,10 +322,10 @@ const formatFileSize = (bytes: number) => {
 // 获取文本状态
 const getStatusText = (status: UploadFile['status']) => {
   const texts = {
-    pending: '等待上传',
-    uploading: '上传中',
-    success: '上传成功',
-    error: '上传失败'
+    pending: isAttachMode.value ? '等待添加' : '等待上传',
+    uploading: isAttachMode.value ? '处理中' : '上传中',
+    success: isAttachMode.value ? '已添加' : '上传成功',
+    error: isAttachMode.value ? '添加失败' : '上传失败'
   }
   return texts[status]
 }
@@ -409,15 +422,21 @@ const uploadFile = async (index: number) => {
         fileItem.status = 'success'
         fileItem.error = undefined
         fileItem.content = content
-        ElMessage.success(`文件 "${fileItem.name}" 上传成功`)
+        // P5-F1：attach 模式（Chat 页附件）绝不能提示"上传成功"——
+        // 它没有 /rag/upload、没有解析、没有 embedding、没有 Chroma 写入。
+        ElMessage.success(
+          isAttachMode.value
+            ? `文件 "${fileItem.name}" 已添加到输入框`
+            : `文件 "${fileItem.name}" 上传成功`
+        )
       } else {
         fileItem.status = 'error'
-        fileItem.error = message || '上传失败'
+        fileItem.error = message || (isAttachMode.value ? '添加失败' : '上传失败')
         ElMessage({
           type: 'error',
           duration: 8000,
           showClose: true,
-          message: `文件 "${fileItem.name}" 上传失败：${message || '未知原因'}`
+          message: `文件 "${fileItem.name}" ${isAttachMode.value ? '添加失败' : '上传失败'}：${message || '未知原因'}`
         })
       }
     }
@@ -467,9 +486,9 @@ const uploadAll = async () => {
     await new Promise(resolve => setTimeout(resolve, 300))
     const failed = files.value.filter(f => f.status === 'error')
     if (failed.length === 0) {
-      ElMessage.success('所有文件上传成功')
+      ElMessage.success(isAttachMode.value ? '所有文件已添加到输入框' : '所有文件上传成功')
     } else if (failed.length < files.value.length) {
-      ElMessage.warning(`${failed.length} 个文件上传失败，请查看列表中的失败原因`)
+      ElMessage.warning(`${failed.length} 个文件${isAttachMode.value ? '添加' : '上传'}失败，请查看列表中的失败原因`)
     }
   } catch (error) {
     console.error('批量上传失败：', error)
