@@ -7,6 +7,14 @@ from pathlib import Path
 # 项目根目录
 BASE_DIR = Path(__file__).parent.parent.parent
 
+# F1 统一配置：本类剩余的"仍被运行时读取"的字段改为委托给 pydantic settings
+# （`.env` 才会真正生效）。容器导入失败时（例如缺少 JWT_SECRET 的极端场景）
+# 回退到本文件原有的 os.getenv / 硬编码默认值，保证不改变既有默认行为。
+try:  # pragma: no cover - 正常情况下一定可用
+    from backend.config.settings import settings as _unified_settings
+except Exception:  # noqa: BLE001
+    _unified_settings = None
+
 
 class DevelopmentConfig:
     """开发环境配置类"""
@@ -20,12 +28,21 @@ class DevelopmentConfig:
     PORT: int = int(os.getenv('PORT', '8080'))
 
     # 基础配置
-    DEBUG = True
+    # F1：DEBUG 委托给统一配置（`.env` 的 DEBUG 生效）；统一配置不可用时保持原默认 True。
+    # 该字段目前只被 database/base.py 用于 echo（SQL 打印），不影响其它行为。
+    DEBUG = bool(getattr(_unified_settings, 'DEBUG', True)) if _unified_settings else True
     TESTING = False
     SECRET_KEY = os.environ.get('JWT_SECRET')
 
     # 数据库配置
-    DATABASE_URL = os.environ.get('DATABASE_URL', f'sqlite:///{BASE_DIR}/my_ai_assistant.db')
+    # F1：优先级 = 进程环境变量 > 统一配置（.env） > 原有绝对路径默认值。
+    # 三者指向同一文件：pydantic 默认值 "./my_ai_assistant.db" 会被 database/base.py
+    # 按**项目根**解析为 <root>/my_ai_assistant.db，与 BASE_DIR 版本等价。
+    DATABASE_URL = (
+        os.environ.get('DATABASE_URL')
+        or (getattr(_unified_settings, 'DATABASE_URL', None) if _unified_settings else None)
+        or f'sqlite:///{BASE_DIR}/my_ai_assistant.db'
+    )
 
     # Redis配置（用于缓存和会话）
     REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')

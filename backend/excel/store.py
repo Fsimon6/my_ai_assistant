@@ -26,7 +26,28 @@ from backend.excel.representation import WorkbookRepresentation
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-EXCEL_DATA_ROOT = PROJECT_ROOT / 'data' / 'excel'
+
+
+def _resolve_excel_root() -> Path:
+    """Excel 原件/解析产物根目录（F2 统一配置）。
+
+    优先取 `settings.EXCEL_DATA_ROOT`（`.env` 可覆盖 → 测试/特殊部署可隔离）；
+    留空则保持原行为 `<项目根>/data/excel`。
+
+    说明：仍然导出为**模块级全局名** `EXCEL_DATA_ROOT`，因为现有测试通过
+    `monkeypatch.setattr(excel_store, 'EXCEL_DATA_ROOT', ...)` 做隔离，必须保持兼容。
+    """
+    try:
+        from backend.config.settings import settings
+        configured = (getattr(settings, 'EXCEL_DATA_ROOT', '') or '').strip()
+        if configured:
+            return Path(configured)
+    except Exception:  # noqa: BLE001 - 配置不可用时回退默认路径
+        pass
+    return PROJECT_ROOT / 'data' / 'excel'
+
+
+EXCEL_DATA_ROOT = _resolve_excel_root()
 
 
 def _doc_dir(document_id: str) -> Path:

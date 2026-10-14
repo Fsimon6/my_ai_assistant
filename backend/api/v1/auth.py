@@ -17,6 +17,7 @@ from backend.utils.rate_limit import (
     is_blocked,
 )
 from backend.models.user import User
+from backend.config.settings import settings
 
 router = APIRouter(prefix="/auth", tags=["认证"])
 
@@ -28,7 +29,12 @@ def _client_key(request: Request, username: str) -> str:
 
 @router.post("/register", response_model=UserResponse)
 async def register(user_data: UserCreate, db: Session = Depends(get_db)):
-    """用户注册"""
+    """用户注册（P-4：可由 ALLOW_REGISTRATION=false 关闭）"""
+    if not settings.ALLOW_REGISTRATION:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='当前已关闭自助注册，请联系管理员开通账号',
+        )
     try:
         user = auth_service.create_user(db, user_data)
         return api_response.success(

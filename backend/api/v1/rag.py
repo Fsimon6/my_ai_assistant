@@ -1034,7 +1034,7 @@ async def excel_nl_query(
                     model=character.model,
                     embedding_model=settings.EMBEDDING_MODEL,
                     temperature=0.0,
-                    max_tokens=int(os.getenv('LLM_MAX_TOKENS', '2000')),
+                    max_tokens=settings.LLM_MAX_TOKENS,
                 ))
                 effective_model = character.model
         if llm is None:

@@ -5,6 +5,8 @@ from fastapi.exceptions import RequestValidationError
 import logging
 import traceback
 
+from backend.config.settings import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,8 +82,8 @@ async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f'异常信息：{str(exc)}')
     logger.error(f'请求客户端：{request.client}')
 
-    import os
-    is_debug = os.getenv('DEBUG', 'False').lower() == 'true'
+    # F1：统一从配置入口读取（原先用 os.getenv 读 → 写在 .env 里的 DEBUG 不生效）
+    is_debug = bool(settings.DEBUG)
 
     if isinstance(exc, AppException):
         status_code = exc.status_code

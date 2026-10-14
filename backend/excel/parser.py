@@ -42,6 +42,69 @@ SUPPORTED_EXTENSIONS = {'.xlsx', '.xls', '.csv', '.tsv'}
 # 超过该绝对值的整数一律字符串化（订单号 / SKU / 时间戳等业务主键）
 LONG_INT_THRESHOLD = 10 ** 15
 
+
+# ---------------------------------------------------------------------------
+# 大表保护（P-8）
+# ---------------------------------------------------------------------------
+# 背景：解析器此前没有任何行数/单元格数上限，超大表格会把进程内存打满（OOM）而不是
+# 给出可理解的失败。这里加**明确的硬上限**：
+#   * 选择"明确报错"而不是"静默截断"——截断会让用户以为拿到的是完整数据，业务上更危险；
+#   * 默认值可用 `.env` 覆盖（见 backend/config/settings.py 的 EXCEL_MAX_* 字段），
+#     大内存机器可按需放宽，无需改代码；
+#   * 数值取"常规业务可用且内存安全"的档位（30000 行 × 10 列实测约 10s/百 MB 量级）。
+_EXCEL_LIMIT_DEFAULTS = {
+    'rows': 200_000,        # 单 Sheet 最大数据行
+    'sheet_cells': 2_000_000,  # 单 Sheet 最大单元格数（行 × 列）
+    'total_cells': 5_000_000,  # 整簿最大单元格数（所有 Sheet 合计）
+}
+
+
+def _excel_limits() -> Dict[str, int]:
+    """读取上限配置；settings 不可用时回退到内置默认值（保证解析器可独立导入）。"""
+    try:
+        from backend.config.settings import settings
+        return {
+            'rows': int(getattr(settings, 'EXCEL_MAX_SHEET_ROWS',
+                                _EXCEL_LIMIT_DEFAULTS['rows'])),
+            'sheet_cells': int(getattr(settings, 'EXCEL_MAX_SHEET_CELLS',
+                                       _EXCEL_LIMIT_DEFAULTS['sheet_cells'])),
+            'total_cells': int(getattr(settings, 'EXCEL_MAX_TOTAL_CELLS',
+                                       _EXCEL_LIMIT_DEFAULTS['total_cells'])),
+        }
+    except Exception:  # noqa: BLE001 - 配置缺失不应导致解析器不可用
+        return dict(_EXCEL_LIMIT_DEFAULTS)
+
+
+class ExcelSizeLimitError(Exception):
+    """表格超出解析上限：明确拒绝，不做静默截断。"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+def _guard_sheet_size(sheet_label: str, rows: int, cols: int, total_cells: int) -> int:
+    """校验单个 Sheet 的规模，返回新的"整簿累计单元格数"。
+
+    rows/cols 用文件**声明**的尺寸（解析前即可获知），因此能在展开数据之前就拒绝超大表。
+    """
+    limits = _excel_limits()
+    if rows > limits['rows']:
+        raise ExcelSizeLimitError(
+            '表格过大：Sheet「%s」有 %d 行，超过单表上限 %d 行。'
+            '请拆分文件或改小数据范围后重试。' % (sheet_label, rows, limits['rows']))
+    cells = max(rows, 0) * max(cols, 0)
+    if cells > limits['sheet_cells']:
+        raise ExcelSizeLimitError(
+            '表格过大：Sheet「%s」共 %d 个单元格（%d 行 × %d 列），超过单表上限 %d 个。'
+            '请拆分文件后重试。' % (sheet_label, cells, rows, cols, limits['sheet_cells']))
+    total = total_cells + cells
+    if total > limits['total_cells']:
+        raise ExcelSizeLimitError(
+            '表格过大：整个工作簿累计 %d 个单元格，超过上限 %d 个。'
+            '请拆分文件后重试。' % (total, limits['total_cells']))
+    return total
+
 # 单元格类型
 K_EMPTY = 'empty'
 K_STRING = 'string'
@@ -223,6 +286,12 @@ class ExcelParser:
             raise RuntimeError('缺少 openpyxl 依赖，无法解析 xlsx：pip install openpyxl') from e
 
         wb_formula = load_workbook(filename=str(path), data_only=False, read_only=False)
+        # P-8 大表保护：在第二次（data_only）全量加载之前先按声明尺寸校验——
+        # 超大工作簿被加载两遍会直接打满内存，必须提前拒绝。
+        _total_cells = 0
+        for _ws in wb_formula.worksheets:
+            _total_cells = _guard_sheet_size(
+                _ws.title, int(_ws.max_row or 0), int(_ws.max_column or 0), _total_cells)
         wb_value = load_workbook(filename=str(path), data_only=True, read_only=False)
         grids: List[Dict[str, Any]] = []
 
@@ -280,6 +349,12 @@ class ExcelParser:
         book = xlrd.open_workbook(str(path))
         grids: List[Dict[str, Any]] = []
         warnings.append('.xls 由 xlrd 解析：不提供公式文本（仅保留计算后的值）。')
+
+        # P-8 大表保护：展开数据之前先按声明尺寸校验
+        _total_cells = 0
+        for _sh in book.sheets():
+            _total_cells = _guard_sheet_size(
+                _sh.name, int(_sh.nrows or 0), int(_sh.ncols or 0), _total_cells)
 
         for sh in book.sheets():
             merged_ranges: List[str] = []
@@ -346,6 +421,9 @@ class ExcelParser:
         reader = csv.reader(io.StringIO(content), delimiter=delimiter)
         values: List[List[Any]] = []
         kinds: List[List[str]] = []
+        # P-8 大表保护：CSV 无法预知尺寸，边读边计数，超限立即中止（内存即随之封顶）
+        _limits = _excel_limits()
+        _total_cells = 0
         for row in reader:
             row_vals: List[Any] = []
             row_kinds: List[str] = []
@@ -355,6 +433,15 @@ class ExcelParser:
                 row_kinds.append(kind)
             values.append(row_vals)
             kinds.append(row_kinds)
+            _total_cells += len(row_vals)
+            if len(values) > _limits['rows']:
+                raise ExcelSizeLimitError(
+                    '表格过大：CSV/TSV 超过单表上限 %d 行，请拆分文件后重试。'
+                    % _limits['rows'])
+            if _total_cells > _limits['sheet_cells']:
+                raise ExcelSizeLimitError(
+                    '表格过大：CSV/TSV 累计 %d 个单元格，超过单表上限 %d 个，请拆分文件后重试。'
+                    % (_total_cells, _limits['sheet_cells']))
 
         sheet_name = 'CSV' if ext == '.csv' else 'TSV'
         return [{

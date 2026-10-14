@@ -20,6 +20,24 @@ class Settings(BaseSettings):
     # 注：原代码引用 settings.ACCESS_TOKEN_EXPIRE_MINUTES，此处补齐以免启动即 AttributeError
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
 
+    # 注册控制（P-4）：false 时关闭自助注册（register 返回 403）。
+    # 默认 true 保持既有行为；面向公司/内网部署请按 .env.example 说明改为 false。
+    ALLOW_REGISTRATION: bool = True
+
+    # 表格解析上限（P-8 大表保护）：超限直接明确报错（413 FILE_TOO_LARGE），不做静默截断。
+    # 大内存机器可放宽；改 .env 后需重启后端生效。
+    EXCEL_MAX_SHEET_ROWS: int = 200_000
+    EXCEL_MAX_SHEET_CELLS: int = 2_000_000
+    EXCEL_MAX_TOTAL_CELLS: int = 5_000_000
+
+    # 运行时数据目录（F2 统一配置，供测试/特殊部署隔离；**留空即保持原有默认路径**）
+    #   UPLOAD_TEMP_DIR 空 -> <系统临时目录>/ai_assistant_uploads（原行为）
+    #                     非空 -> 直接作为上传临时文件目录
+    #   EXCEL_DATA_ROOT 空 -> <项目根>/data/excel（原行为）
+    #                     非空 -> 直接作为 Excel 原件/解析产物的根目录
+    UPLOAD_TEMP_DIR: str = ""
+    EXCEL_DATA_ROOT: str = ""
+
     # 数据库
     DATABASE_URL: str = "sqlite:///./my_ai_assistant.db"
 
@@ -38,6 +56,18 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str | None = None
     LLM_MODEL: str = "gpt-3.5-turbo"
 
+    # LLM 生成参数（F1）：原先业务代码用 os.getenv 读取 → 写在 .env 里**不生效**；
+    # 现统一到配置入口。默认值与原 os.getenv 兜底值一致（0.7 / 2000）。
+    LLM_TEMPERATURE: float = 0.7
+    LLM_MAX_TOKENS: int = 2000
+
+    # API Key 哈希盐（F1）：原 security.hash_api_key 用 os.getenv 读取（.env 不生效）
+    API_KEY_SALT: str = "ai_assistant_salt"
+
+    # 管理员初始化（F1）：原 init_db.py 用 os.getenv 读取（.env 不生效）
+    INIT_ADMIN_PASSWORD: str | None = None
+    INIT_ADMIN_EMAIL: str = "admin@example.com"
+
     # 嵌入模型（EMBEDDING_MODEL 仅用于 Embedding，与 LLM_MODEL（Chat）解耦）
     EMBEDDING_PROVIDER: str = "local"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
@@ -55,8 +85,15 @@ class Settings(BaseSettings):
         return v
 
     # 日志
+    # P-3：默认开启文件日志（可运维/可回溯）。同时写控制台与文件（轮转）。
+    # 说明：
+    #   * 默认路径为**项目根**下的 logs/app.log（绝对路径，与 CWD 无关）；
+    #   * 置空（.env 中 `LOG_FILE=`）即关闭文件日志，仅保留控制台输出；
+    #   * 轮转上限 5MB × 5 个历史文件，避免长期运行无限增长。
     LOG_LEVEL: str = "INFO"
-    LOG_FILE: str | None = None
+    LOG_FILE: str = str(_PROJECT_ROOT / "logs" / "app.log")
+    LOG_MAX_BYTES: int = 5 * 1024 * 1024
+    LOG_BACKUP_COUNT: int = 5
 
     model_config = SettingsConfigDict(
         env_file=str(_PROJECT_ROOT / '.env'),

@@ -907,10 +907,13 @@ const sendRAGMessage = async (message: string) => {
   isLoading.value = true
   scrollToBottom()
 
-  // 构建多轮历史（不含当前用户消息与占位），注入 query-with-history 维持会话连贯
+  // 构建多轮历史（不含当前用户消息与占位），注入 query-with-history 维持会话连贯。
+  // P-2 能力边界：表格查询（工具产物）轮次**不进入**知识库问答的上下文，
+  // 与后端 main.py 排除 SOURCE_EXCEL/SOURCE_RAG 的规则对称。
   const history = messages.value
     .slice(0, userMsgIndex)
-    .filter((m: any) => (m.role === 'user' || m.role === 'assistant') && m.content && !m.isStreaming)
+    .filter((m: any) => (m.role === 'user' || m.role === 'assistant')
+      && m.content && !m.isStreaming && !m.isExcelQuery)
     .map((m: any) => ({ role: m.role, content: m.content }))
 
   try {

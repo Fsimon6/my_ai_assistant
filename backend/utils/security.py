@@ -143,7 +143,7 @@ class SecretManager:
 
     def hash_api_key(self, api_key: str) -> str:
         """哈希API密钥（用于存储验证）"""
-        salt = os.getenv('API_KEY_SALT', 'ai_assistant_salt')
+        salt = settings.API_KEY_SALT
         return hashlib.sha256(f'{api_key}{salt}'.encode()).hexdigest()
 
     def validate_api_key(self, api_key: str, hashed_key: str) -> bool:

@@ -298,8 +298,13 @@ _vector_store_manager = None
 
 
 def get_vector_store_manager() -> VectorStoreManager:
-    """获取向量存储管理器单例"""
+    """获取向量存储管理器单例。
+
+    F1/F2 统一配置：目录取自 `settings.VECTOR_DB_PATH`（`.env` 生效），
+    其默认值 "./data/chroma_db" 与原硬编码默认值一致 → 既有默认行为不变。
+    """
     global _vector_store_manager
     if _vector_store_manager is None:
-        _vector_store_manager = VectorStoreManager()
+        _vector_store_manager = VectorStoreManager(
+            persist_directory=settings.VECTOR_DB_PATH or './data/chroma_db')
     return _vector_store_manager

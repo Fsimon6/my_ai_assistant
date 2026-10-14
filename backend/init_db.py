@@ -5,19 +5,22 @@
 import sys
 import os
 import secrets
+from typing import Optional
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backend.config.settings import settings
 from backend.database.base import init_db, SessionLocal
 from backend.models.user import User
 from backend.utils.security import get_password_hash
 
 
-def _initial_password(env_name: str) -> tuple:
-    """取得初始口令：优先读环境变量，未配置则**随机生成**（避免硬编码弱口令入库）。
+def _initial_password(configured: Optional[str]) -> tuple:
+    """取得初始口令：优先用配置值（F1：统一从 settings 读取 → `.env` 生效），
+    未配置则**随机生成**（避免硬编码弱口令入库）。
 
-    返回 ``(password, from_env)``；随机生成的口令只打印一次，请立即记录并修改。
+    返回 ``(password, from_config)``；随机生成的口令只打印一次，请立即记录并修改。
     """
-    password = os.getenv(env_name)
+    password = (configured or '').strip()
     if password:
         return password, True
     return secrets.token_urlsafe(12), False
@@ -25,15 +28,15 @@ def _initial_password(env_name: str) -> tuple:
 
 def init_admin_user():
     """初始化管理员用户"""
-    is_production = os.getenv('ENVIRONMENT', 'development').lower() == 'production'
+    is_production = (settings.ENVIRONMENT or 'development').lower() == 'production'
     db = SessionLocal()
     try:
         # 检查是否已有管理员
         admin = db.query(User).filter(User.username == "admin").first()
         if not admin:
             # 创建管理员用户（口令来自 INIT_ADMIN_PASSWORD，未设置则随机生成）
-            admin_password, admin_from_env = _initial_password('INIT_ADMIN_PASSWORD')
-            admin_email = os.getenv('INIT_ADMIN_EMAIL', 'admin@example.com')
+            admin_password, admin_from_env = _initial_password(settings.INIT_ADMIN_PASSWORD)
+            admin_email = settings.INIT_ADMIN_EMAIL
             admin = User(
                 username="admin",
                 email=admin_email,

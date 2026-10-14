@@ -381,6 +381,16 @@ export interface ExcelQueryResult {
   calc_filter?: { operator: string; value: number } | null
 }
 
+// P-10 超时分层：前端超时必须 **不早于** 后端完成与网关上限（Docker 下 nginx
+// `/api/v1/rag/*` = 300s），否则会出现"前端已报错、后端仍在继续跑"的假失败。
+// 分层依据（按最坏情况取档）：
+//   * 默认 30s：轻量元数据（axios 实例默认值）；
+//   * 60s：可能全量扫描结构化数据 / 向量元数据的读接口；
+//   * 120s：非流式问答（服务端会真实调用 embedding + LLM）；
+//   * 180s：上传与自然语言表格查询（多次 embedding / 1~2 次 LLM，见下方注释）。
+const TIMEOUT_DATA_MS = 60000
+const TIMEOUT_LLM_MS = 120000
+
 // RAG API
 export const ragApi = {
   // 上传文档
@@ -402,20 +412,22 @@ export const ragApi = {
 
   // 查询文档（可选 documentId 限定只在该文档内检索）
   queryDocument: async (query: string, stream: boolean = false, contextCount: number = 3, documentId?: string): Promise<RagQueryResult> => {
-    const res = await api.post('/rag/query', { query, stream, context_count: contextCount, document_id: documentId })
+    const res = await api.post('/rag/query', { query, stream, context_count: contextCount, document_id: documentId },
+      { timeout: TIMEOUT_LLM_MS })
     return res as unknown as RagQueryResult
   },
 
   // 获取单个文档全部分块内容（按 document_id，供预览；服务端 user_id 隔离）
   getDocument: async (documentId: string): Promise<{ success?: boolean; document_id?: string; chunks?: any[]; total?: number }> => {
-    const res = await api.get(`/rag/documents/${documentId}`)
+    const res = await api.get(`/rag/documents/${documentId}`, { timeout: TIMEOUT_DATA_MS })
     return res as unknown as { success?: boolean; document_id?: string; chunks?: any[]; total?: number }
   },
 
   // Excel 基础预览（Phase 1A）：直接读取服务端 Unified Representation，不重新解析原文件
   getExcelPreview: async (documentId: string, sheetIndex: number = 0, limit: number = 20): Promise<ExcelPreviewResult> => {
     const res = await api.get(`/rag/excel/${documentId}/preview`, {
-      params: { sheet_index: sheetIndex, limit }
+      params: { sheet_index: sheetIndex, limit },
+      timeout: TIMEOUT_DATA_MS
     })
     return res as unknown as ExcelPreviewResult
   },
@@ -433,13 +445,15 @@ export const ragApi = {
     filters?: ExcelFilter[]
     engine?: 'auto' | 'duckdb' | 'python'
   }): Promise<ExcelAggregateResult | ExcelGroupedAggregateResult> => {
-    const res = await api.post(`/rag/excel/${documentId}/aggregate`, payload)
+    const res = await api.post(`/rag/excel/${documentId}/aggregate`, payload,
+      { timeout: TIMEOUT_DATA_MS })
     return res as unknown as ExcelAggregateResult | ExcelGroupedAggregateResult
   },
 
   // Excel 结构化查询（Phase 1B）：服务端在 representation.json 上做精确筛选/分页，不经 LLM、不经 Chroma
   queryExcel: async (documentId: string, payload: ExcelQueryParams): Promise<ExcelQueryResult> => {
-    const res = await api.post(`/rag/excel/${documentId}/query`, payload)
+    const res = await api.post(`/rag/excel/${documentId}/query`, payload,
+      { timeout: TIMEOUT_DATA_MS })
     return res as unknown as ExcelQueryResult
   },
 
@@ -458,7 +472,8 @@ export const ragApi = {
 
   // 带历史查询
   queryWithHistory: async (query: string, history: any[], stream: boolean = false): Promise<RagQueryResult> => {
-    const res = await api.post('/rag/query-with-history', { query, history, stream })
+    const res = await api.post('/rag/query-with-history', { query, history, stream },
+      { timeout: TIMEOUT_LLM_MS })
     return res as unknown as RagQueryResult
   },
 
@@ -471,14 +486,15 @@ export const ragApi = {
   // 删除文档（按 document_id 精确删除，自动携带 JWT）
   deleteDocument: async (documentIds: string[]): Promise<any> => {
     const res = await api.delete('/rag/documents', {
-      data: { document_ids: documentIds }
+      data: { document_ids: documentIds },
+      timeout: TIMEOUT_DATA_MS
     })
     return res as unknown as any
   },
 
   // 获取当前用户的真实文档列表（按 user_id 隔离，聚合自向量库 metadata）
   getDocuments: async (): Promise<{ success?: boolean; documents?: any[]; total?: number }> => {
-    const res = await api.get('/rag/documents')
+    const res = await api.get('/rag/documents', { timeout: TIMEOUT_DATA_MS })
     return res as unknown as { success?: boolean; documents?: any[]; total?: number }
   }
 }

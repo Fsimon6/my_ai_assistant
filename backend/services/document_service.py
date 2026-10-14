@@ -7,6 +7,7 @@ import logging
 import uuid
 from pathlib import Path
 from backend.services.types import SearchResult
+from backend.config.settings import settings
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
@@ -184,10 +185,14 @@ async def save_uploaded_file(upload_file) -> str:
         )
 
     try:
-        # 创建临时目录
-        temp_dir = Path(tempfile.gettempdir())
-        upload_dir = temp_dir / 'ai_assistant_uploads'
-        upload_dir.mkdir(exist_ok=True)
+        # 上传临时目录（F2 统一配置）：
+        #   UPLOAD_TEMP_DIR 留空 -> 保持原行为：<系统临时目录>/ai_assistant_uploads
+        #   UPLOAD_TEMP_DIR 非空 -> 直接作为上传临时目录（测试/特殊部署可隔离，
+        #                          不再需要运行时 patch tempfile / 写真实临时目录）
+        _configured_upload_dir = (getattr(settings, 'UPLOAD_TEMP_DIR', '') or '').strip()
+        upload_dir = (Path(_configured_upload_dir) if _configured_upload_dir
+                      else Path(tempfile.gettempdir()) / 'ai_assistant_uploads')
+        upload_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f'{uuid.uuid4().hex} {file_ext}'
         file_path = upload_dir / filename

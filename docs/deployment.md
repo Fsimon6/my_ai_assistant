@@ -147,13 +147,19 @@ chmod +x scripts/deploy.sh
 ### 数据库备份
 
 ```bash
-# 自动备份脚本
+# 自动备份（跨平台：Windows / Linux / macOS 一致；纯标准库）
+python scripts/backup_db.py
+
+# 兼容入口（等价，参数透传）
 ./scripts/backup_db.sh
 
-# 手动备份
-cp backend/my_ai_assistant.db backups/       # 备份数据库
-cp -r data/chroma_db backups/                # 备份向量数据库
+# 恢复（先停止后端；--yes 才会写入；恢复前会自动留存 pre_restore 快照）
+python scripts/restore_db.py --from backups/ai_assistant_backup_YYYYmmdd_HHMMSS --yes
 ```
+
+备份集内容：`my_ai_assistant.db`（SQLite 在线一致性快照）+ `chroma_db.zip`（向量库）
++ `excel.zip`（`data/excel` 原件与解析产物）+ `manifest.json`（含 SHA256 校验值）。
+**备份不包含 `.env` 等密钥文件**，请单独安全保管。
 
 ## 验证部署
 

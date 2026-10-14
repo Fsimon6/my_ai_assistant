@@ -373,8 +373,8 @@ class RagService:
                 base_url=settings.LLM_BASE_URL,
                 model=model,
                 embedding_model=settings.EMBEDDING_MODEL,
-                temperature=float(os.getenv('LLM_TEMPERATURE', '0.7')),
-                max_tokens=int(os.getenv('LLM_MAX_TOKENS', '2000')),
+                temperature=settings.LLM_TEMPERATURE,
+                max_tokens=settings.LLM_MAX_TOKENS,
             ))
         logger.info(f'RAG 使用全局默认模型：{settings.LLM_MODEL}')
         return self.llm

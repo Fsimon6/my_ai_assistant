@@ -254,8 +254,8 @@ class LLMFactory:
             base_url=settings.LLM_BASE_URL,
             model=settings.LLM_MODEL,
             embedding_model=settings.EMBEDDING_MODEL,
-            temperature=float(os.getenv('LLM_TEMPERATURE', '0.7')),
-            max_tokens=int(os.getenv('LLM_MAX_TOKENS', '2000')),
+            temperature=settings.LLM_TEMPERATURE,
+            max_tokens=settings.LLM_MAX_TOKENS,
         )
 
         return LLMFactory.create_llm(config)

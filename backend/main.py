@@ -96,7 +96,7 @@ def log_startup_configuration() -> None:
         settings.LLM_PROVIDER,
         settings.LLM_MODEL,
         _base_host(settings.LLM_BASE_URL),
-        os.getenv('LLM_TEMPERATURE', '0.7（默认）'),
+        settings.LLM_TEMPERATURE,
         settings.EMBEDDING_MODEL,
         settings.EMBEDDING_PROVIDER,
         key_state,
@@ -116,8 +116,9 @@ async def lifespan(app: FastAPI):
     # 生效配置可见性（不打印任何密钥内容）
     log_startup_configuration()
 
-    # 创建必要目录
-    os.makedirs('./data/chroma_db', exist_ok=True)
+    # 创建必要目录（F1：向量库目录取自统一配置，不再硬编码；
+    # data/uploads 为历史遗留目录，保持原行为不动）
+    os.makedirs(settings.VECTOR_DB_PATH or './data/chroma_db', exist_ok=True)
     os.makedirs('./data/uploads', exist_ok=True)
 
     # 启动时创建数据库表（init_db 内部会导入所有模型，确保 Base.metadata 已注册）
@@ -236,7 +237,7 @@ async def speak_to_character_stream(
     from backend.services.llm_service import get_llm, LLMFactory, LLMConfig
     from backend.services.character_service import character_service
     from backend.services.conversation_service import (
-        conversation_service, SOURCE_CHAT, SOURCE_EXCEL,
+        conversation_service, SOURCE_CHAT, SOURCE_EXCEL, SOURCE_RAG,
     )
 
     # 归属查询（防 IDOR）：角色不存在 / 不属于当前用户（含已删除）→ 404
@@ -273,8 +274,8 @@ async def speak_to_character_stream(
                     base_url=settings.LLM_BASE_URL,
                     model=character_model,
                     embedding_model=settings.EMBEDDING_MODEL,
-                    temperature=float(os.getenv('LLM_TEMPERATURE', '0.7')),
-                    max_tokens=int(os.getenv('LLM_MAX_TOKENS', '2000')),
+                    temperature=settings.LLM_TEMPERATURE,
+                    max_tokens=settings.LLM_MAX_TOKENS,
                 ))
             else:
                 effective_model = settings.LLM_MODEL
@@ -294,10 +295,11 @@ async def speak_to_character_stream(
                     meta_info={'source': SOURCE_CHAT},
                 )
                 # 加载历史（已含刚写入的用户消息），注入 LLM 多轮上下文。
-                # 来源隔离：Excel 表格查询属独立工具能力，其整轮（user + assistant）
-                # 一律不进入普通聊天上下文，避免历史表格结果污染其他聊天模式。
+                # 来源隔离（P-2）：Excel 表格查询（工具产物）与知识库问答（RAG）都属
+                # **独立能力**，其整轮（user + assistant）一律不进入普通聊天上下文。
+                # 目的：关闭某项能力后，该能力历史产生的内容不得继续影响普通聊天。
                 history = conversation_service.get_history(
-                    conv_id, exclude_sources=[SOURCE_EXCEL],
+                    conv_id, exclude_sources=[SOURCE_EXCEL, SOURCE_RAG],
                 )
             else:
                 history = []

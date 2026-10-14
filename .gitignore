@@ -55,6 +55,8 @@ data/
 logs/
 cache/
 uploads/
+# 备份产物（含业务库快照/向量库/Excel 原件，属用户数据，禁止入库）
+backups/
 *.db
 *.db-wal
 *.db-shm

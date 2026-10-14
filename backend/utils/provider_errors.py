@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DOCUMENT_PARSE_FAILED = 'DOCUMENT_PARSE_FAILED'
 UNSUPPORTED_FILE_TYPE = 'UNSUPPORTED_FILE_TYPE'
+#: P-8 大表保护：表格超过解析上限（行数/单元格数）→ 413，明确拒绝而不是静默截断
+FILE_TOO_LARGE = 'FILE_TOO_LARGE'
 
 QUOTA_EXCEEDED = 'QUOTA_EXCEEDED'
 AUTH_FAILED = 'AUTH_FAILED'
@@ -185,6 +187,16 @@ _PARSE_ERROR_NAMES = (
 )
 
 
+#: P-8：表格解析上限异常的类型名（`backend.excel.parser.ExcelSizeLimitError`）。
+#: 用类型名判断而不是 import，避免 provider_errors 反向依赖 excel 包。
+_SIZE_LIMIT_ERROR_NAMES = ('ExcelSizeLimitError',)
+
+
+def is_size_limit_error(exc: Any) -> bool:
+    """异常是否表示「表格超过解析上限」（应为 413，而不是 400/500）。"""
+    return type(exc).__name__ in _SIZE_LIMIT_ERROR_NAMES
+
+
 def is_file_format_error(exc: Any) -> bool:
     """异常是否表示「上传文件本身格式/内容不合法」（应为 400，而不是 500）。
 
@@ -216,6 +228,14 @@ def classify_upload_error(exc: Any) -> ClassifiedError:
 
     if isinstance(exc, excel_query.ExcelQueryError):
         return classify_parse_error(exc)
+
+    # P-8：大表超限优先于"解析失败"——它是明确的容量问题（413），不是文件损坏（400）
+    if is_size_limit_error(exc):
+        detail = sanitize_secret_text(getattr(exc, 'message', None) or exc)
+        return ClassifiedError(
+            FILE_TOO_LARGE,
+            detail or '表格过大，已超过解析上限，本次上传未完成，请拆分文件后重试。',
+            413, 'parser', detail)
 
     if is_file_format_error(exc):
         return classify_parse_error(exc)
