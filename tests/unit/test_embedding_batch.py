@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Embedding 统一分片（≤20/请求）回归 —— 生产缺口修复的护栏。
+"""Embedding 统一分片（每请求 <=10 条）回归 —— 生产缺口修复的护栏。
 
 背景（只读审查结论）：本仓库唯一的"接收完整 texts + 直接调用远端 embedding"入口是
     ``OpenAILikeLLM.generate_embeddings``（`backend/services/llm_service.py`）
@@ -21,7 +21,7 @@ import pytest
 
 from backend.services.llm_service import LLMConfig, LLMFactory
 
-BATCH_CAP = 20
+BATCH_CAP = 10
 
 
 # --------------------------------------------------------------------------
@@ -81,16 +81,16 @@ def _llm(api: RecordingEmbeddingsAPI):
 
 
 # ==========================================================================
-# §三/§六：任意 N 个输入必须自动分片，且单次请求 <= 20
+# §三/§六：任意 N 个输入必须自动分片，且单次请求 <= 10
 # ==========================================================================
 @pytest.mark.parametrize('n,expected_sizes', [
-    (21, [20, 1]),
-    (50, [20, 20, 10]),
-    (100, [20, 20, 20, 20, 20]),
-    (448, [20] * 22 + [8]),
+    (21, [10, 10, 1]),
+    (50, [10, 10, 10, 10, 10]),
+    (100, [10] * 10),
+    (448, [10] * 44 + [8]),
 ])
 def test_remote_embedding_requests_are_capped(n, expected_sizes):
-    """单次 remote embedding 请求 <= 20，且总数量与输入一致。"""
+    """单次 remote embedding 请求 <= 10，且总数量与输入一致。"""
     api = RecordingEmbeddingsAPI()
     llm = _llm(api)
     texts = _marker_texts(n)
@@ -99,13 +99,15 @@ def test_remote_embedding_requests_are_capped(n, expected_sizes):
 
     sizes = [len(c) for c in api.calls]
     assert sizes == expected_sizes
-    assert max(sizes) <= BATCH_CAP                       # 绝不超上限
+    assert max(sizes) <= BATCH_CAP                       # 绝不超上限（真实 Provider 实测 10）
+    assert len(sizes) == (n + BATCH_CAP - 1) // BATCH_CAP  # 批次数与上限一致（448 -> 45）
+    assert sum(sizes) == n                               # 分批覆盖全部输入（不丢/不重）
     assert len(vectors) == n                             # 数量一致（不丢/不重）
     assert all(len(v) == 2 for v in vectors)
 
 
 def test_small_input_is_single_request_and_empty_input_makes_no_call():
-    """<= 20 条仍然只发 1 次请求（Excel 2 条摘要 chunk 场景不变）；空输入不发请求。"""
+    """<= 10 条仍然只发 1 次请求（Excel 2 条摘要 chunk 场景不变）；空输入不发请求。"""
     api = RecordingEmbeddingsAPI()
     llm = _llm(api)
 
@@ -143,7 +145,7 @@ def test_embeddings_keep_input_order_across_batches(n):
 # §四/§八：某一批失败 -> 记录 batch index/total/size/reason 并向上抛出（不吞）
 # ==========================================================================
 def test_failing_batch_is_reported_and_propagates(caplog):
-    """448 条（23 批）时让第 7 批失败：必须记录 7/23 与 size，并把异常抛给调用方。"""
+    """448 条（45 批）时让第 7 批失败：必须记录 7/45 与 size，并把异常抛给调用方。"""
     api = RecordingEmbeddingsAPI(fail_on_call=7)
     llm = _llm(api)
 
@@ -153,9 +155,10 @@ def test_failing_batch_is_reported_and_propagates(caplog):
 
     assert 'remote embedding exploded at call 7' in str(err.value)     # 原异常冒泡
     assert len(api.calls) == 7                                          # 失败即止，不继续
-    assert len(api.calls[6]) == 20                                      # 第 7 批 size=20
+    assert len(api.calls[6]) == BATCH_CAP                               # 第 7 批 size=10
+    assert (448 + BATCH_CAP - 1) // BATCH_CAP == 45                     # 448/10 -> 45 批
     logged = '\n'.join(r.getMessage() for r in caplog.records)
-    assert 'batch=7' in logged and 'total=23' in logged and 'size=20' in logged
+    assert 'batch=7' in logged and 'total=45' in logged and 'size=10' in logged
     assert 'RuntimeError' in logged                                     # 异常原因被记录
     assert 'test-key-not-used' not in logged                            # 不泄露密钥
     assert 'MARK0000' not in logged                                     # 不打印被嵌入文本

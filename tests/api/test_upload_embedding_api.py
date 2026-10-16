@@ -7,11 +7,11 @@
   * 失败必须向 API 正确返回错误，且不留下"幽灵文档"；
   * **记录** 远端 embedding 请求的实际形态（本仓库的分片现状见报告）。
 
-embedding 的分片上限（≤20/请求）由**唯一 batch boundary** `OpenAILikeLLM.generate_embeddings`
-（`backend/services/llm_service.py`，`EMBEDDING_BATCH_SIZE=20`）保证；上传链路
-（TXT/MD/DOCX/PDF 的 chunk 与 Excel 摘要 chunk）都经
+embedding 的分片上限（<=10/请求，按真实 Provider text-embedding-v3 实测校正）由**唯一 batch
+boundary** `OpenAILikeLLM.generate_embeddings`（`backend/services/llm_service.py`，
+`EMBEDDING_BATCH_SIZE=10`）保证；上传链路（TXT/MD/DOCX/PDF 的 chunk 与 Excel 摘要 chunk）都经
 `VectorStoreManager.add_documents` → Chroma `add_texts` → `AIAssistantEmbeddings.embed_documents`
-汇聚到该层，因此这里断言每个远端请求 ≤20 条、总量一致、顺序保持。
+汇聚到该层，因此这里断言每个远端请求 <=10 条、总量一致、顺序保持。
 """
 import pytest
 
@@ -61,17 +61,17 @@ def test_excel_upload_embeds_every_summary_chunk_once(api):
 
 
 # ==========================================================================
-# > 20 chunks：数量一致 / 顺序保持 / 失败处理
+# > 10 chunks：数量一致 / 顺序保持 / 失败处理
 # ==========================================================================
-def test_large_document_over_20_chunks_embedding_contract(api):
-    """>20 chunks 的合成文档：每个 chunk 都被嵌入、顺序保持，并**记录**请求形态。"""
+def test_large_document_over_10_chunks_embedding_contract(api):
+    """>10 chunks 的合成文档：每个 chunk 都被嵌入、顺序保持，并**记录**请求形态。"""
     headers = api.user('embed_big_user')
     content = _marker_sections(28)
     resp = api.upload_bytes(headers, 'synthetic_big.txt', content, 'text/plain')
     assert resp.status_code == 200, resp.text
     body = resp.json()
     total = body['total_chunks']
-    assert total > 20, '合成文本必须产生 >20 个 chunk，实际 %s' % total
+    assert total > 10, '合成文本必须产生 >10 个 chunk，实际 %s' % total
 
     requests = api.fake.embedding_requests
     assert requests, '必须发生远端 embedding 调用'
@@ -82,12 +82,13 @@ def test_large_document_over_20_chunks_embedding_contract(api):
     # 顺序保持（独立校验：标记出现顺序必须是 0..N）
     markers = _markers_in_order(embedded)
     assert markers == ['MARK%04d' % i for i in range(len(markers))]
-    assert len(markers) >= 20
+    assert len(markers) >= 10
 
-    # 唯一 batch boundary：单次远端请求 <= 20 条，且分片覆盖全部 chunk
+    # 唯一 batch boundary：单次远端请求 <= 10 条，且分片覆盖全部 chunk
     observed_sizes = [len(r) for r in requests]
-    assert max(observed_sizes) <= 20, observed_sizes
-    assert observed_sizes == [20, total - 20], observed_sizes      # 28 -> [20, 8]
+    assert max(observed_sizes) <= 10, observed_sizes
+    expected = [10] * (total // 10) + ([total % 10] if total % 10 else [])
+    assert observed_sizes == expected, observed_sizes              # 例：28 -> [10, 10, 8]
     assert sum(observed_sizes) == total
 
     # 文档可用且可查（API 层未被大文件破坏）
@@ -99,9 +100,9 @@ def test_large_document_over_20_chunks_embedding_contract(api):
 
 
 def test_later_batch_failure_is_not_partially_successful(api):
-    """>20 chunks 时**后续批**失败：API 必须报错，不部分成功、不留幽灵文档/不完整向量。"""
+    """>10 chunks 时**后续批**失败：API 必须报错，不部分成功、不留幽灵文档/不完整向量。"""
     headers = api.user('embed_batch_fail_user')
-    api.fake.fail_on_embedding_call = 2                            # 第 2 批（8 条）失败
+    api.fake.fail_on_embedding_call = 2                            # 第 2 批（10 条）失败
     resp = api.upload_bytes(headers, 'synthetic_batch_fail.txt',
                             _marker_sections(28), 'text/plain')
 
@@ -110,7 +111,7 @@ def test_later_batch_failure_is_not_partially_successful(api):
     assert 'Traceback' not in resp.text
 
     # 第 1 批已发出、第 2 批失败 -> 后续不再调用（顺序分批、失败即止）
-    assert [len(r) for r in api.fake.embedding_requests] == [20, 8]
+    assert [len(r) for r in api.fake.embedding_requests] == [10, 10]
 
     # 不产生幽灵文档：列表为空，且没有任何向量残留到 Chroma
     listed = api.client.get('/api/v1/rag/documents', headers=headers).json()

@@ -48,7 +48,7 @@ def test_txt_upload_smoke(api):
 
 
 def test_md_upload_smoke(api):
-    """MD 与 TXT/Excel 共用**同一个** embedding 入口（单次请求 <= 20、总量一致）。"""
+    """MD 与 TXT/Excel 共用**同一个** embedding 入口（单次请求 <= 10、总量一致）。"""
     headers = api.user('doc_md_user')
     content = ('# API regression 标题\n\n- 合成 Markdown 内容，不含真实业务数据。\n' * 40).encode()
     resp = api.upload_bytes(headers, 'smoke.md', content, MD_MIME)
@@ -57,7 +57,7 @@ def test_md_upload_smoke(api):
     total = resp.json()['total_chunks']
     assert total >= 1
     sizes = [len(r) for r in api.fake.embedding_requests]
-    assert max(sizes) <= 20                       # 统一 batch boundary 生效
+    assert max(sizes) <= 10                       # 统一 batch boundary 生效（Provider 上限 10）
     assert sum(sizes) == total
 
 

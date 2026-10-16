@@ -67,7 +67,7 @@ class FakeProviderLLM(OpenAILikeLLM):
     """真实 ``OpenAILikeLLM`` 的**子类**：只覆盖 chat（模型返回值），embedding 走真实实现。
 
     这样 API 层验证的 embedding 链路与生产**完全一致**（含 ``generate_embeddings`` 的
-    ≤20 分片），只把"远端客户端"换成 ``RecordingEmbeddingsAPI``（不外发任何请求）。
+    <=10 分片），只把"远端客户端"换成 ``RecordingEmbeddingsAPI``（不外发任何请求）。
     """
 
     def __init__(self) -> None:

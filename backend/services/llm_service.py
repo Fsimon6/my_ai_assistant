@@ -11,10 +11,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-#: 远端 embedding 单次请求的**条数上限**（2026-09-30）。
+#: 远端 embedding 单次请求的**条数上限**（2026-10-16 按真实 Provider 校正）。
+#: 当前生产 Provider 为 DashScope 兼容端点、模型 text-embedding-v3，实测单次 input 上限为
+#: **10** 条（10 条成功；11 条与 20 条均返回 400 "batch size is invalid, it should not be
+#: larger than 10."），此前按 20 分片仍会触发 400，故改为 10。
 #: 唯一 batch boundary 位于 ``OpenAILikeLLM.generate_embeddings``：任何一次可能传入数百条
 #: 文本的上传（TXT/MD/DOCX/PDF 的 chunk、Excel 摘要 chunk）都只在这里分片，其它层不要再分批。
-EMBEDDING_BATCH_SIZE = 20
+EMBEDDING_BATCH_SIZE = 10
 
 
 @dataclass
@@ -187,9 +190,10 @@ class OpenAILikeLLM(BaseLLM):
 
         模型优先级：显式传入 > config.embedding_model(settings.EMBEDDING_MODEL) > 兜底默认。
 
-        **分片（2026-09-30，唯一 batch boundary）**：远端 embedding API 对单次 ``input`` 条数
-        有上限，而上传链路（TXT/MD/DOCX/PDF 的 chunk、Excel 摘要 chunk）可能一次传入数百条，
-        因此这里统一按 ``EMBEDDING_BATCH_SIZE``（<=20）**顺序分批**调用，并按输入顺序合并；
+        **分片（2026-10-16 按真实 Provider 校正，唯一 batch boundary）**：远端 embedding API
+        对单次 ``input`` 条数有上限（当前模型 text-embedding-v3 实测为 10），而上传链路
+        （TXT/MD/DOCX/PDF 的 chunk、Excel 摘要 chunk）可能一次传入数百条，
+        因此这里统一按 ``EMBEDDING_BATCH_SIZE``（<=10）**顺序分批**调用，并按输入顺序合并；
         ``embeddings[i]`` 严格对应 ``texts[i]``。
 
         为什么放在这一层：本函数是**唯一**"接收完整 texts 列表 + 直接调用远端 embedding API"
@@ -207,6 +211,9 @@ class OpenAILikeLLM(BaseLLM):
                    for i in range(0, len(texts), EMBEDDING_BATCH_SIZE)]
         embeddings: List[List[float]] = []
         for index, batch in enumerate(batches, start=1):
+            # 只记录批次规模，不记录被嵌入文本 / 向量 / 密钥
+            if len(batches) > 1:
+                logger.info('Embedding batch: %d/%d, size=%d', index, len(batches), len(batch))
             try:
                 response = await self.client.embeddings.create(model=model, input=batch)
             except Exception as e:
