@@ -227,3 +227,139 @@ def independent_amount_stats(sheet, rows: Sequence[int]) -> Tuple[int, int, int,
             numeric += 1
             total += num
     return numeric, empty, non_numeric, round(total, 2)
+
+
+# --------------------------------------------------------------------------
+# 规模守卫探针：极小体积 + 极大"使用范围"的 xlsx（P-8 413 回归）
+# --------------------------------------------------------------------------
+def probe_col_letter(idx: int) -> str:
+    """1 -> 'A'，63 -> 'BK'（仅测试用，刻意不复用生产 parser 的实现）。"""
+    letters = ''
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def build_probe_xlsx(path: Path, sheets: Sequence[Tuple[str, int, int]]) -> Path:
+    """生成一个**极小**的 xlsx：每个 Sheet 只在「首格」与「远角」各放一个数字。
+
+    文件只有几百字节，但 openpyxl 的 ``ws.max_row`` / ``ws.max_column``（= 使用范围）等于
+    给定尺寸，因此可以在不生成真实百万行数据的前提下，精确测试 Excel 规模守卫的边界
+    （limit-1 / limit / limit+1）与"守卫先于全量加载"的顺序。
+
+    sheets: [(sheet_name, max_row, max_col), ...]，均为 1-based 且 >= 1。
+    """
+    import zipfile
+
+    n = len(sheets)
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.'
+        'relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-'
+        'officedocument.spreadsheetml.sheet.main+xml"/>'
+        + ''.join(
+            '<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.'
+            'openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i
+            for i in range(1, n + 1))
+        + '</Types>')
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets>'
+        + ''.join('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (name, i, i)
+                  for i, (name, _r, _c) in enumerate(sheets, start=1))
+        + '</sheets></workbook>')
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + ''.join('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/'
+                  'officeDocument/2006/relationships/worksheet" '
+                  'Target="worksheets/sheet%d.xml"/>' % (i, i)
+                  for i in range(1, n + 1))
+        + '</Relationships>')
+
+    with zipfile.ZipFile(str(path), 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('[Content_Types].xml', content_types)
+        zf.writestr('_rels/.rels', root_rels)
+        zf.writestr('xl/workbook.xml', workbook_xml)
+        zf.writestr('xl/_rels/workbook.xml.rels', workbook_rels)
+        for i, (_name, max_row, max_col) in enumerate(sheets, start=1):
+            corner = '%s%d' % (probe_col_letter(max_col), max_row)
+            rows = ['<row r="1"><c r="A1"><v>1</v></c></row>']
+            if max_row > 1:
+                rows.append('<row r="%d"><c r="%s"><v>2</v></c></row>' % (max_row, corner))
+            zf.writestr(
+                'xl/worksheets/sheet%d.xml' % i,
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<dimension ref="A1:%s"/><sheetData>%s</sheetData></worksheet>'
+                % (corner, ''.join(rows)))
+    return path
+
+
+def build_raw_xlsx(path: Path, sheets: Sequence[Tuple[str, str]]) -> Path:
+    """用**原始 ``<sheetData>`` 片段**构造最小 xlsx（覆盖 ``<row>``/``<c>`` 缺 ``r`` 等形状）。
+
+    sheets: [(sheet_name, sheet_data_xml), ...]；不写 ``<dimension>``（刻意制造"无声明尺寸"的
+    文件，用于验证扫描口径与 openpyxl DOM 的实际使用范围一致）。
+    """
+    import zipfile
+
+    n = len(sheets)
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.'
+        'relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-'
+        'officedocument.spreadsheetml.sheet.main+xml"/>'
+        + ''.join(
+            '<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.'
+            'openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i
+            for i in range(1, n + 1))
+        + '</Types>')
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets>'
+        + ''.join('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (name, i, i)
+                  for i, (name, _body) in enumerate(sheets, start=1))
+        + '</sheets></workbook>')
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + ''.join('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/'
+                  'officeDocument/2006/relationships/worksheet" '
+                  'Target="worksheets/sheet%d.xml"/>' % (i, i)
+                  for i in range(1, n + 1))
+        + '</Relationships>')
+
+    with zipfile.ZipFile(str(path), 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('[Content_Types].xml', content_types)
+        zf.writestr('_rels/.rels', root_rels)
+        zf.writestr('xl/workbook.xml', workbook_xml)
+        zf.writestr('xl/_rels/workbook.xml.rels', workbook_rels)
+        for i, (_name, body) in enumerate(sheets, start=1):
+            zf.writestr(
+                'xl/worksheets/sheet%d.xml' % i,
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<sheetData>%s</sheetData></worksheet>' % body)
+    return path

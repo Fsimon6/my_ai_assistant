@@ -412,12 +412,16 @@ export const ragApi = {
     if (metadata) {
       formData.append('metadata', JSON.stringify(metadata))
     }
-    // 稳定性补丁：上传在服务端会顺序做多次 embedding（每批 <=20 条），大文件（TXT/MD/DOCX/PDF）
-    // 总耗时远超默认 30s；这里为该接口单独放宽超时（与 nlQueryExcel 的 180000 保持一致），
-    // 避免客户端先超时终止、而服务端仍在继续处理。仅此接口，不影响其它请求。
+    // 稳定性补丁：上传在服务端会顺序做多次 embedding（每批 <=10 条，见
+    // backend/services/llm_service.py 的 EMBEDDING_BATCH_SIZE），大文件（TXT/MD/DOCX/PDF）
+    // 总耗时远超默认 30s，因此该接口单独放宽超时。
+    // 注意：上传超时必须 **不早于** 网关上限（nginx `^~ /api/v1/rag/` 的
+    // proxy_read_timeout = 300s），否则会出现"前端已报失败、后端仍在继续处理并最终写入成功"
+    // 的假失败（用户重传 → 知识库出现重复文档）。这里取 300000 与网关对齐。
+    // 仅此接口，不影响其它请求（Excel 自然语言查询仍是 180000）。
     const res = await api.post('/rag/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 180000
+      timeout: 300000
     })
     return res as unknown as RagUploadResult
   },

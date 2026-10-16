@@ -20,6 +20,8 @@ import logging
 import math
 import os
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import date, datetime, time as dtime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -104,6 +106,171 @@ def _guard_sheet_size(sheet_label: str, rows: int, cols: int, total_cells: int) 
             '表格过大：整个工作簿累计 %d 个单元格，超过上限 %d 个。'
             '请拆分文件后重试。' % (total, limits['total_cells']))
     return total
+
+
+# ---------------------------------------------------------------------------
+# 大表保护（P-8）guard-before-load：在**任何全量 workbook DOM 之前**执行规模校验
+# ---------------------------------------------------------------------------
+# 背景：守卫最初放在第一次 load_workbook(read_only=False) **之后**，而那份全量 DOM 正是
+# 内存峰值的来源 —— 超限文件仍会先把内存打满，之后才（可能）报 413，即"守卫防不住 OOM"。
+# 现在改为：先做一次轻量扫描拿到每个 Worksheet 的**实际使用范围**，再用**同一个**
+# `_guard_sheet_size` 判定，因此：
+#   * 上限值与错误文案完全不变（仍是 EXCEL_MAX_*，仍抛 ExcelSizeLimitError → HTTP 413）；
+#   * 判定口径与 openpyxl DOM 的 ws.max_row / ws.max_column 一致（"存在单元格的最大行/列"）；
+#   * 不建立 DOM、不读取共享字符串表、不解析单元格值；一旦确定超限立即抛错、不再继续扫描。
+_NS_SPREADSHEET = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+_NS_REL = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+
+
+def _split_cell_ref(ref: str) -> Tuple[int, int]:
+    """'BK449' -> (449, 63)；无法解析时返回 (0, 0)（调用方回退到顺序推断）。"""
+    letters = ''
+    digits = ''
+    for ch in ref:
+        if ch.isdigit():
+            digits += ch
+        elif ch.isalpha():
+            if digits:
+                break
+            letters += ch
+        elif ch == '$':
+            continue
+        else:
+            return 0, 0
+    if not letters or not digits:
+        return 0, 0
+    col = 0
+    for ch in letters.upper():
+        col = col * 26 + (ord(ch) - 64)
+    return int(digits), col
+
+
+def _xlsx_worksheet_parts(zf: 'zipfile.ZipFile') -> List[Tuple[str, str]]:
+    """返回 [(sheet_name, zip 内路径)]，顺序与工作簿一致（只含 Worksheet，跳过 chartsheet）。"""
+    try:
+        workbook_xml = zf.read('xl/workbook.xml')
+        rels_xml = zf.read('xl/_rels/workbook.xml.rels')
+    except KeyError:
+        return []
+    rel_targets: Dict[str, str] = {}
+    for rel in ET.fromstring(rels_xml):
+        rid = rel.get('Id')
+        target = rel.get('Target')
+        if rid and target:
+            rel_targets[rid] = target
+    sheets_el = ET.fromstring(workbook_xml).find(_NS_SPREADSHEET + 'sheets')
+    if sheets_el is None:
+        return []
+    parts: List[Tuple[str, str]] = []
+    for idx, sheet in enumerate(sheets_el, start=1):
+        name = sheet.get('name') or ('Sheet%d' % idx)
+        rid = sheet.get(_NS_REL + 'id')
+        target = rel_targets.get(rid) if rid else None
+        if not target:
+            continue
+        part = target.lstrip('/')
+        if not part.startswith('xl/'):
+            part = 'xl/' + part
+        if 'chartsheet' in part:
+            continue
+        parts.append((name, part))
+    return parts
+
+
+def _scan_sheet_used_range(stream, limits: Dict[str, int], label: str) -> Tuple[int, int]:
+    """流式扫描单个 worksheet XML，返回 (rows, cols)。
+
+    口径与 openpyxl DOM 的 ``ws.max_row`` / ``ws.max_column`` **完全一致**：只取 ``<c>`` 单元格
+    坐标的最大行/列（无单元格时与 DOM 一样返回 1, 1）。
+
+    行列推断规则刻意对齐 openpyxl 的 ``WorkSheetParser``（worksheet/_reader.py 的
+    ``parse_row`` / ``parse_cell``）：
+      * 行号：``<row r="N">`` 取 N；``<row>`` 无 r 时在上一个行号上 +1（首个行 = 1）。
+        **行上下文必须在该行开始时建立**——openpyxl 在行的结束事件上先按 ``<row r>`` 设置
+        ``row_counter``，再逐个解析子 ``<c>``；因此这里用 start 事件与之等效。若改为在
+        ``<c>`` 自己的结束事件上读行号，缺 ``r`` 的 ``<c>`` 会错误地取到上一行的行号
+        （例如 ``<row r="10"><c/></row>`` 会被算成第 1 行）。
+      * 列号：``<c r="B7">`` 以 ref 为准（行号同样以 ref 为准）；``<c>`` 无可用 r 时在本行内
+        依次 +1（首个单元格 = 第 1 列）。
+    """
+    max_row = 0
+    max_col = 0
+    row_counter = 0
+    col_counter = 0
+    for event, element in ET.iterparse(stream, events=('start', 'end')):
+        tag = element.tag.rsplit('}', 1)[-1]
+        if tag == 'row':
+            if event == 'start':
+                # 行上下文在行的**开始**处建立（见 docstring：与 openpyxl 的解析时机等效）
+                ref = element.get('r')
+                if ref is None:
+                    row_counter += 1
+                else:
+                    try:
+                        row_counter = int(ref)
+                    except ValueError:
+                        try:
+                            row_counter = int(float(ref))
+                        except ValueError:
+                            row_counter += 1
+                col_counter = 0
+            else:
+                element.clear()
+        elif tag == 'c' and event == 'end':
+            ref = element.get('r')
+            if ref:
+                row, col = _split_cell_ref(ref)
+                if row > 0 and col > 0:
+                    col_counter = col
+                else:                       # 无法解析 -> 与 openpyxl 一致地顺序推断
+                    row = row_counter or 1
+                    col_counter += 1
+                    col = col_counter
+            else:
+                row = row_counter or 1
+                col_counter += 1
+                col = col_counter
+            if row > max_row:
+                max_row = row
+            if col > max_col:
+                max_col = col
+            if max_row > limits['rows'] or max_row * max_col > limits['sheet_cells']:
+                # 复用解析后守卫的同一套上限与文案（超限时必然抛出）
+                _guard_sheet_size(label, max_row, max_col, 0)
+            element.clear()
+    return (max_row or 1), (max_col or 1)
+
+
+def _guard_xlsx_before_load(path: Path) -> None:
+    """P-8 guard-before-load：在任何 read_only=False 全量加载之前按规模拒绝超大表。
+
+    仅在能安全判定时生效：预检自身遇到文件结构异常会**静默跳过**（只记 debug 日志），
+    交由后续 load_workbook 与解析后的守卫按原有方式处理 —— 绝不把可解析的文件变成新错误。
+    """
+    try:
+        if not zipfile.is_zipfile(str(path)):
+            return
+        with zipfile.ZipFile(str(path)) as zf:
+            parts = _xlsx_worksheet_parts(zf)
+            if not parts:
+                return
+            limits = _excel_limits()
+            total_cells = 0
+            for label, part in parts:
+                try:
+                    with zf.open(part) as stream:
+                        rows, cols = _scan_sheet_used_range(stream, limits, label)
+                except ExcelSizeLimitError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - 预检失败不得影响正常解析
+                    logger.debug('前置规模预检跳过 Sheet「%s」（%s：%s）',
+                                 label, type(e).__name__, e)
+                    continue
+                total_cells = _guard_sheet_size(label, rows, cols, total_cells)
+    except ExcelSizeLimitError:
+        raise
+    except Exception as e:  # noqa: BLE001 - 同上
+        logger.debug('Excel 前置规模预检跳过（%s：%s）', type(e).__name__, e)
 
 # 单元格类型
 K_EMPTY = 'empty'
@@ -285,9 +452,13 @@ class ExcelParser:
         except ImportError as e:  # pragma: no cover
             raise RuntimeError('缺少 openpyxl 依赖，无法解析 xlsx：pip install openpyxl') from e
 
+        # P-8 guard-before-load：在任何 read_only=False 全量加载之前，先按**实际使用范围**
+        # 用轻量 ZIP/XML 流式扫描做规模校验（不建 DOM、不读共享字符串表）。
+        _guard_xlsx_before_load(path)
+
         wb_formula = load_workbook(filename=str(path), data_only=False, read_only=False)
-        # P-8 大表保护：在第二次（data_only）全量加载之前先按声明尺寸校验——
-        # 超大工作簿被加载两遍会直接打满内存，必须提前拒绝。
+        # P-8 兜底：若上面的前置预检因文件结构异常被跳过，这里仍按解析后的 DOM 尺寸校验一次
+        # （同一套 _guard_sheet_size，成本很低，作为纵深防御保留）。
         _total_cells = 0
         for _ws in wb_formula.worksheets:
             _total_cells = _guard_sheet_size(
@@ -350,7 +521,9 @@ class ExcelParser:
         grids: List[Dict[str, Any]] = []
         warnings.append('.xls 由 xlrd 解析：不提供公式文本（仅保留计算后的值）。')
 
-        # P-8 大表保护：展开数据之前先按声明尺寸校验
+        # P-8 大表保护：展开数据之前先按声明尺寸校验。
+        # 注：.xls 是二进制 BIFF，xlrd 没有"不载入工作表即可获知 nrows/ncols"的轻量接口，
+        # 因此 .xls 保持"载入后立即校验"（本轮的 guard-before-load 仅适用于 xlsx/xlsm）。
         _total_cells = 0
         for _sh in book.sheets():
             _total_cells = _guard_sheet_size(
