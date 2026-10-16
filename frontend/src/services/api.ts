@@ -69,6 +69,9 @@ export interface RagCollectionInfoResult {
 // ===== Excel（Phase 1A）统一表示 / 预览结构 =====
 export interface ExcelColumnMeta {
   name: string
+  // display_name：表格结果**列标题**的可读显示名（由后端按既有语义表给出；无则回退 name）。
+  // name 永远是真实列名（机器字段，不得用于展示时的替换）。
+  display_name?: string
   index: number
   excel_column: number
   excel_column_letter: string
@@ -240,9 +243,13 @@ export interface ExcelGroupedAggregateResult {
   operation: 'count' | 'sum' | 'avg' | 'min' | 'max'
   operation_label?: string
   column: string | null
+  // column_display_name：指标列的可读显示名（可选增量字段；旧快照缺失即回退 column）
+  column_display_name?: string
   column_index?: number | null
   column_letter: string | null
-  group_by: { name: string; index: number; letter: string }[]
+  // display_name：分组字段的**可读显示名**（由后端按既有语义表给出；无则回退 name）。
+  // name 永远是真实列名（机器字段，不得用于展示时的替换）。
+  group_by: { name: string; index: number; letter: string; display_name?: string }[]
   filters: ExcelAppliedFilter[]
   applied_filters: ExcelAppliedFilter[]
   rows: ExcelGroupRow[]
@@ -275,10 +282,13 @@ export interface ExcelMultiStepStep1 {
   // 后端仅在能定位 Sheet 时返回（multi_step.py: if sheet_name: payload['sheet_name']=...）
   sheet_name?: string
   sheet_index?: number
-  group_by: { name: string; index: number; letter: string }[]
+  // display_name：分组字段可读显示名（可选增量字段；旧快照缺失时回退 name）
+  group_by: { name: string; index: number; letter: string; display_name?: string }[]
   operation: 'count' | 'sum' | 'avg' | 'min' | 'max'
   operation_label?: string
   column: string | null
+  // column_display_name：第 1 步指标列的可读显示名（可选增量字段；旧快照缺失即回退 column）
+  column_display_name?: string
   calculation?: ExcelCalculation | null
   filters: ExcelAppliedFilter[]
   applied_filters: ExcelAppliedFilter[]
@@ -334,6 +344,8 @@ export interface ExcelAggregateResult {
   operation: 'count' | 'sum' | 'avg' | 'min' | 'max'
   operation_label?: string
   column: string | null
+  // column_display_name：指标列的可读显示名（可选增量字段；旧快照缺失即回退 column）
+  column_display_name?: string
   column_index: number | null
   column_letter: string | null
   filters: ExcelAppliedFilter[]

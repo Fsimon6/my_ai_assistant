@@ -20,6 +20,7 @@
     "operation": "sum",
     "operation_label": "SUM（求和）",
     "column": "Order Amount",
+    "column_display_name": "订单金额",
     "column_index": 3,
     "column_letter": "D",
     "column_numeric_in_sheet": 17,

@@ -190,6 +190,167 @@ RANK_UNIT_ALIASES: Dict[str, str] = {
 # 单位位置匹配：「...前3个订单」「...排名前3的订单」；单独的「按订单金额排名前三」不匹配
 RANK_UNIT_RE = re.compile(r'(?:个|条|的|位|名)\s*(订单|order)', re.I)
 
+
+# ---------------------------------------------------------------------------
+# 用户可见的**列显示名**（Stage 2 / NEW-2；纯展示层，不改变任何查询语义）
+# ---------------------------------------------------------------------------
+# 由既有同义词表 `COLUMN_ALIASES` **反向推导**：每个真实列取声明顺序中第一个中文别名
+# 作为可读名称；没有中文别名的列（如 Created Time / Order Channel）原样返回真实列名。
+# 使用边界（刻意收紧）：
+#   * 只用于**用户可见文案、澄清候选与结果展示名**，避免无解释地暴露内部英文列名；
+#   * **绝不**参与列匹配 / 筛选 / 分组 / 排序 / 计数 / 全量枚举；
+#   * **绝不**改动真实列名、真实数值与机器字段（`group_by[].name` 等一律保持原样）。
+def _build_column_display_labels(aliases: Dict[str, str]) -> Dict[str, str]:
+    """同义词表 -> {真实列名: 可读名称}（同一列多个别名时取**声明顺序中最先出现的**）。
+
+    只采用**纯中文**别名键（含中文且不含拉丁字母）：``sku`` / ``sku编号`` / ``卖家sku``
+    这类键不算"可信中文别名"，不用于展示 —— 该列保留真实列名
+    （例如 ``SKU ID`` 仍显示为 ``SKU ID``，而不是 ``sku`` 或 ``sku编号``）。
+    """
+    out: Dict[str, str] = {}
+    for key, target in aliases.items():
+        if not re.search(r'[\u4e00-\u9fff]', key) or re.search(r'[A-Za-z]', key):
+            continue
+        out.setdefault(target, key)
+    return out
+
+
+COLUMN_DISPLAY_LABELS: Dict[str, str] = _build_column_display_labels(COLUMN_ALIASES)
+
+
+def column_display_name(column: Optional[str]) -> str:
+    """真实列名 -> 用户可读显示名（无中文别名时原样返回真实列名）。"""
+    if not column:
+        return ''
+    return COLUMN_DISPLAY_LABELS.get(column, column)
+
+
+def display_column_candidates(columns: Optional[Sequence[str]],
+                              limit: int = 0) -> List[str]:
+    """把列名列表转成**可读显示名**列表（limit > 0 时截断）。"""
+    items = [column_display_name(c) for c in (columns or [])]
+    return items[:limit] if limit else items
+
+
+def display_column_text(columns: Optional[Sequence[str]], limit: int = 10) -> str:
+    """把列名列表渲染成「A、B、C」形式（超出 limit 追加省略号）。"""
+    names = [column_display_name(c) for c in (columns or [])]
+    text = '、'.join(names[:limit]) if limit else '、'.join(names)
+    if limit and len(names) > limit:
+        text += '…'
+    return text
+
+
+def _payload_columns(payload: Dict[str, Any]) -> List[str]:
+    """结果负载里**被展示的**真实列名（分组列 + 目标列 + 计算字段列）。"""
+    names: List[str] = []
+    for item in (payload.get('group_by') or []):
+        if isinstance(item, dict) and item.get('name'):
+            names.append(item['name'])
+        elif isinstance(item, str) and item:
+            names.append(item)
+    col = payload.get('column')
+    if isinstance(col, str) and col:
+        names.append(col)
+    calc = payload.get('calculation')
+    if isinstance(calc, dict):
+        for key in ('left_column', 'right_column'):
+            if isinstance(calc.get(key), str) and calc[key]:
+                names.append(calc[key])
+    return list(dict.fromkeys(names))
+
+
+def _result_columns(result: Any) -> List[str]:
+    """从统计 / 分析结果对象取「被展示的」真实列名（两步分析会递归第 1 步）。"""
+    if result is None:
+        return []
+    names: List[str] = []
+
+    def _add(value: Any) -> None:
+        if isinstance(value, str) and value:
+            names.append(value)
+
+    for item in (getattr(result, 'group_by', None) or []):
+        if isinstance(item, dict):
+            _add(item.get('name'))
+        elif isinstance(item, str):
+            _add(item)
+    _add(getattr(result, 'column', None))
+    calc = getattr(result, 'calculation', None)
+    if isinstance(calc, dict):
+        _add(calc.get('left_column'))
+        _add(calc.get('right_column'))
+    step1 = getattr(result, 'step1', None)
+    if step1 is not None:
+        names.extend(_result_columns(step1))
+    return list(dict.fromkeys(names))
+
+
+def label_text_columns(text: str, columns: Sequence[str]) -> str:
+    """把文本中出现的**指定真实列名**替换为可读显示名（逐字替换，其它文本不动）。"""
+    if not text:
+        return text
+    for real in columns:
+        label = column_display_name(real)
+        if label and label != real and real in text:
+            text = text.replace(real, label)
+    return text
+
+
+#: 摘要文案中**保留真实列名**的行前缀：这两行是"最终执行条件 / 放宽过程"，
+#: 与卡片 filtersLabel、执行层条件一一对应，原样展示更利于与真实 Excel 列核对
+#: （避免同一轮出现"文案是显示名、卡片是真实列名"的不一致）。
+_KEEP_RAW_LINE_PREFIXES = ('- 筛选条件：', '- 筛选过程：')
+
+
+def label_result_text(text: str, result: Any) -> str:
+    """展示层：摘要文案里的列名换成可读显示名（仅本次涉及的列，不改数值/条件/口径）。
+
+    「筛选条件 / 筛选过程」两行保持真实列名（见 ``_KEEP_RAW_LINE_PREFIXES``）。
+    """
+    if not text:
+        return text
+    columns = _result_columns(result)
+    lines: List[str] = []
+    for line in text.split('\n'):
+        if line.startswith(_KEEP_RAW_LINE_PREFIXES):
+            lines.append(line)
+        else:
+            lines.append(label_text_columns(line, columns))
+    return '\n'.join(lines)
+
+
+def with_display_names(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """给结果负载**追加**展示名（只增不改机器字段，绝不改动任何数值）。
+
+    * ``group_by[].display_name``：分组字段的可读名（``name`` 保持真实列名不变）；
+    * ``column_display_name``：指标列（``column``）的可读名 —— 供卡片「目标列 / 操作（列）」
+      与「值标签」使用；``column`` 本身保持真实列名；
+    * ``columns[].display_name``：表格结果**列标题**的可读名（``name`` 保持真实列名不变）；
+    * ``order_by_label`` / ``sort_description`` / ``definition``：把其中出现的
+      **本次涉及列名**换成可读名；
+    * 递归处理两步分析的 ``step1`` / ``step2``（第 1 步因此同样拿到 ``column_display_name``）。
+    """
+    if not isinstance(payload, dict):
+        return payload or {}
+    named = _payload_columns(payload)
+    for item in (payload.get('group_by') or []):
+        if isinstance(item, dict) and item.get('name'):
+            item.setdefault('display_name', column_display_name(item['name']))
+    if isinstance(payload.get('column'), str) and payload['column']:
+        payload.setdefault('column_display_name', column_display_name(payload['column']))
+    for item in (payload.get('columns') or []):
+        if isinstance(item, dict) and item.get('name'):
+            item.setdefault('display_name', column_display_name(item['name']))
+    for key in ('order_by_label', 'sort_description', 'definition'):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            payload[key] = label_text_columns(value, named)
+    for key in ('step1', 'step2'):
+        if isinstance(payload.get(key), dict):
+            with_display_names(payload[key])
+    return payload
+
 _CODE_FENCE_RE = re.compile(r'```(?:json)?\s*(.*?)```', re.S | re.I)
 
 
@@ -651,8 +812,9 @@ def build_validated_query(
         if col is None:
             raise NlQueryError(
                 'column_ambiguous_or_missing',
-                f'无法确定列「{name}」（候选：{", ".join(cands[:10]) or "无"}）',
-                {'column': name, 'candidates': cands[:30]},
+                f'无法确定列「{column_display_name(name)}」'
+                f'（候选：{display_column_text(cands) or "无"}）',
+                {'column': name, 'candidates': display_column_candidates(cands, 30)},
             )
         if col not in resolved_columns:
             resolved_columns.append(col)
@@ -663,8 +825,10 @@ def build_validated_query(
         if col is None:
             raise NlQueryError(
                 'column_ambiguous_or_missing',
-                f'筛选列「{f.get("column")}」无法确定（候选：{", ".join(cands[:10]) or "无"}）',
-                {'column': f.get('column'), 'candidates': cands[:30]},
+                f'筛选列「{column_display_name(f.get("column"))}」无法确定'
+                f'（候选：{display_column_text(cands) or "无"}）',
+                {'column': f.get('column'),
+                 'candidates': display_column_candidates(cands, 30)},
             )
         value = f.get('value')
         operator = f.get('operator') or excel_query.OPERATOR_EQ
@@ -734,7 +898,9 @@ def format_summary(result: 'excel_query.StructuredQueryResult', filename: str,
     现在：有筛选时输出「筛选条件」（= **最终执行条件**）；执行层确有放宽（``relaxed_notes``
     非空）时再输出一行「筛选过程」。无筛选 -> 不输出「筛选条件：无」，保持简洁。
     """
-    col_names = [c['name'] for c in result.columns]
+    # 展示层：列名用可读显示名（无中文别名时原样返回真实列名）；
+    # 真实列名不变，仍完整保留在结构化字段 columns[].name 与 query 中。
+    col_names = [column_display_name(c['name']) for c in result.columns]
     # 文案规范（批次 A）：面向用户不暴露 offset/limit 这类分页实现参数，改用"第 a~b 条"。
     if result.returned_count:
         seq_start = result.offset + 1
@@ -751,8 +917,10 @@ def format_summary(result: 'excel_query.StructuredQueryResult', filename: str,
     # Phase 4B：计算字段与计算值筛选必须显式告知（口径可核对）
     if getattr(result, 'calculation', None):
         calc = result.calculation
+        # 展示层：计算字段引用的两列同样用可读显示名（真实列名保留在 calculation 字段里）
         head += (f'\n- 计算字段：{calc["label"]}'
-                 f'（对每行「{calc["left_column"]}」与「{calc["right_column"]}」做 {calc["symbol"]} 运算；'
+                 f'（对每行「{column_display_name(calc["left_column"])}」与'
+                 f'「{column_display_name(calc["right_column"])}」做 {calc["symbol"]} 运算；'
                  f'空值/非数值/除零不计入）')
     if getattr(result, 'calc_filter', None):
         cf = result.calc_filter
@@ -774,7 +942,8 @@ def format_summary(result: 'excel_query.StructuredQueryResult', filename: str,
 def format_pagination_summary(result: 'excel_query.StructuredQueryResult', filename: str, mode: str,
                               relaxed_notes: Optional[Sequence[str]] = None) -> str:
     """由 Python 生成「继续分页」的摘要（不经过 LLM）。"""
-    col_names = [c['name'] for c in result.columns]
+    # 展示层：同 format_new_query_summary，列名用可读显示名
+    col_names = [column_display_name(c['name']) for c in result.columns]
     mode_label = {
         ACTION_NEXT: '下一页',
         ACTION_PREV: '上一页',
@@ -2352,7 +2521,9 @@ def _run_pagination(turn: TurnIntent, ctx: 'ExcelQueryContext') -> Dict[str, Any
         'document': {'document_id': rep.document_id, 'filename': rep.filename, 'file_type': rep.file_type},
         'sheet': {'sheet_index': result.sheet_index, 'sheet_name': result.sheet_name},
         'query': payload,
-        'result': result.to_dict(),
+        # 展示层：为表格结果补列标题可读名（columns[].display_name）；
+        # 真实列名、行数据、总数与分页语义完全不变。
+        'result': with_display_names(result.to_dict()),
         'new_context': new_ctx.to_dict(),
     }
 
@@ -2367,8 +2538,10 @@ def resolve_filters_nl(
         if col is None:
             raise NlQueryError(
                 'column_ambiguous_or_missing',
-                f'筛选列「{f.get("column")}」无法确定（候选：{", ".join(cands[:10]) or "无"}）',
-                {'column': f.get('column'), 'candidates': cands[:30]},
+                f'筛选列「{column_display_name(f.get("column"))}」无法确定'
+                f'（候选：{display_column_text(cands) or "无"}）',
+                {'column': f.get('column'),
+                 'candidates': display_column_candidates(cands, 30)},
             )
         operator = (f.get('operator') or excel_query.OPERATOR_EQ)
         if operator not in excel_query.SUPPORTED_OPERATORS:
@@ -2626,12 +2799,28 @@ def _temporal_filter_for_message(
         return None, None
     expr = nl_norm.parse_date_expression(text)
     if expr is None:
-        # 相对时间（最近7天/上个月/本周…）：明确不支持 -> 澄清，绝不静默退化
+        # 相对时间（今天/最近7天/上个月/本周…）：明确不支持 -> 澄清，绝不静默退化。
+        # Stage 2（NEW-1）：澄清必须说清**缺什么** —— ① 相对时间不支持，需要明确的日期
+        # 区间；② 本表若有多个日期列，用户还必须指明按哪一列筛选（否则口径不确定）。
+        # 本期**不实现**相对时间：项目没有统一时区约定（无 TZ/TIMEZONE 配置），且真实
+        # 工作簿存在多个候选日期列（Created/Paid/RTS/Shipped Time），自行猜测列或
+        # "今天"的边界都会造成静默错口径（与系统"绝不猜"的既有契约一致）。
         if nl_norm.RELATIVE_TIME_RE.search(text):
+            rel_cols = _iter_date_columns(sheet)
+            if len(rel_cols) > 1:
+                col_hint = ('本表有多个日期列（%s），请一并指明按哪一列筛选。'
+                            % display_column_text(rel_cols, 6))
+            elif len(rel_cols) == 1:
+                col_hint = '本表可用的日期列：%s。' % column_display_name(rel_cols[0])
+            else:
+                col_hint = ''
+            logger.info('[nl] 相对时间不支持 -> 澄清（stage=date，可选日期列 %d 个）',
+                        len(rel_cols))
             return None, _clarify(
-                '暂不支持相对时间（如"最近7天 / 上个月 / 本周"）。请给出明确的年 / 月 / 日'
-                '或日期区间，例如「8月19日的订单」「2026年8月1日到8月15日的订单」。',
-                stage='date',
+                '暂不支持相对时间（如"今天 / 最近7天 / 上个月 / 本周"），'
+                '请给出明确的年 / 月 / 日或日期区间。' + col_hint +
+                '例如「2026年8月1日到8月15日 按 Created Time 的订单」。',
+                display_column_candidates(rel_cols, 30), stage='date',
             )
         return None, None
 
@@ -2639,7 +2828,7 @@ def _temporal_filter_for_message(
     if not date_cols:
         return None, _clarify(
             '没有找到可识别的日期列，无法按日期筛选。请指明具体列，或改用其他条件。',
-            sheet.column_names[:30], stage='date',
+            display_column_candidates(sheet.column_names, 30), stage='date',
         )
     # **用户文本**里能解析出的日期列（真实列名或列别名）才算"用户指定"。
     # LLM 自己填的日期列不算（见函数 docstring 的两条实测依据）。
@@ -2661,7 +2850,7 @@ def _temporal_filter_for_message(
                 return None, _clarify(
                     '表格中有多个日期列且年份不一致，请指明具体年份与日期列，'
                     '例如「2026年8月按 Created Time 统计」。',
-                    date_cols[:30], stage='date',
+                    display_column_candidates(date_cols, 30), stage='date',
                 )
             rng_c = _expr_to_range(expr, y_c)
             if rng_c is None:
@@ -2670,11 +2859,12 @@ def _temporal_filter_for_message(
                 )
             counts[c] = _count_in_range(sheet, c, rng_c[0], rng_c[1])
         if len(set(counts.values())) != 1:
-            detail = '、'.join(f'{c}={counts[c]}' for c in date_cols[:4])
+            detail = '、'.join('%s=%d' % (column_display_name(c), counts[c])
+                              for c in date_cols[:4])
             return None, _clarify(
-                f'该表格有多个日期列（{"、".join(date_cols[:5])}），各列结果不同'
+                f'该表格有多个日期列（{display_column_text(date_cols, 5)}），各列结果不同'
                 f'（{detail}），请指明按哪一列筛选。',
-                date_cols[:30], stage='date',
+                display_column_candidates(date_cols, 30), stage='date',
             )
         col_name = date_cols[0]                 # 各日期列结果一致 -> 无歧义
 
@@ -2832,8 +3022,9 @@ def _guard_rank_semantics(
         # 2A-P1：step1 的排名单位同样必须来自用户文本（LLM 自行给的 step1.group_by 不作依据）。
         if unit_cands:
             return turn, [], _clarify(
-                '文本里出现多个可能的排名维度（%s），请明确按哪一个排名。' % '、'.join(unit_cands),
-                list(unit_cands), stage='order',
+                '文本里出现多个可能的排名维度（%s），请明确按哪一个排名。'
+                % display_column_text(unit_cands),
+                display_column_candidates(unit_cands, 30), stage='order',
             )
         if unit_col is None:
             cands1: List[str] = []
@@ -2842,7 +3033,7 @@ def _guard_rank_semantics(
                 cands1 = [c.name for c in _s1.columns if _column_is_numeric(_s1, c.name)][:30]
             return turn, [], _clarify(
                 '需要明确按什么字段排名（例如「按订单金额排名前三的订单」「订单最多的前3个物流商」）。',
-                cands1, stage='order',
+                display_column_candidates(cands1, 30), stage='order',
             )
         notes1: List[str] = []
         if list(step1.get('group_by') or []) != [unit_col]:
@@ -2873,7 +3064,7 @@ def _guard_rank_semantics(
         cands0 = [c.name for c in _s0.columns if _column_is_numeric(_s0, c.name)][:30]
         return turn, [], _clarify(
             '需要明确按什么字段排名（例如「按订单金额排名前三的订单」「订单最多的前3个物流商」）。',
-            cands0, stage='order',
+            display_column_candidates(cands0, 30), stage='order',
         )
 
     notes: List[str] = []
@@ -2885,8 +3076,9 @@ def _guard_rank_semantics(
     # 现在统一：单位来自文本才执行，且**以文本为准**；无单位 / 多义 -> 澄清。
     if unit_cands:
         return turn, notes, _clarify(
-            '文本里出现多个可能的排名维度（%s），请明确按哪一个排名。' % '、'.join(unit_cands),
-            list(unit_cands), stage='order',
+            '文本里出现多个可能的排名维度（%s），请明确按哪一个排名。'
+            % display_column_text(unit_cands),
+            display_column_candidates(unit_cands, 30), stage='order',
         )
     if unit_col is not None:
         prev_group = list(agg.group_by or [])
@@ -2922,7 +3114,7 @@ def _guard_rank_semantics(
                            if _column_is_numeric(sheet3, c.name)][:30]
             return turn, notes, _clarify(
                 '文本里出现了多个/无法唯一确定的统计指标，请明确按哪一个指标排名。',
-                cands_m, stage='order',
+                display_column_candidates(cands_m, 30), stage='order',
             )
         else:
             # 情况 C：用户没有说要排什么 -> 沿用**既有正式默认口径**：按行数（COUNT）
@@ -2950,7 +3142,7 @@ def _guard_rank_semantics(
         cands = [c.name for c in sheet2.columns if _column_is_numeric(sheet2, c.name)][:30]
     return turn, notes, _clarify(
         '需要明确按什么字段排名（例如「按订单金额排名前三的订单」「订单最多的前3个物流商」）。',
-        cands, stage='order',
+        display_column_candidates(cands, 30), stage='order',
     )
 
 
@@ -3851,10 +4043,10 @@ def _run_aggregate_turn(
         col, col_candidates = resolve_column_nl(sheet, agg.column)
         if col is None:
             return _clarify(
-                f'无法确定统计的目标列「{agg.column}」'
-                f'（候选：{", ".join(col_candidates[:10]) or "无"}）。'
+                f'无法确定统计的目标列「{column_display_name(agg.column)}」'
+                f'（候选：{display_column_text(col_candidates) or "无"}）。'
                 f'请明确要统计哪一列。',
-                col_candidates[:30], stage='schema',
+                display_column_candidates(col_candidates, 30), stage='schema',
             )
         payload['column'] = col
 
@@ -3866,17 +4058,18 @@ def _run_aggregate_turn(
         gcol, g_candidates = resolve_column_nl(sheet, name)
         if gcol is None:
             return _clarify(
-                f'无法确定分组字段「{name}」（候选：{", ".join(g_candidates[:10]) or "无"}）。'
+                f'无法确定分组字段「{column_display_name(name)}」'
+                f'（候选：{display_column_text(g_candidates) or "无"}）。'
                 f'请明确按哪一列分组。',
-                g_candidates[:30], stage='schema',
+                display_column_candidates(g_candidates, 30), stage='schema',
             )
         if gcol not in resolved_group_by:
             resolved_group_by.append(gcol)
     if len(resolved_group_by) > excel_aggregate.MAX_GROUP_COLUMNS:
         return _clarify(
             f'本阶段最多支持 {excel_aggregate.MAX_GROUP_COLUMNS} 个分组字段，'
-            f'当前需要 {len(resolved_group_by)} 个（{", ".join(resolved_group_by)}）。',
-            resolved_group_by, stage='schema',
+            f'当前需要 {len(resolved_group_by)} 个（{display_column_text(resolved_group_by)}）。',
+            display_column_candidates(resolved_group_by, 30), stage='schema',
         )
     if resolved_group_by:
         payload['group_by'] = resolved_group_by
@@ -3952,19 +4145,23 @@ def _run_aggregate_turn(
             identifiers = set(e.details.get('identifier_columns') or [])
             candidates = [c for c in (e.details.get('available_columns') or sheet.column_names)
                           if c not in identifiers]
-            return _clarify(e.message, candidates[:30], stage='aggregate_target')
+            return _clarify(e.message, display_column_candidates(candidates, 30),
+                            stage='aggregate_target')
         if e.code in (excel_aggregate.ERR_NOT_NUMERIC_COLUMN,
                       excel_query.ERR_COLUMN_NOT_FOUND,
                       excel_query.ERR_COLUMN_AMBIGUOUS,
                       excel_aggregate.ERR_COLUMN_REQUIRED):
-            return _clarify(e.message, e.details.get('available_columns') or [], stage='schema')
+            return _clarify(e.message,
+                            display_column_candidates(
+                                e.details.get('available_columns') or [], 30),
+                            stage='schema')
         return {'status': STATUS_ERROR, 'message': e.message, 'details': e.details}
 
     notes: List[str] = []
     if inherited_from:
         notes.append('已沿用上一轮的数据范围与筛选条件')
     if group_inherited:
-        notes.append(f'已沿用上一轮的分组字段（{", ".join(resolved_group_by)}）')
+        notes.append(f'已沿用上一轮的分组字段（{display_column_text(resolved_group_by)}）')
     if order_inherited:
         notes.append('已沿用上一轮的排序与 TOP-N 设置')
     # R2：放宽说明由摘要的「筛选过程」行**单独**承载（不混进通用提示，避免同一解释重复出现）
@@ -3976,6 +4173,9 @@ def _run_aggregate_turn(
     else:
         message = excel_aggregate.format_aggregate_summary(
             result, rep.filename, relaxed_notes=relax_notes)
+    # Stage 2（NEW-2）：摘要里出现的列名统一换成可读显示名
+    # （纯展示层：仅替换本次涉及的精确列名，不改任何数值 / 条件 / 口径）
+    message = label_result_text(message, result)
     if notes:
         message += ''.join('\n- 提示：' + n for n in notes)
 
@@ -4001,8 +4201,9 @@ def _run_aggregate_turn(
         'status': STATUS_OK,
         'message': message,
         'turn': turn.to_dict(),
-        'aggregate': None if is_grouped else result.to_dict(),
-        'group_aggregate': result.to_dict() if is_grouped else None,
+        'aggregate': None if is_grouped else with_display_names(result.to_dict()),
+        'group_aggregate': (with_display_names(result.to_dict())
+                            if is_grouped else None),
         'engine': engine_used,
         'relaxed_filters': relax_notes,
         'inherited_from': inherited_from,
@@ -4774,8 +4975,9 @@ def _run_analysis_turn(
         gcol, g_candidates = resolve_column_nl(sheet, name)
         if gcol is None:
             return _clarify(
-                f'无法确定分组字段「{name}」（候选：{", ".join(g_candidates[:10]) or "无"}）。',
-                g_candidates[:30], stage='schema',
+                f'无法确定分组字段「{column_display_name(name)}」'
+                f'（候选：{display_column_text(g_candidates) or "无"}）。',
+                display_column_candidates(g_candidates, 30), stage='schema',
             )
         if gcol not in resolved_group:
             resolved_group.append(gcol)
@@ -4797,8 +4999,8 @@ def _run_analysis_turn(
         except excel_query.ExcelQueryError as e:
             return _clarify(
                 f'第 1 步的计算字段无法解析：{e.message}。'
-                f'（候选：{", ".join(sheet.column_names[:10])}）',
-                sheet.column_names[:30], stage='schema',
+                f'（候选：{display_column_text(sheet.column_names)}）',
+                display_column_candidates(sheet.column_names, 30), stage='schema',
             )
         ambiguous = excel_calculation.needs_clarify(user_message, calc, level='aggregate')
         if ambiguous:
@@ -4808,9 +5010,9 @@ def _run_analysis_turn(
         col, col_candidates = resolve_column_nl(sheet, s1.column)
         if col is None:
             return _clarify(
-                f'无法确定第 1 步的目标列「{s1.column}」'
-                f'（候选：{", ".join(col_candidates[:10]) or "无"}）。',
-                col_candidates[:30], stage='schema',
+                f'无法确定第 1 步的目标列「{column_display_name(s1.column)}」'
+                f'（候选：{display_column_text(col_candidates) or "无"}）。',
+                display_column_candidates(col_candidates, 30), stage='schema',
             )
         resolved_column = col
 
@@ -4925,13 +5127,18 @@ def _run_analysis_turn(
                       excel_query.ERR_COLUMN_AMBIGUOUS,
                       excel_aggregate.ERR_COLUMN_REQUIRED,
                       excel_aggregate.ERR_TOO_MANY_GROUP_COLUMNS):
-            return _clarify(e.message, e.details.get('available_columns') or [], stage='schema')
+            return _clarify(e.message,
+                            display_column_candidates(
+                                e.details.get('available_columns') or [], 30),
+                            stage='schema')
         return _clarify(e.message, stage='analysis')
 
     notes: List[str] = []
     if inherited_from:
         notes.append('已沿用上一轮的第 1 步（分组、排序与 TOP-N 不变），只替换了第 2 步的汇总方式')
     message = excel_multi_step.format_analysis_summary(result)
+    # Stage 2（NEW-2）：摘要里的列名换成可读显示名（同上，纯展示层）
+    message = label_result_text(message, result)
     if notes:
         message += ''.join('\n- 提示：' + n for n in notes)
 
@@ -4952,7 +5159,7 @@ def _run_analysis_turn(
         'status': STATUS_OK,
         'message': message,
         'turn': turn.to_dict(),
-        'multi_step': result.to_dict(),
+        'multi_step': with_display_names(result.to_dict()),
         'engine': engine_used,
         'inherited_from': inherited_from,
         'document': {'document_id': rep.document_id, 'filename': rep.filename, 'file_type': rep.file_type},
@@ -5296,7 +5503,20 @@ async def _run_nl_query_impl(
     # 若 LLM 把明确的统计问题判成了「新查询」或「澄清」，这里用确定性词元判定拦住，
     # 并再做一次 temperature=0 的"只抽统计参数"调用；成功则改走统计链路，
     # 失败则**原样回退**原路径（绝不劣化）。
+    #
+    # Stage 2 收尾（本轮）：LLM 已给出**非空、可直接交付**的澄清时，本条兜底**不再执行**。
+    #   ① 该澄清就是最终结果（下方 2.45 / 3 会原样返回它），再问一次抽取器只增加延迟；
+    #   ② 抽取器的输出结构**没有 clarify 字段**，遇到"口径 / 定义歧义"无法表达"需澄清"，
+    #      只能凭空选一个口径并执行 —— 那会把用户的语义澄清静默换成另一个问题的答案
+    #      （实测「7月份哪个商品退货率最高？」：先正确澄清退货率的两种口径，随后仍触发
+    #      兜底，5/5 次超时、约 +30s，最终仍回退原澄清；若抽取成功则会答成 COUNT 排行）。
+    # 兜底**保留**的两类场景（不得被本条件跳过）：
+    #   * ``action=new_query`` 的统计问题（原有主力救回场景，测试覆盖）；
+    #   * ``action=clarify`` 但**澄清内容为空**（用户拿不到任何有效澄清，兜底仍可能救回）。
+    _llm_clarify_ready = (turn.action == ACTION_CLARIFY
+                          and bool((turn.clarification or '').strip()))
     if (turn.action in (ACTION_NEW_QUERY, ACTION_CLARIFY)
+            and not _llm_clarify_ready
             and llm is not None
             and (turn.intent is None or turn.intent.query_type != INTENT_NOT_EXCEL)
             and not _row_calc_only(user_message)
@@ -5512,6 +5732,8 @@ async def _run_nl_query_impl(
         'document': {'document_id': rep.document_id, 'filename': rep.filename, 'file_type': rep.file_type},
         'sheet': {'sheet_index': result.sheet_index, 'sheet_name': result.sheet_name},
         'query': payload,
-        'result': result.to_dict(),
+        # 展示层：为表格结果补列标题可读名（columns[].display_name）；
+        # 真实列名、行数据、总数与分页语义完全不变。
+        'result': with_display_names(result.to_dict()),
         'new_context': new_ctx.to_dict(),
     }

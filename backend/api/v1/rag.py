@@ -754,10 +754,14 @@ _RESULT_KEYS = ('offset', 'limit', 'returned_count', 'total_matches', 'total_row
 #: 三者都是 **schema v1 的可选增量字段**：旧快照缺失时卡片/叙述自动回退既有包络文案。
 _ROW_RUN_KEYS = ('matched_row_runs', 'matched_row_run_count', 'matched_row_runs_truncated')
 _AGG_KEYS = ('operation', 'operation_label', 'column', 'column_index', 'column_letter',
+             # Stage 2：指标列的可读显示名（schema v1 可选增量字段；旧快照缺失即回退 column）
+             'column_display_name',
              'column_numeric_in_sheet', 'value', 'value_display', 'matched_rows', 'numeric_rows',
              'empty_rows', 'non_numeric_rows', 'total_rows_in_sheet', 'row_excel_spans',
              'sheet_index', 'sheet_name', 'definition') + _ROW_RUN_KEYS
 _GROUP_KEYS = ('kind', 'operation', 'operation_label', 'column', 'column_index', 'column_letter',
+               # Stage 2：同上（分组统计卡片「操作（列）」/ 值标签使用）
+               'column_display_name',
                'column_numeric_in_sheet', 'total_groups', 'returned_groups', 'top_n', 'order_by',
                'order_by_column', 'order_by_label', 'order_dir', 'order_dir_label', 'sorted',
                'sort_description', 'truncated_by_top_n', 'matched_rows', 'total_rows_in_sheet',
@@ -802,7 +806,10 @@ def _history_columns(columns: Any) -> List[Dict[str, Any]]:
             continue
         out.append({k: col.get(k) for k in
                     ('name', 'index', 'excel_column', 'excel_column_letter', 'dtype',
-                     'semantic_type', 'non_empty', 'null_count', 'header_row_excel')
+                     'semantic_type', 'non_empty', 'null_count', 'header_row_excel',
+                     # Stage 2（NEW-2）：列的可读**显示名**（schema v1 的可选增量字段；
+                     # 旧快照缺失时前端自动回退真实列名 name，历史卡片因此同样可读）。
+                     'display_name')
                     if k in col})
     return out
 

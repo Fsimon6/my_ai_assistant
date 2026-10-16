@@ -200,7 +200,7 @@
                         v-for="(col, ci) in message.excelTable.columns"
                         :key="ci"
                         :prop="String(ci)"
-                        :label="col.name"
+                        :label="col.display_name || col.name"
                         min-width="140"
                         show-overflow-tooltip>
                         <template #default="scope">
@@ -376,7 +376,7 @@
                           <span class="k">操作</span>
                           <span class="v">
                             {{ message.excelMultiStep.step1.operation_label }}<template
-                              v-if="message.excelMultiStep.step1.column">（{{ message.excelMultiStep.step1.column }}）</template>
+                              v-if="message.excelMultiStep.step1ColumnLabel">（{{ message.excelMultiStep.step1ColumnLabel }}）</template>
                           </span>
                         </div>
                         <!-- Phase 4B：计算字段（口径由后端给出） -->
@@ -1054,11 +1054,13 @@ const AGG_VALUE_LABELS: Record<string, string> = {
 const buildExcelAgg = (a: ExcelAggregateResult, res: ExcelNlQueryResult) => {
   const isCount = a.operation === 'count'
   const calc = a.calculation || null
+  // 指标列展示名优先（后端给出可读名）；a.column 仍是真实列名，仅作回退
+  const colLabel = a.column_display_name || a.column || ''
   const valueLabel = isCount
     ? AGG_VALUE_LABELS.count
     : calc
       ? `${calc.label} ${AGG_VALUE_LABELS[a.operation] || a.operation}`
-      : `${a.column || ''} ${AGG_VALUE_LABELS[a.operation] || a.operation}`
+      : `${colLabel} ${AGG_VALUE_LABELS[a.operation] || a.operation}`
   const matchedLabel = isCount
     ? `${a.matched_rows} 行（该 Sheet 共 ${a.total_rows_in_sheet} 行）`
     : `${a.matched_rows} 行，其中可数值化 ${a.numeric_rows} 行`
@@ -1070,7 +1072,7 @@ const buildExcelAgg = (a: ExcelAggregateResult, res: ExcelNlQueryResult) => {
     valueLabel,
     valueDisplay: a.value_display,
     operationLabel: a.operation_label || a.operation.toUpperCase(),
-    column: a.column || '',
+    column: colLabel,
     calcLabel: calc ? `计算字段：${calc.label}（${calc.operation_label}；先逐行计算再聚合）` : '',
     filtersLabel: formatFilters(a.applied_filters || a.filters),
     matchedLabel,
@@ -1088,12 +1090,15 @@ const buildExcelAgg = (a: ExcelAggregateResult, res: ExcelNlQueryResult) => {
 const buildGroupAgg = (g: ExcelGroupedAggregateResult, res: ExcelNlQueryResult) => {
   const isCount = g.operation === 'count'
   const calc = g.calculation || null
-  const groupColumns = (g.group_by || []).map(x => x.name)
+  // 展示名优先用后端给出的 display_name（可读语义），无则回退真实列名
+  const groupColumns = (g.group_by || []).map(x => x.display_name || x.name)
+  // 指标列展示名优先（后端给出可读名）；g.column 仍是真实列名，仅作回退
+  const colLabel = g.column_display_name || g.column || ''
   const valueLabel = isCount
     ? '行数'
     : calc
       ? `${calc.label} ${AGG_VALUE_LABELS[g.operation] || g.operation}`
-      : `${g.column || ''} ${AGG_VALUE_LABELS[g.operation] || g.operation}`
+      : `${colLabel} ${AGG_VALUE_LABELS[g.operation] || g.operation}`
   const data = (g.rows || []).map((r, i) => {
     const obj: Record<string, any> = {
       __i: i,
@@ -1125,7 +1130,7 @@ const buildGroupAgg = (g: ExcelGroupedAggregateResult, res: ExcelNlQueryResult) 
     groupColumns,
     valueLabel,
     operationLabel: g.operation_label || g.operation.toUpperCase(),
-    column: g.column || '',
+    column: colLabel,
     calcLabel: calc ? `${calc.label}（${calc.operation_label}；先逐行计算再聚合）` : '',
     filtersLabel: formatFilters(g.applied_filters || g.filters),
     document: res.document?.filename || '',
@@ -1151,12 +1156,15 @@ const buildMultiStep = (m: ExcelMultiStepResult, res: ExcelNlQueryResult) => {
   const s2 = m.step2
   const isCount1 = s1.operation === 'count'
   const s1Calc = s1.calculation || null
-  const groupColumns = (s1.group_by || []).map(x => x.name)
+  // 同上：展示名优先 display_name（旧快照缺失时回退 name）
+  const groupColumns = (s1.group_by || []).map(x => x.display_name || x.name)
+  // 第 1 步指标列展示名优先（后端给出可读名）；s1.column 仍是真实列名，仅作回退
+  const s1ColLabel = s1.column_display_name || s1.column || ''
   const valueLabel = isCount1
     ? '行数'
     : s1Calc
       ? `${s1Calc.label} ${AGG_VALUE_LABELS[s1.operation] || s1.operation}`
-      : `${s1.column || ''} ${AGG_VALUE_LABELS[s1.operation] || s1.operation}`
+      : `${s1ColLabel} ${AGG_VALUE_LABELS[s1.operation] || s1.operation}`
 
   const data = (s1.rows || []).map((r, i) => {
     const obj: Record<string, any> = {
@@ -1192,6 +1200,8 @@ const buildMultiStep = (m: ExcelMultiStepResult, res: ExcelNlQueryResult) => {
     stepCountLabel: `共 ${m.step_count} 步（上限 ${m.max_steps}）`,
     step1: s1,
     step2: s2,
+    // 第 1 步指标列的展示名（模板「操作（列）」使用；真实列名仍在 step1.column）
+    step1ColumnLabel: s1ColLabel,
     groupColumns,
     valueLabel,
     data,
@@ -1214,7 +1224,7 @@ const buildMultiStep = (m: ExcelMultiStepResult, res: ExcelNlQueryResult) => {
       + `再对第 1 步结果（${s2.input_rows} 个分组）的${valueLabel}执行 ${op2}`,
     step1CalcLabel: s1Calc ? `${s1Calc.label}（${s1Calc.operation_label}；先逐行计算再聚合）` : '',
     step1Title: `按「${groupColumns.join(' + ')}」分组并 ${op1}`
-      + (s1Calc ? `（计算字段 ${s1Calc.label}）` : (s1.column ? `（${s1.column}）` : ''))
+      + (s1Calc ? `（计算字段 ${s1Calc.label}）` : (s1ColLabel ? `（${s1ColLabel}）` : ''))
       + (s1.sorted ? `，${sortLabel}，${topLabel}` : ''),
     step2Title: `对第 1 步的 ${s2.input_rows} 个分组的${valueLabel}再执行 ${op2}`,
     definition: m.definition

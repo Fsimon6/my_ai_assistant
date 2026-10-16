@@ -460,17 +460,76 @@ def test_plain_list_downgrade_when_llm_says_aggregate(small_rep):
     assert out['turn']['source'] == 'deterministic_downgrade'
 
 
-def test_clear_count_question_rescued_from_clarify(small_rep):
-    """LLM 判成 clarify 的明确计数问题 → 统计兜底救回（§9 的核心诉求）。"""
-    llm = ScriptedLLM(turn={'action': 'clarify', 'clarification': '我不确定你想统计什么'},
+def test_clarify_with_text_is_final_and_skips_statistical_guard(small_rep):
+    """LLM 已给出**非空澄清** -> 该澄清即最终结果，**不再**触发统计意图兜底（Stage 2 收尾）。
+
+    变更说明（本轮）：此前"判成 clarify 的明确计数问题"也会被兜底改写成 ok。
+    但抽取器的输出结构没有 clarify 字段：遇到口径/定义歧义时只能凭空选一个口径并执行，
+    会把用户的语义澄清静默换成"另一个问题"的答案；且实测多一次调用会超时（约 +30s）。
+    故现在的契约是：**澄清文案非空 => 尊重澄清**，兜底不再二次调用 LLM。
+    （`ScriptedLLM` 已提供 stat 载荷，若兜底被调用 `llm.calls` 必然多出 'stat_guard'。）
+    """
+    llm = ScriptedLLM(turn={'action': 'clarify', 'clarification': '「退货率」有两种计算口径，请明确'},
                       stat={'aggregate_operation': 'count', 'column': None, 'group_by': [],
                             'filters': [{'column': 'Quantity', 'operator': 'gt', 'value': 1}],
                             'document': '一店'})
     out = _run(small_rep, '数量大于1的订单有几条？', llm)
+
+    assert out['status'] == 'clarify'                        # 不被强制转成 ok
+    assert out['message'] == '「退货率」有两种计算口径，请明确'   # 原始澄清内容保持不变
+    assert llm.calls == ['turn'], '已有有效澄清时不得再调用统计抽取器'
+    assert out.get('statistical_guard') is None
+    assert out.get('aggregate') is None and out.get('group_aggregate') is None  # 未执行查询
+
+
+def test_clarify_without_text_still_rescued_by_statistical_guard(small_rep):
+    """clarify 但**没有**澄清内容（用户拿不到有效澄清）-> 兜底仍必须救回（原设计保留）。"""
+    llm = ScriptedLLM(turn={'action': 'clarify', 'clarification': ''},
+                      stat={'aggregate_operation': 'count', 'column': None, 'group_by': [],
+                            'filters': [{'column': 'Quantity', 'operator': 'gt', 'value': 1}],
+                            'document': '一店'})
+    out = _run(small_rep, '数量大于1的订单有几条？', llm)
+
     assert out['status'] == 'ok'
+    assert llm.calls == ['turn', 'stat_guard'], '无有效澄清时兜底必须照常运行'
+    assert out['statistical_guard'] is True
     assert nl.describe_executor(out) == 'run_aggregate'
     assert out['aggregate']['operation'] == 'count'
     assert out['aggregate']['value'] == 1.0         # 一店：Quantity > 1 的只有 1 行（其余 18 行为 1）
+
+
+@pytest.mark.parametrize('message,turn,executor,expected', [
+    ('物流商为SF的有几单？',
+     {'action': 'aggregate', 'aggregate_operation': 'count', 'column': None,
+      'group_by': [], 'document': '一店',
+      'filters': [{'column': 'Shipping Provider Name', 'operator': 'contains', 'value': 'SF'}]},
+     'run_aggregate', ('count', 4.0)),
+    ('每个物流商分别有多少单？',
+     {'action': 'aggregate', 'aggregate_operation': 'count', 'column': None,
+      'group_by': ['Shipping Provider Name'], 'document': '一店'},
+     'run_group_aggregate', ('count', 3)),
+    ('直邮一店订单金额总和是多少？',
+     {'action': 'aggregate', 'aggregate_operation': 'sum', 'column': 'Order Amount',
+      'group_by': [], 'document': '一店'},
+     'run_aggregate', ('sum', None)),
+])
+def test_valid_queries_unchanged_and_no_extra_llm_call(small_rep, message, turn, executor, expected):
+    """回归（验收 C）：普通计数 / 分组计数 / 数值聚合仍走原执行流程，且**只调用一次 LLM**。"""
+    llm = ScriptedLLM(turn=turn, stat={'aggregate_operation': 'count', 'group_by': []})
+    out = _run(small_rep, message, llm)
+
+    assert out['status'] == 'ok'
+    assert nl.describe_executor(out) == executor
+    assert llm.calls == ['turn'], '正常可执行查询不得触发统计兜底'
+    assert out.get('statistical_guard') is None
+    op, value = expected
+    if executor == 'run_group_aggregate':
+        assert out['group_aggregate']['operation'] == op
+        assert out['group_aggregate']['total_groups'] == value
+    else:
+        assert out['aggregate']['operation'] == op
+        if value is not None:
+            assert out['aggregate']['value'] == value
 
 
 def test_clear_query_not_rescued_from_clarify(small_rep):
