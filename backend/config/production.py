@@ -59,10 +59,9 @@ class ProductionConfig:
     LLM_MODEL = settings.LLM_MODEL
     LLM_BASE_URL = settings.LLM_BASE_URL
     API_KEY = settings.API_KEY
-    LLM_TIMEOUT = 30    # 生产环境增加超时
+    # LLM_TIMEOUT / MAX_UPLOAD_SIZE 已统一到 pydantic Settings（唯一来源，`.env` 可配）
 
-    # 文件上传限制
-    MAX_UPLOAD_SIZE = 50 * 1024 * 1024      # 50MB
+    # 文件上传类型（大小上限见 settings.MAX_UPLOAD_SIZE）
     ALLOWED_FILE_TYPES = ['.pdf', '.txt', '.docx', '.md']
 
     # 频率限制

@@ -4,13 +4,14 @@
 覆盖：
   * 超过 EXCEL_MAX_SHEET_ROWS 的 xlsx → HTTP 413 + error_code=FILE_TOO_LARGE（**不是 500/400**）；
   * 超限失败必须**不留半成品**：没有文档进入列表、没有 excel artifacts 目录；
-  * 超过 MAX_UPLOAD_BYTES(10MB) 的上传 → HTTP 413（应用层字节上限，与逻辑单元格上限相互独立）。
+  * 超过 `settings.MAX_UPLOAD_SIZE` 的上传 → HTTP 413（应用层字节上限，与逻辑单元格上限相互独立）。
 
 超限文件由 `tests/helpers/fixtures.build_probe_xlsx()` 生成（极小体积 + 极大使用范围），
 因此不需要真实的大表数据。
 """
 from pathlib import Path
 
+from backend.config.settings import settings
 from backend.excel import store as excel_store
 from backend.excel.parser import _excel_limits
 from tests.helpers import fixtures as F
@@ -18,7 +19,8 @@ from tests.helpers import fixtures as F
 from .conftest import XLSX_MIME
 
 LIMITS = _excel_limits()
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+#: 唯一来源：settings.MAX_UPLOAD_SIZE（字节；B2-B）
+MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_SIZE
 
 
 def test_over_limit_xlsx_returns_413_and_leaves_no_residue(api, tmp_path):

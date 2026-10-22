@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import Literal
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: .env 固定指向**项目根目录**下的 .env。
@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     EXCEL_MAX_SHEET_ROWS: int = 200_000
     EXCEL_MAX_SHEET_CELLS: int = 2_000_000
     EXCEL_MAX_TOTAL_CELLS: int = 5_000_000
+
+    # 单文件上传上限（**字节**）：文档与 Excel 上传共用的唯一来源（B2-B）。
+    # 默认 10MiB（10485760）；合法范围 1 字节 .. 99MiB（103809024）。
+    # 上限取 99MiB（< nginx `client_max_body_size 100M`），避免"后端允许、代理先拒绝"。
+    MAX_UPLOAD_SIZE: int = Field(default=10 * 1024 * 1024,
+                                 ge=1, le=99 * 1024 * 1024)
 
     # 运行时数据目录（F2 统一配置，供测试/特殊部署隔离；**留空即保持原有默认路径**）
     #   UPLOAD_TEMP_DIR 空 -> <系统临时目录>/ai_assistant_uploads（原行为）
@@ -60,6 +66,12 @@ class Settings(BaseSettings):
     # 现统一到配置入口。默认值与原 os.getenv 兜底值一致（0.7 / 2000）。
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 2000
+
+    # LLM 请求超时（**秒**）：唯一来源（B2-A）。优先级 进程环境变量 > `.env` > 默认 30。
+    # 合法范围 1..600；非法值在进程启动（Settings 构造）时即报错，不静默回退。
+    # 说明：同一 AsyncOpenAI client 同时服务 chat 与 embedding（既有实现），
+    # 因此该超时是 client 级；本轮不拆分 embedding 独立超时。
+    LLM_TIMEOUT: int = Field(default=30, ge=1, le=600)
 
     # API Key 哈希盐（F1）：原 security.hash_api_key 用 os.getenv 读取（.env 不生效）
     API_KEY_SALT: str = "ai_assistant_salt"

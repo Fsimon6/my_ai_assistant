@@ -117,7 +117,9 @@ class DocumentProcessor:
 
 
 # 上传限制（生产加固，第二阶段）：扩展名白名单 + 大小上限
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
+# 大小上限（B2-B）：唯一来源 settings.MAX_UPLOAD_SIZE（**字节**），文档与 Excel 共用；
+# 默认 10MB，可在 .env 配置；非法值在 Settings 构造（进程启动）时即报错。
+
 # 普通文档（走 DocumentProcessor 文本链路）
 DOC_EXT = {'.pdf', '.txt', '.docx', '.md'}
 # 表格文件（Phase 1A：走 Unified Table Representation 链路）
@@ -200,6 +202,9 @@ async def save_uploaded_file(upload_file) -> str:
         # 读取内容（流式：逐块读入并直接落盘，避免整份文件常驻内存）
         # 6A-8 P4：原实现用一次性 read（不带 size）把整个文件读成 bytes——超限文件也要先
         # 吃满内存才判 413；现改为边读边写边累计，超限立刻中止并删除半成品。
+        # 3) 大小上限：每次调用读取当前配置（唯一来源；测试可临时覆盖）
+        max_upload_bytes = int(settings.MAX_UPLOAD_SIZE)
+
         total_bytes = 0
         try:
             with open(file_path, 'wb') as f:
@@ -208,11 +213,14 @@ async def save_uploaded_file(upload_file) -> str:
                     if not chunk:
                         break
                     total_bytes += len(chunk)
-                    # 3) 大小限制（与原实现同一边界：> MAX_UPLOAD_BYTES 才算超限）
-                    if total_bytes > MAX_UPLOAD_BYTES:
+                    # 边界与既有语义一致：严格大于上限才算超限
+                    if total_bytes > max_upload_bytes:
+                        limit_mb = max_upload_bytes / (1024 * 1024)
+                        readable = (f'{limit_mb:g}MB' if limit_mb >= 1
+                                    else f'{max_upload_bytes} 字节')
                         raise HTTPException(
                             status_code=413,
-                            detail=f'文件过大，最大允许 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB',
+                            detail=f'文件过大，最大允许 {readable}',
                         )
                     f.write(chunk)
         except BaseException:

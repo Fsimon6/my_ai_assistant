@@ -34,33 +34,21 @@ class LLMConfig:
     timeout: int = 30
 
 
-def resolve_request_timeout(config: 'LLMConfig') -> float:
-    """LLM 请求超时（秒）—— 只用项目**已有**配置，不新增 env / 配置层。
+def resolve_request_timeout(config: Optional['LLMConfig'] = None) -> float:
+    """LLM 请求超时（秒）—— 唯一来源：``settings.LLM_TIMEOUT``。
 
-    优先级：
-      1. 环境配置的 ``LLM_TIMEOUT``（``backend.config.config``；当前仅 ``ProductionConfig``
-         定义了它，值为 30）；
-      2. ``LLMConfig.timeout``（LLM 统一配置对象的既有字段，默认 30）；
-      3. 兜底 30。
+    取值优先级由 pydantic-settings 决定：进程环境变量 > 项目根 ``.env`` > 默认 30。
+    合法范围（1..600）在 ``Settings`` 中校验：非法值在进程启动（Settings 构造）时
+    即报错，因此这里**不再**做"回退到另一个值"的兜底。
 
-    注：pydantic ``backend.config.settings.settings`` **没有** ``LLM_TIMEOUT`` 字段
-    （``extra='ignore'``，env 也不会注入），因此这里按"环境配置类"读取；两个来源当前
-    都为 30，故运行时数值与既有默认一致，只是**真正传给了 transport 层**。
+    说明：
+      * ``config`` 参数保留仅为兼容既有调用/测试签名，不再作为超时来源
+        （旧实现的 ``ProductionConfig.LLM_TIMEOUT`` / ``LLMConfig.timeout`` 不再参与）；
+      * 同一 ``AsyncOpenAI`` client 同时服务 chat 与 embedding（既有实现），
+        因此该超时是 client 级；本批不拆分 embedding 的独立超时。
     """
-    try:
-        from backend.config import config as env_config
-        env_value = getattr(env_config, 'LLM_TIMEOUT', None)
-        if env_value is not None:
-            return float(env_value)
-    except Exception:  # noqa: BLE001 - 配置缺失不应影响 client 创建
-        logger.debug('读取环境 LLM_TIMEOUT 失败（回退 LLMConfig.timeout）', exc_info=True)
-    value = getattr(config, 'timeout', None)
-    if value is not None:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            logger.warning('LLMConfig.timeout 非数值（%r），回退 30s', value)
-    return 30.0
+    from backend.config.settings import settings
+    return float(settings.LLM_TIMEOUT)
 
 
 class BaseLLM(ABC):
@@ -119,8 +107,7 @@ class OpenAILikeLLM(BaseLLM):
             )
             # Ollama / local 不需要 API Key
             api_key = self.config.api_key or 'not-needed'
-            # Stage 4：把项目既有 timeout 真正接到 transport 层
-            # （配置来源见 resolve_request_timeout；不新增任何配置项）
+            # 超时唯一来源：settings.LLM_TIMEOUT（.env / 环境变量 / 默认 30；范围 1..600）
             self.request_timeout = resolve_request_timeout(self.config)
             self.client = AsyncOpenAI(
                 api_key=api_key,

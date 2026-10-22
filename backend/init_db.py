@@ -8,6 +8,7 @@ import secrets
 from typing import Optional
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backend.config import ENV_PRODUCTION, get_env
 from backend.config.settings import settings
 from backend.database.base import init_db, SessionLocal
 from backend.models.user import User
@@ -28,7 +29,10 @@ def _initial_password(configured: Optional[str]) -> tuple:
 
 def init_admin_user():
     """初始化管理员用户"""
-    is_production = (settings.ENVIRONMENT or 'development').lower() == 'production'
+    # 与配置类选择共用同一套有效环境值（B1）：`ENVIRONMENT=" production "` 这类
+    # 带首尾空白的原始值会被 `normalize_env` 规约为 production；若此处自行 lower()
+    # 比较，就会出现“选了 ProductionConfig、却仍创建 test 账号”的不一致。
+    is_production = get_env() == ENV_PRODUCTION
     db = SessionLocal()
     try:
         # 检查是否已有管理员

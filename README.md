@@ -130,61 +130,69 @@ python backend/init_db.py
 - 管理员：`admin`（口令取自环境变量 `INIT_ADMIN_PASSWORD`；未设置则**随机生成并打印一次**）
 - 测试用户：`test`（仅非生产环境；口令取自 `INIT_TEST_PASSWORD` 或随机生成）
 
-### 4. 启动后端（默认 http://127.0.0.1:8000）
+### 4. 启动后端（本仓库开发默认 http://127.0.0.1:8021）
 
 在**仓库根目录**执行（推荐，`backend.main:app` 需要以根目录为工作目录）：
 
 ```bash
 # Windows
-.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8021 --reload
 
 # Linux / macOS
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8021 --reload
 ```
 
-也可以直接运行 `python backend/main.py`（内部使用 uvicorn 启动，端口见配置）。
+也可以直接运行 `python backend/main.py`（内部使用 uvicorn 启动；开发配置默认 8021，可用 `PORT` 环境变量覆盖）。
 
-### 5. 启动前端（默认 http://localhost:5173）
+### 5. 启动前端（本仓库开发使用 http://localhost:5181）
 
 ```bash
 cd frontend
 npm run dev
 ```
 
+`frontend/vite.config.ts` 的 `server.port` 固定为 **5181**，`/api` 代理指向 `http://127.0.0.1:8021`。
+
 Vite 已配置代理：`/api` → `http://127.0.0.1:8021`（见 `frontend/vite.config.ts`；开发期前端使用绝对地址 `VITE_API_BASE_URL`，代理为备用路径）。
 
 ### 6. 访问
 
-| 服务 | 地址 |
+| 服务 | 地址（本仓库开发默认） |
 |------|------|
-| 前端页面 | http://localhost:5173 |
-| 后端 API | http://localhost:8000 |
-| Swagger 文档 | http://localhost:8000/docs |
-| 健康检查 | http://localhost:8000/health |
+| 前端页面 | http://localhost:5181 |
+| 后端 API | http://127.0.0.1:8021 |
+| Swagger 文档 | http://127.0.0.1:8021/docs |
+| 健康检查 | http://127.0.0.1:8021/health |
 
-### 7. 当前 Windows 副本（本仓库）：开发端口 8021 / 5181
+### 7. 开发端口约定：8021 / 5181
 
-上表为**默认端口**；本仓库在 Windows 上的日常开发与浏览器验收统一使用下面的端口，避免与另一个独立项目（8000 / 5173）互相串台：
+日常开发与浏览器验收统一使用这两个端口：
 
 ```bash
 # 后端：在仓库根目录执行（使用根目录 .venv；需要根目录存在 .env）
 .venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8021 --reload
 
-# 前端：在 frontend/ 目录执行
-npm run dev -- --host 127.0.0.1 --port 5181 --strictPort
+# 前端：在 frontend/ 目录执行（vite.config.ts 的 server.port 已是 5181）
+npm run dev
 ```
 
-- `8021` / `5181` 是**当前 Windows 副本**的开发端口；`8000` / `5173` 属另一个独立项目，请勿混用。
-- **Docker 容器内部端口保持 `8000` 不变**（容器内 backend 服务与 healthcheck 均按 8000 设计），不要把容器端口改成 8021。
-- Vite 的**默认**端口仍是 `5173`（`frontend/vite.config.ts`），上面的 `--port 5181` 是命令行覆盖。
-- 根 `.env` **不需要**添加 `PORT`：后端监听端口完全由 uvicorn 的 `--port` 决定。
-- 启动一律在**当前项目根目录**、使用根目录的 `.venv`（`backend.main:app` 需以仓库根为工作目录）。
+- 后端 **8021**：日常开发以 `uvicorn --port` 为唯一实际生效来源；
+  `python backend/main.py` 使用 `DevelopmentConfig.PORT`（默认 8021，可用 `PORT` 环境变量覆盖）。
+  根 `.env` 不需要写 `PORT`。
+- **绑定范围差异**：直接运行 `python backend/main.py` 时，`DevelopmentConfig.HOST` 默认为
+  `0.0.0.0`（监听所有网卡，局域网可访问）；而上面的 uvicorn 命令与启动脚本使用
+  `127.0.0.1`（仅本机）。如需仅本机访问，用 `HOST=127.0.0.1 python backend/main.py`
+  或直接使用 uvicorn 命令。
+- 前端 **5181**：`frontend/vite.config.ts` 的 `server.port`；`/api` 代理指向 `http://127.0.0.1:8021`。
+- **Docker 容器内部端口保持 `8000` 不变**（容器内 backend 服务与 healthcheck 均按 8000 设计），
+  不要把镜像内端口改成 8021；对外仍由 nginx 的 80 端口暴露。
+- 启动一律在**项目根目录**、使用根目录的 `.venv`（`backend.main:app` 需以仓库根为工作目录）。
 
 ---
 
 ## API 概览
 
-完整、始终最新的接口定义请以 **`http://localhost:8000/docs`（Swagger）** 为准。
+完整、始终最新的接口定义请以 **`http://127.0.0.1:8021/docs`（Swagger）** 为准。
 
 | 分组 | 主要端点 |
 |------|----------|
@@ -265,7 +273,7 @@ docker-compose down
 | [docs/testing.md](docs/testing.md) | 测试策略与运行方法 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 常见问题排查 |
 
-> 部分文档中的路径 / 端口可能滞后于实现，冲突时以本文档与 `http://localhost:8000/docs` 为准。
+> 部分文档中的路径 / 端口可能滞后于实现，冲突时以本文档与 `http://127.0.0.1:8021/docs` 为准。
 
 ---
 

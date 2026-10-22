@@ -55,7 +55,7 @@ class TestingConfig:
     # ========== 文件上传配置 ==========
     # 使用临时上传目录
     UPLOAD_FOLDER: str = os.getenv('TEST_UPLOAD_FOLDER', str(tempfile.gettempdir() / Path('test_uploads')))
-    MAX_CONTENT_LENGTH: int = 10 * 1024 * 1024  # 10MB
+    # 上传大小上限已统一到 settings.MAX_UPLOAD_SIZE（B2-B）
     ALLOWED_EXTENSIONS: set = {'.txt', '.pdf', '.docx', '.xlsx', '.csv', '.jpg', '.png'}
 
     # ========== 会话配置 ==========

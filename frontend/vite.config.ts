@@ -15,10 +15,11 @@ export default defineConfig({
     }
   },
   server: {
-    port: 5173,
+    // 开发端口统一为 5181（与 README / start*.ps1 / .env.development 一致）
+    port: 5181,
     proxy: {
       '/api': {
-        // 本副本 Windows 开发后端为 8021；Docker 容器内部仍是 8000（勿同步修改）。
+        // 开发后端为 8021；Docker 容器内部仍是 8000（勿同步修改）。
         target: 'http://127.0.0.1:8021',
         changeOrigin: true
         // 后端路由前缀本身就是 /api/v1，无需 rewrite；

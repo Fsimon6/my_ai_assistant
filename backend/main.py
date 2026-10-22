@@ -42,10 +42,13 @@ logger = logging.getLogger(__name__)
 
 # 导入配置
 try:
-    from backend.config import Config
+    # EFFECTIVE_ENV 与 Config 出自**同一个**解析结果（backend/config/__init__.py），
+    # 启动日志与配置类选择不会出现两种口径。
+    from backend.config import Config, env as EFFECTIVE_ENV
     print('√ 配置加载成功')
 except Exception as e:
     print(f'× 配置加载失败：{e}')
+    EFFECTIVE_ENV = 'development'
     # 创建默认配置
     class Config:
         PROJECT_NAME = '我的AI知识库助手'
@@ -82,7 +85,7 @@ def log_startup_configuration() -> None:
     key_state = 'true' if (settings.API_KEY or '').strip() else 'false'
     logger.info(
         'configuration loaded at startup（改 .env 需重启进程才生效）\n'
-        '  environment        = %s\n'
+        '  environment        = %s (config class = %s)\n'
         '  llm.provider       = %s\n'
         '  llm.model          = %s\n'
         '  llm.base_host      = %s\n'
@@ -92,7 +95,8 @@ def log_startup_configuration() -> None:
         '  api_key_configured = %s\n'
         '  cors_origins       = %s\n'
         '  vector_db_path     = %s',
-        settings.ENVIRONMENT,
+        EFFECTIVE_ENV,
+        Config.__name__,
         settings.LLM_PROVIDER,
         settings.LLM_MODEL,
         _base_host(settings.LLM_BASE_URL),

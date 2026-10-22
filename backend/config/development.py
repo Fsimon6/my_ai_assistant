@@ -25,7 +25,8 @@ class DevelopmentConfig:
     APP_DESCRIPTION: str = '基于大模型的本地知识库智能问答助手API'
     API_V1_PREFIX: str = '/api/v1'
     HOST: str = os.getenv('HOST', '0.0.0.0')
-    PORT: int = int(os.getenv('PORT', '8080'))
+    # 开发默认端口：与 README / 启动脚本 / Vite 代理保持一致（8021）
+    PORT: int = int(os.getenv('PORT', '8021'))
 
     # 基础配置
     # F1：DEBUG 委托给统一配置（`.env` 的 DEBUG 生效）；统一配置不可用时保持原默认 True。
@@ -66,7 +67,7 @@ class DevelopmentConfig:
 
     # 文件上传配置
     UPLOAD_FOLDER = str(BASE_DIR / 'data' / 'uploads')
-    MAX_CONTENT_LENGTH = 50 * 1024 * 1024   # 50MB
+    # 上传大小上限已统一到 settings.MAX_UPLOAD_SIZE（B2-B）
     ALLOWED_EXTENSIONS = {'.txt', '.pdf', '.doc', '.docx',
                           '.xls', '.xlsx', '.ppt', '.pptx',
                           '.md', '.json', '.xml', '.csv'

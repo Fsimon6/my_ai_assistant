@@ -1,146 +1,76 @@
-# Ò»¼üÆô¶¯½Å±¾£¨ÊÊÓÃÓÚGit Bash/WSL£©
+#!/usr/bin/env bash
+# ä¸€é”®å¯åŠ¨ï¼ˆGit Bash / WSLï¼‰ï¼šåç«¯ 8021 + å‰ç«¯ 5181
+# è¯´æ˜ï¼š
+#   * åç«¯ç«¯å£ç”± `uvicorn --port` æ˜¾å¼æŒ‡å®šï¼ˆå¼€å‘ç¯å¢ƒçš„å”¯ä¸€å®é™…ç”Ÿæ•ˆæ¥æºï¼‰ï¼›
+#   * `.env` åœ¨è¿›ç¨‹å¯åŠ¨æ—¶è¯»å–ä¸€æ¬¡ï¼Œæ”¹å®Œéœ€é‡è·‘æœ¬è„šæœ¬ï¼›
+#   * å‰ç«¯ç«¯å£æ¥è‡ª frontend/vite.config.ts çš„ server.portï¼ˆ5181ï¼‰ã€‚
+set -u
 
-echo "================================"
-echo " ÎÒµÄAIÖªÊ¶¿âÖúÊÖ - Æô¶¯½Å±¾"
-echo "================================"
-echo ""
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
 
-# ÑÕÉ«¶¨Òå
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-BLUE='\033[0;34m'
 NC='\033[0m'
 
-# ¼ì²éPython
-check_python() {
-  if ! command -v python &> /dev/null; then
-    echo -e "${RED} PythonÎ´°²×°${NC}"
-    exit 1
-  fi
+BACKEND_PORT=8021
+FRONTEND_PORT=5181
 
-  python_version=$(python --version 2>&1 | cut -d' ' -f2)
-  echo -e "${GREEN} Python$python_version${NC}"
-}
+if [ ! -f "$ROOT/.env" ]; then
+  echo -e "${YELLOW}æœªæ‰¾åˆ°æ ¹ç›®å½• .envï¼šè¯·å…ˆå¤åˆ¶ .env.example ä¸º .env å¹¶å¡«å†™ JWT_SECRET / API_KEY${NC}"
+  exit 1
+fi
 
-# ¼ì²éNode.js
-check_node() {
-  if ! command -v node &> /dev/null; then
-    echo -e "${RED} Node.jsÎ´°²×°${NC}"
-    exit 1
-  fi
+PY="$ROOT/.venv/Scripts/python.exe"
+[ -x "$PY" ] || PY="$ROOT/.venv/bin/python"
+if [ ! -x "$PY" ]; then
+  echo -e "${RED}æœªæ‰¾åˆ° .venv Pythonï¼šè¯·å…ˆåˆ›å»ºè™šæ‹Ÿç¯å¢ƒå¹¶å®‰è£… backend/requirements.txt${NC}"
+  exit 1
+fi
 
-  node_version=$(node --version)
-  echo -e "${GREEN} Node.js $node_version${NC}"
-}
+# é¦–æ¬¡åˆå§‹åŒ–ï¼šä»…å½“ SQLite æ•°æ®åº“æ–‡ä»¶å°šä¸å­˜åœ¨æ—¶æ‰§è¡Œï¼ˆå·²å­˜åœ¨çš„åº“ä¸ä¼šé‡å¤åˆå§‹åŒ–ï¼‰ã€‚
+# **å­˜åœ¨æ€§åˆ¤æ–­ç”± Python å®Œæˆ**ï¼šå®æµ‹ Git Bash ä¸‹ Python è¾“å‡ºçš„ä¸­æ–‡/åæ–œæ è·¯å¾„
+# ç»å‘½ä»¤æ›¿æ¢åï¼ŒBash çš„ `-f` ä¼šæŠŠå®é™…å­˜åœ¨çš„åº“è¯¯åˆ¤ä¸ºä¸å­˜åœ¨ï¼ˆä»“åº“è·¯å¾„å«"å‰¯æœ¬"ï¼‰ã€‚
+# å› æ­¤è¿™é‡Œåªå‘ Bash è¿”å› ASCII çŠ¶æ€ï¼ŒBash ä¸å†å¯¹ Windows è·¯å¾„åšæ–‡ä»¶åˆ¤æ–­ã€‚
+DB_STATE="$("$PY" - <<'PY'
+import os
+import sys
 
-# ¼ì²é»·¾³ÎÄ¼ş
-check_env() {
-  if [ ! -f "backend/.env" ] && [ -f "backend/.env.example" ]; then
-    echo -e "${YELLOW} Î´ÕÒµ½.envÎÄ¼ş£¬´ÓÊ¾Àı´´½¨${NC}"
-    cp backend/.env.example backend/.env
-    echo -e "${YELLOW} Çë±à¼­ backend/.env ÎÄ¼şÅäÖÃAPIÃÜÔ¿${NC}"
-  fi
-}
+sys.path.insert(0, os.getcwd())
+from backend.config.settings import settings  # noqa: E402
 
-# Æô¶¯ºó¶Ë
-start_backend() {
-  echo -e "\n${BLUE} Æô¶¯ºó¶Ë·şÎñ...${NC}"
-  cd backend
+url = (settings.DATABASE_URL or '').strip()
+prefix = 'sqlite:///'
+if not url.startswith(prefix):
+    print('NON_SQLITE')
+else:
+    path = url[len(prefix):]
+    absolute = os.path.abspath(path) if not os.path.isabs(path) else path
+    print('EXISTS' if os.path.exists(absolute) else 'MISSING')
+PY
+)"
+if [ "$DB_STATE" = "MISSING" ]; then
+  echo -e "${YELLOW}é¦–æ¬¡å¯åŠ¨ï¼šåˆå§‹åŒ–æ•°æ®åº“ä¸ç®¡ç†å‘˜è´¦å·ï¼ˆpython -m backend.init_dbï¼‰${NC}"
+  "$PY" -m backend.init_db
+elif [ "$DB_STATE" = "NON_SQLITE" ]; then
+  echo -e "${YELLOW}é SQLite çš„ DATABASE_URLï¼šè¯·æŒ‰éƒ¨ç½²æ–‡æ¡£æ‰‹åŠ¨æ‰§è¡Œä¸€æ¬¡ python -m backend.init_db${NC}"
+fi
 
-  # ¼ì²éĞéÄâ»·¾³
-  if [ -d "venv" ]; then
-    source venv/Scripts/activate 2>/dev/null || source venv/bin/activate
-  else
-    echo -e "${YELLOW} Î´ÕÒµ½ĞéÄâ»·¾³£¬Ê¹ÓÃÏµÍ³Python${NC}"
-  fi
+echo -e "${GREEN}backend  -> http://127.0.0.1:${BACKEND_PORT}${NC}"
+"$PY" -m uvicorn backend.main:app --host 127.0.0.1 --port "$BACKEND_PORT" --reload &
+BACKEND_PID=$!
 
-  # ¼ì²éÊı¾İ¿â
-  if [ ! -f "my_ai_assistant.db" ]; then
-    echo -e "${YELLOW} ³õÊ¼»¯Êı¾İ¿â...${NC}"
-    python init_db.py
-  fi
+echo -e "${GREEN}frontend -> http://127.0.0.1:${FRONTEND_PORT}${NC}"
+( cd "$ROOT/frontend" && npm run dev ) &
+FRONTEND_PID=$!
 
-  # Æô¶¯ºó¶Ë(ºóÌ¨ÔËĞĞ)
-  python main.py &
-  BACKEND_PID=$!
-  cd ..
-
-  echo -e "${GREEN} ºó¶Ë·şÎñÆô¶¯ £¨PID: $BACKEND_PID)${NC}"
-  echo " http://localhost:8000"
-  echo " http://localhost:8000/docs"
-}
-
-# Æô¶¯Ç°¶Ë
-start_frontend() {
-  echo -e "\n${BLUE} Æô¶¯Ç°¶Ë·şÎñ...${NC}"
-  cd frontend
-
-  # ¼ì²énode_modules
-  if [ ! -d "node_modules" ]; then
-    echo -e "${YELLOW} °²×°Ç°¶ËÒÀÀµ...${NC}"
-    npm install
-  fi
-
-  # Æô¶¯Ç°¶Ë£¨ºóÌ¨ÔËĞĞ£©
-  npm run dev &
-  FRONTEND_PID=$!
-  cd ..
-
-  echo -e "${GREEN} Æô¶¯Ç°¶Ë·şÎñ (PID: $FRONTEND_PID)${NC}"
-  echo " http://localhost:5173"
-}
-
-# ÏÔÊ¾×´Ì¬
-show_status() {
-  echo -e "\n${BLUE} ·şÎñ×´Ì¬${NC}"
-  echo "=================================="
-  echo -e "ºó¶Ë: http://localhost:8000"
-  echo -e "APIÎÄµµ: http://localhost:8000/docs"
-  echo -e "Ç°¶Ë: http://localhost:5173"
-  echo "=================================="
-  echo -e "${YELLOW}°´ Ctrl+C Í£Ö¹ËùÓĞ·şÎñ${NC}"
-}
-
-# ÇåÀí½ø³Ì
 cleanup() {
-  echo -e "\n${YELLOW} Í£Ö¹·şÎñ...${NC}"
-  if [ ! -z "$BACKEND_PID" ]; then
-    kill $BACKEND_PID 2>/dev/null
-    echo "ºó¶ËÒÑÍ£Ö¹"
-  fi
-
-  if [ ! -z "FRONTEND_PID" ]; then
-    kill $FRONTEND_PID 2>/dev/null
-    echo "Ç°¶ËÒÑÍ£Ö¹"
-  fi
-
-  echo -e "${GREEN} ·şÎñÒÑÍ£Ö¹${NC}"
+  echo -e "\n${YELLOW}åœæ­¢æœåŠ¡...${NC}"
+  kill "$BACKEND_PID" "$FRONTEND_PID" 2>/dev/null
   exit 0
 }
+trap cleanup INT TERM
 
-# ÉèÖÃÇåÀí¹³×Ó
-trap cleanup SIGINT SIGTERM
-
-# Ö÷º¯Êı
-main() {
-  echo -e "${BLUE} ¼ì²é»·¾³...${NC}"
-  check_python
-  check_node
-  check_env
-
-  start_backend
-
-  # µÈ´ıºó¶ËÆô¶¯
-  echo -e "\n${YELLOW} µÈ´ıºó¶ËÆô¶¯...${NC}"
-  sleep 3
-
-  start_frontend
-  show_status
-
-  # µÈ´ıÓÃ»§ÖĞ¶Ï
-  wait
-}
-
-# Ö´ĞĞÖ÷º¯Êı
-main
+echo -e "${YELLOW}Ctrl+C åœæ­¢ï¼›åç«¯ :${BACKEND_PORT}ï¼Œå‰ç«¯ :${FRONTEND_PORT}${NC}"
+wait
