@@ -91,7 +91,6 @@ def log_startup_configuration() -> None:
         '  llm.base_host      = %s\n'
         '  llm.temperature    = %s\n'
         '  embedding.model    = %s\n'
-        '  embedding.provider = %s\n'
         '  api_key_configured = %s\n'
         '  cors_origins       = %s\n'
         '  vector_db_path     = %s',
@@ -102,7 +101,6 @@ def log_startup_configuration() -> None:
         _base_host(settings.LLM_BASE_URL),
         settings.LLM_TEMPERATURE,
         settings.EMBEDDING_MODEL,
-        settings.EMBEDDING_PROVIDER,
         key_state,
         ','.join(settings.BACKEND_CORS_ORIGINS or []) if isinstance(
             settings.BACKEND_CORS_ORIGINS, (list, tuple)) else settings.BACKEND_CORS_ORIGINS,
@@ -120,10 +118,12 @@ async def lifespan(app: FastAPI):
     # 生效配置可见性（不打印任何密钥内容）
     log_startup_configuration()
 
-    # 创建必要目录（F1：向量库目录取自统一配置，不再硬编码；
-    # data/uploads 为历史遗留目录，保持原行为不动）
+    # 创建必要目录（F1：向量库目录取自统一配置，不再硬编码）。
+    # 上传临时目录优先使用 settings.UPLOAD_TEMP_DIR（testing 必须隔离）；
+    # 留空时保持原有 ./data/uploads 行为。
     os.makedirs(settings.VECTOR_DB_PATH or './data/chroma_db', exist_ok=True)
-    os.makedirs('./data/uploads', exist_ok=True)
+    upload_temp_dir = (settings.UPLOAD_TEMP_DIR or '').strip()
+    os.makedirs(upload_temp_dir or './data/uploads', exist_ok=True)
 
     # 启动时创建数据库表（init_db 内部会导入所有模型，确保 Base.metadata 已注册）
     from backend.database.base import init_db

@@ -75,6 +75,12 @@ else:   # development
 # 导出配置实例
 config = Config()
 
+# testing 必须在任何 database.base / logger 导入产生副作用之前完成路径校验。
+# 该模块是 backend.config.settings 的父包：database/base.py 与 main.py 在导入
+# settings 时都会先执行到这里。开发/生产环境保持原有“lifespan 校验”时序。
+if env == ENV_TESTING:
+    Config.validate_config()
+
 # 导出配置类
 __all__ = ['config', 'Config', 'get_env', 'normalize_env', 'env',
            'ENV_DEVELOPMENT', 'ENV_PRODUCTION', 'ENV_TESTING']

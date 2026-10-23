@@ -5,6 +5,7 @@ from fastapi.exceptions import RequestValidationError
 import logging
 import traceback
 
+from backend.config import ENV_PRODUCTION, get_env
 from backend.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -82,8 +83,13 @@ async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f'异常信息：{str(exc)}')
     logger.error(f'请求客户端：{request.client}')
 
-    # F1：统一从配置入口读取（原先用 os.getenv 读 → 写在 .env 里的 DEBUG 不生效）
-    is_debug = bool(settings.DEBUG)
+    # F1：统一从配置入口读取（原先用 os.getenv 读 → 写在 .env 里的 DEBUG 不生效）。
+    # 生产环境额外硬隔离：即使 Settings.DEBUG=true（.env / 进程环境变量误配），
+    # 也绝不向客户端返回 traceback 或内部异常信息。环境值复用配置类选择所用的
+    # get_env()，因此带空白、大小写等写法与“实际生效环境”保持一致。
+    effective_env = get_env()
+    is_production = effective_env == ENV_PRODUCTION
+    is_debug = bool(settings.DEBUG) and not is_production
 
     if isinstance(exc, AppException):
         status_code = exc.status_code
@@ -131,7 +137,8 @@ async def global_exception_handler(request: Request, exc: Exception):
             'error': {
                 'code': 'ERR_INTERNAL',
                 'message': str(exc) if is_debug else '服务器内部错误，请稍后重试',
-                'type': type(exc).__name__,
+                # 生产环境连异常类名也不返回，避免泄露数据库/驱动等实现信息。
+                'type': type(exc).__name__ if not is_production else 'InternalServerError',
             },
             'timestamp': datetime.now().isoformat(),
         }

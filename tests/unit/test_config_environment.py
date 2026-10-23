@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +25,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: 固定的非真实测试密钥（仅用于子进程构造 Settings / 启动 ProductionConfig）
 TEST_JWT_SECRET = 'unit-test-only-secret'
+#: testing 配置预校验需要完整的隔离路径；这些路径不需要提前创建。
+TESTING_ROOT = Path(tempfile.gettempdir()) / 'b1_testing_paths'
+TESTING_PATHS = {
+    'TEST_ISOLATION_ROOT': str(TESTING_ROOT),
+    'TEST_DATABASE_URL': 'sqlite:///' + (TESTING_ROOT / 'test.db').as_posix(),
+    'TEST_VECTOR_DB_PATH': str(TESTING_ROOT / 'chroma'),
+    'TEST_UPLOAD_FOLDER': str(TESTING_ROOT / 'uploads'),
+    'TEST_LOG_FILE': str(TESTING_ROOT / 'logs' / 'app.log'),
+    'TEST_EXCEL_DATA_ROOT': str(TESTING_ROOT / 'excel'),
+}
 
 EXPECTED_CONFIG_CLASS = {
     'development': 'DevelopmentConfig',
@@ -142,10 +153,22 @@ def _run(code: str, env_overrides: Optional[dict] = None):
     - `ENVIRONMENT` 只由 `env_overrides` 指定，未指定时等同于“未设置”。
     """
     env = dict(os.environ)
-    for key in ('ENVIRONMENT', 'JWT_SECRET', 'DATABASE_URL', 'LLM_MODEL'):
+    for key in (
+        'ENVIRONMENT', 'JWT_SECRET', 'DATABASE_URL', 'LLM_MODEL',
+        'VECTOR_DB_PATH', 'UPLOAD_TEMP_DIR', 'LOG_FILE', 'EXCEL_DATA_ROOT',
+        'LLM_PROVIDER', 'API_KEY', 'TEST_ISOLATION_ROOT',
+        'TEST_DATABASE_URL', 'TEST_VECTOR_DB_PATH', 'TEST_UPLOAD_FOLDER',
+        'TEST_LOG_FILE', 'TEST_EXCEL_DATA_ROOT', 'TEST_LLM_PROVIDER',
+        'TEST_LLM_MODEL', 'TEST_LLM_BASE_URL',
+    ):
         env.pop(key, None)
     env['JWT_SECRET'] = TEST_JWT_SECRET
     env.update(env_overrides or {})
+    # testing 现在会在 backend.config 初始化阶段 fail-fast；配置类选择
+    # 用例也必须提供完整合法隔离路径，否则导入即被拒绝。
+    if str(env.get('ENVIRONMENT', '')).strip().lower() == 'testing':
+        for key, value in TESTING_PATHS.items():
+            env.setdefault(key, value)
     env['PYTHONPATH'] = str(REPO_ROOT)
     env['PYTHONIOENCODING'] = 'utf-8'
     env['PYTHONUTF8'] = '1'

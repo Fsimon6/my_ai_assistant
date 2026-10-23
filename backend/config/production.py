@@ -19,8 +19,6 @@ from backend.config.settings import settings
 class ProductionConfig:
     """生产环境配置"""
 
-    ENVIRONMENT = 'production'
-
     # 服务器配置
     DEBUG = False
     HOST = os.getenv('HOST', '0.0.0.0')
@@ -40,34 +38,13 @@ class ProductionConfig:
         h.strip() for h in os.getenv('ALLOWED_HOSTS', '').split(',') if h.strip()
     ]
 
-    # CORS 配置（生产可配置，默认来自 environment，不允许 '*'）
-    BACKEND_CORS_ORIGINS = settings.BACKEND_CORS_ORIGINS
-
     # 数据库配置
     DATABASE_URL = settings.DATABASE_URL
-    VECTOR_DB_PATH = os.getenv('VECTOR_DB_PATH', './data/chroma_db')
-
-    # 缓存配置
-    REDIS_URL = os.getenv('REDIS_URL', 'redis://redis:6379/0')
-
-    # 日志配置
-    LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-    LOG_FILE = os.getenv('LOG_FILE', '/app/logs/ai_assistant.log')
 
     # 大模型配置（通用 API_KEY 驱动）
     LLM_PROVIDER = settings.LLM_PROVIDER
-    LLM_MODEL = settings.LLM_MODEL
-    LLM_BASE_URL = settings.LLM_BASE_URL
     API_KEY = settings.API_KEY
     # LLM_TIMEOUT / MAX_UPLOAD_SIZE 已统一到 pydantic Settings（唯一来源，`.env` 可配）
-
-    # 文件上传类型（大小上限见 settings.MAX_UPLOAD_SIZE）
-    ALLOWED_FILE_TYPES = ['.pdf', '.txt', '.docx', '.md']
-
-    # 频率限制
-    RATE_LIMIT_ENABLED = True
-    RATE_LIMIT_REQUESTS = 100   # 每分钟请求数
-    RATE_LIMIT_PERIOD = 60      # 秒
 
     @classmethod
     def validate_config(cls):

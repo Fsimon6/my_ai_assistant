@@ -1,6 +1,7 @@
+import os
 from pathlib import Path
 from typing import Literal
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: .env 固定指向**项目根目录**下的 .env。
@@ -47,12 +48,8 @@ class Settings(BaseSettings):
     # 数据库
     DATABASE_URL: str = "sqlite:///./my_ai_assistant.db"
 
-    # Redis
-    REDIS_URL: str | None = None
-
     # 向量数据库
     VECTOR_DB_PATH: str = "./data/chroma_db"
-    VECTOR_DB_COLLECTION: str = "documents"
 
     # 大模型供应商（通用 API_KEY 驱动 OpenAI 兼容接口）
     LLM_PROVIDER: Literal["openai", "dashscope", "zhipu", "ollama", "local"] = "openai"
@@ -81,10 +78,7 @@ class Settings(BaseSettings):
     INIT_ADMIN_EMAIL: str = "admin@example.com"
 
     # 嵌入模型（EMBEDDING_MODEL 仅用于 Embedding，与 LLM_MODEL（Chat）解耦）
-    EMBEDDING_PROVIDER: str = "local"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_DIMENSIONS: int = 512
-    EMBEDDING_DEVICE: str = "cpu"
 
     # CORS
     BACKEND_CORS_ORIGINS: list[str] | str = []
@@ -95,6 +89,53 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [i.strip() for i in v.split(",")]
         return v
+
+    @model_validator(mode="after")
+    def apply_testing_aliases(self):
+        """testing 环境保留 TEST_* 兼容变量，并映射到实际运行字段。
+
+        优先级：显式 ``TEST_*`` 进程环境变量 > 标准 Settings 字段
+        （进程环境变量 / 根 .env / 默认值）。只在 ``ENVIRONMENT=testing``
+        时应用，开发/生产不会读取测试路径。映射后的值会直接参与后续
+        业务运行与 TestingConfig 隔离校验，避免“校验一套、运行另一套”。
+        """
+        if str(self.ENVIRONMENT or "").strip().lower() != "testing":
+            return self
+
+        aliases = {
+            "DATABASE_URL": "TEST_DATABASE_URL",
+            "VECTOR_DB_PATH": "TEST_VECTOR_DB_PATH",
+            "UPLOAD_TEMP_DIR": "TEST_UPLOAD_FOLDER",
+            "LOG_FILE": "TEST_LOG_FILE",
+            "EXCEL_DATA_ROOT": "TEST_EXCEL_DATA_ROOT",
+            "LLM_PROVIDER": "TEST_LLM_PROVIDER",
+            "LLM_MODEL": "TEST_LLM_MODEL",
+            "LLM_BASE_URL": "TEST_LLM_BASE_URL",
+        }
+        for field_name, env_name in aliases.items():
+            value = os.getenv(env_name)
+            if value is None or not value.strip():
+                continue
+            if field_name == "LLM_PROVIDER":
+                allowed = {"openai", "dashscope", "zhipu", "ollama", "local"}
+                if value not in allowed:
+                    raise ValueError(
+                        f'{env_name}={value!r} 不受支持（可选：{sorted(allowed)}）'
+                    )
+            setattr(self, field_name, value)
+
+        # testing 默认关闭文件日志：否则 main 导入时的 setup_logging 会在
+        # lifespan 校验之前写入项目 logs/app.log。显式 LOG_FILE/TEST_LOG_FILE
+        # 仍按上面的规则使用，并由 TestingConfig 校验其位于隔离根目录内。
+        #
+        # 空白值（空字符串、纯空格）统一规范为空：logger.py 使用
+        # `if settings.LOG_FILE` 而不是 strip 后判断；若保留 ' '，校验会
+        # 视为未配置而通过，但 logger 仍会尝试创建空白路径。
+        if 'LOG_FILE' not in self.model_fields_set and not (os.getenv('TEST_LOG_FILE') or '').strip():
+            self.LOG_FILE = ''
+        elif not (self.LOG_FILE or '').strip():
+            self.LOG_FILE = ''
+        return self
 
     # 日志
     # P-3：默认开启文件日志（可运维/可回溯）。同时写控制台与文件（轮转）。
