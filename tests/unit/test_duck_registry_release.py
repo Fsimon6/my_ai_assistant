@@ -225,7 +225,7 @@ class _FakeVectorStore:
     def __init__(self):
         self.deleted: List[Any] = []
 
-    async def delete_documents(self, document_ids, user_id=None):
+    async def delete_documents(self, document_ids, user_id=None, strict=False):
         self.deleted.append((list(document_ids), user_id))
         return len(document_ids)
 

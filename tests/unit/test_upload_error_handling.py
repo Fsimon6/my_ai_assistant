@@ -115,7 +115,7 @@ class FakeVectorStore:
         self.added.extend(documents)
         return [d['id'] for d in documents]
 
-    async def delete_documents(self, document_ids, user_id=None):
+    async def delete_documents(self, document_ids, user_id=None, strict=False):
         self.deleted.append((list(document_ids), user_id))
         return len(document_ids)
 
@@ -160,8 +160,8 @@ def test_excel_upload_success(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(not SMALL_REAL.exists(), reason='缺少真实测试表格')
-def test_excel_upload_embedding_failure_leaves_no_residue(tmp_path, monkeypatch):
-    """embedding 欠费：必须明确报错 + 不留半成品（目录/临时文件/向量都不留）。"""
+def test_excel_upload_embedding_failure_keeps_local_and_records_index_failure(tmp_path, monkeypatch):
+    """embedding 欠费：本地 Excel 保留，仅在 meta 记录索引失败，并尝试清理向量。"""
     from backend.excel import store as excel_store
     from backend.services.vector_service import EmbeddingError
 
@@ -174,15 +174,23 @@ def test_excel_upload_embedding_failure_leaves_no_residue(tmp_path, monkeypatch)
     out = asyncio.run(svc.process_and_store_document(
         file_path=str(upload_copy), user_id=7, original_filename=SMALL_REAL.name, file_size=1234))
 
-    assert out['success'] is False
-    assert out['error_code'] == 'EMBEDDING_QUOTA_EXCEEDED'
-    assert out['http_status'] == 503
-    assert '额度' in out['message']
+    assert out['success'] is True
+    assert out['index_status'] == 'index_failed'
+    assert out['partial'] is True
+    assert out['index_error_code'] == 'EMBEDDING_QUOTA_EXCEEDED'
+    assert '额度' in (out.get('index_message') or '')
     assert 'sk-' not in json.dumps(out, ensure_ascii=False, default=str)
-    # 无半成品
-    assert list(tmp_path.glob('*/representation.json')) == []
+
+    # 本地 artifacts 仍存在，临时上传文件被清理。
+    doc_dir = tmp_path / out['document_id']
+    assert (doc_dir / 'representation.json').exists()
+    assert (doc_dir / 'original.xlsx').exists()
     assert not upload_copy.exists()
-    # 向量侧被显式清理（按 document_id）
+    meta = excel_store.load_meta(out['document_id'])
+    assert meta['index_status'] == 'index_failed'
+    assert meta['vector_write_started'] is False
+
+    # 向量侧被显式清理（按 document_id）。
     assert vs.deleted and len(vs.deleted[0][0]) == 1
 
 

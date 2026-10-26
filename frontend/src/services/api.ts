@@ -47,6 +47,10 @@ export interface RagUploadResult {
   message?: string
   filename?: string
   total_chunks?: number
+  doc_kind?: string
+  partial?: boolean
+  index_status?: 'pending' | 'indexing' | 'indexed' | 'index_failed' | 'unknown' | string
+  index_error_code?: string
   [key: string]: any
 }
 
@@ -509,9 +513,21 @@ export const ragApi = {
   },
 
   // 获取当前用户的真实文档列表（按 user_id 隔离，聚合自向量库 metadata）
-  getDocuments: async (): Promise<{ success?: boolean; documents?: any[]; total?: number }> => {
+  getDocuments: async (): Promise<{
+    success?: boolean
+    documents?: any[]
+    total?: number
+    partial?: boolean
+    warnings?: string[]
+  }> => {
     const res = await api.get('/rag/documents', { timeout: TIMEOUT_DATA_MS })
-    return res as unknown as { success?: boolean; documents?: any[]; total?: number }
+    return res as unknown as {
+      success?: boolean
+      documents?: any[]
+      total?: number
+      partial?: boolean
+      warnings?: string[]
+    }
   }
 }
 

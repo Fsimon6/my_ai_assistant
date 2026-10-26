@@ -55,9 +55,8 @@ async def upload_document(
 ):
     """上传并处理文档（需登录；文档归属当前用户）"""
     try:
-        rag_service = get_rag_service()
-
-        # 验证文件类型（普通文档 + 表格文件）
+        # 验证文件类型（普通文档 + 表格文件）。
+        # 先做不依赖外部服务的基础校验，避免非法扩展名触发 RAG/Chroma 初始化。
         allowed_types = ['.pdf', '.txt', '.docx', '.md', '.xlsx', '.xls', '.csv', '.tsv']
         file_ext = '.' + file.filename.split('.')[-1] if '.' in file.filename else ''
 
@@ -66,6 +65,9 @@ async def upload_document(
                 status_code=400,
                 detail=f'不支持的文件类型。支持的类型：{",".join(allowed_types)}'
             )
+
+        # RagService 构造本身已不再初始化 LLM/Chroma；此处只为后续处理取得轻量实例。
+        rag_service = get_rag_service()
 
         # 保存文件
         file_path = await save_uploaded_file(file)
@@ -96,18 +98,23 @@ async def upload_document(
         )
 
         if result['success']:
+            index_message = result.get('index_message') or ''
             response = {
                 'success': True,
-                'message': '文档处理成功',
+                'message': index_message or '文档处理成功',
                 'document_id': result['document_id'],
                 'chunk_ids': result.get('chunk_ids'),
                 'filename': result['filename'],
                 'total_chunks': result['total_chunks'],
                 'doc_kind': result.get('doc_kind', 'document'),
+                'partial': bool(result.get('partial', False)),
             }
-            # 表格文件（Phase 1A）附加 Representation 摘要信息
+            # 表格文件（Phase 1A）附加 Representation / 索引状态信息
             if result.get('doc_kind') == 'excel':
                 response.update({
+                    'local_status': result.get('local_status', 'ready'),
+                    'index_status': result.get('index_status'),
+                    'index_error_code': result.get('index_error_code', ''),
                     'file_type': result.get('file_type'),
                     'sheet_count': result.get('sheet_count'),
                     'total_rows': result.get('total_rows'),
@@ -411,38 +418,115 @@ async def delete_documents(
     req: DeleteDocumentsRequest,
     current_user: User = Depends(get_current_active_user)
 ):
-    """删除文档（需登录；仅删除归属当前用户的文档）"""
+    """删除文档（需登录；仅删除归属当前用户的文档）。
+
+    Excel 本地文档必须先确认向量删除完成（或可靠记录为从未开始写入），
+    才允许删除本地 artifacts；任何无法确认的步骤都会返回 partial，不虚报完全成功。
+    """
     try:
         from backend.services.vector_service import get_vector_store_manager
-        vector_store = get_vector_store_manager()
-        deleted_count = await vector_store.delete_documents(req.document_ids, user_id=current_user.id)
+        from backend.excel import duck as duck_engine
 
-        # 同步清理归属于当前用户的 Excel 附件（原文件 + representation），避免孤儿文件
+        deleted_vectors = 0
         cleaned_artifacts = 0
         released_resources = 0
-        for doc_id in req.document_ids:
-            # 归属校验（非本人 / 不存在的文档一律不动，保持既有隔离语义）
-            if excel_store.load_representation(doc_id, user_id=current_user.id) is None:
-                continue
-            if excel_store.delete_artifacts(doc_id):
-                cleaned_artifacts += 1
-            # Stage 4：文档已删除 -> 精确释放该文档的 DuckDB 内存资源
-            # （只移除这一个 document_id；失败只记录，不影响"删除成功"这一业务结果）
-            try:
-                from backend.excel import duck as duck_engine
-                if duck_engine.release_document(doc_id):
-                    released_resources += 1
-            except Exception as re:  # noqa: BLE001 - 释放内存失败不能反过来隐藏删除结果
-                logger.warning('释放 DuckDB 文档资源失败（删除仍成功）：document_id=%s %s',
-                               doc_id, re)
+        deleted_documents = 0
+        failed_document_ids: List[str] = []
+        warnings: List[str] = []
+        any_vector_failure = False
+        any_local_failure = False
+        vector_store = None
+        vector_store_error = None
 
+        def _get_vector_store():
+            nonlocal vector_store, vector_store_error
+            if vector_store is not None:
+                return vector_store
+            if vector_store_error is not None:
+                raise vector_store_error
+            try:
+                vector_store = get_vector_store_manager()
+                return vector_store
+            except Exception as exc:  # noqa: BLE001
+                vector_store_error = exc
+                raise
+
+        for doc_id in req.document_ids:
+            representation = excel_store.load_representation(doc_id, user_id=current_user.id)
+            meta = excel_store.load_meta(doc_id) if representation is not None else None
+
+            if representation is not None:
+                # 新代码可靠记录 false 时，文档从未开始向量写入；不必初始化 Chroma。
+                vector_write_started = (meta or {}).get('vector_write_started')
+                needs_vector_delete = vector_write_started is not False
+                vector_confirmed = True
+                vector_deleted = 0
+
+                if needs_vector_delete:
+                    try:
+                        vs = _get_vector_store()
+                        vector_deleted = await vs.delete_documents(
+                            [doc_id], user_id=current_user.id, strict=True
+                        )
+                        deleted_vectors += vector_deleted
+                    except Exception as e:  # noqa: BLE001
+                        any_vector_failure = True
+                        logger.warning('删除 Excel 文档向量失败：document_id=%s %s', doc_id, e)
+                        warnings.append(f'文档 {doc_id} 的向量删除失败，已保留本地文件')
+                        failed_document_ids.append(doc_id)
+                        vector_confirmed = False
+
+                if vector_confirmed:
+                    if excel_store.delete_artifacts(doc_id):
+                        cleaned_artifacts += 1
+                        deleted_documents += 1
+                        try:
+                            if duck_engine.release_document(doc_id):
+                                released_resources += 1
+                        except Exception as re:  # noqa: BLE001
+                            logger.warning('释放 DuckDB 文档资源失败：document_id=%s %s', doc_id, re)
+                    else:
+                        any_local_failure = True
+                        failed_document_ids.append(doc_id)
+                        warnings.append(f'文档 {doc_id} 的本地文件删除失败')
+                continue
+
+            # 非 Excel / 无本地 representation：按原有文档生命周期只删向量。
+            try:
+                vs = _get_vector_store()
+                deleted = await vs.delete_documents(
+                    [doc_id], user_id=current_user.id, strict=True
+                )
+                deleted_vectors += deleted
+                # 0 条也可能是越权 / 不存在；不能把“无可删向量”计成删除了文档。
+                if deleted:
+                    deleted_documents += 1
+            except Exception as e:  # noqa: BLE001
+                any_vector_failure = True
+                logger.warning('删除文档向量失败：document_id=%s %s', doc_id, e)
+                warnings.append(f'文档 {doc_id} 的向量删除失败')
+                failed_document_ids.append(doc_id)
+
+        partial = any_vector_failure or any_local_failure
+        message = (
+            '部分文档未完成删除' if partial
+            else ('文档删除成功' if deleted_documents else '未删除任何归属于当前用户的文档')
+        )
         return {
-            'success': True,
-            'message': '文档删除成功' if deleted_count else '未删除任何归属于当前用户的文档',
+            'success': not partial,
+            'partial': partial,
+            'message': message,
             'delete_ids': req.document_ids,
-            'deleted_count': deleted_count,
+            # 保持既有字段：deleted_count 历史含义 = 实际删除的向量数。
+            'deleted_count': deleted_vectors,
+            'deleted_vectors': deleted_vectors,
+            'deleted_documents_count': deleted_documents,
             'deleted_artifacts': cleaned_artifacts,
             'released_duckdb_resources': released_resources,
+            'vector_delete_confirmed': not any_vector_failure,
+            'local_delete_confirmed': not any_local_failure,
+            'failed_document_ids': failed_document_ids,
+            'warnings': warnings,
             'timestamp': datetime.now().isoformat()
         }
 
@@ -450,7 +534,7 @@ async def delete_documents(
         logger.error(f'删除文档失败：{e}')
         raise HTTPException(
             status_code=500,
-            detail=f'删除文档失败“：{str(e)}'
+            detail=f'删除文档失败：{str(e)}'
         )
 
 
@@ -458,26 +542,88 @@ async def delete_documents(
 async def list_documents(
     current_user: User = Depends(get_current_active_user)
 ):
-    """列出当前用户的文档（需登录；按 user_id 隔离，聚合自 Chroma 向量 metadata）
+    """列出当前用户的文档。
 
-    返回字段（仅 UI 实际需要的）：document_id / filename / type / size / chunks / created_at
+    普通文档继续以 Chroma 为来源；Excel 以本地 catalog/meta 为权威来源。
+    Chroma 不可用时仍返回本地 Excel，并通过 partial/warnings 明确列表不完整。
     """
+    warnings: List[str] = []
+    chroma_docs: List[Dict[str, Any]] = []
+    excel_docs: List[Dict[str, Any]] = []
+    chroma_ok = True
+    catalog_ok = True
+
+    # Chroma 部分单独捕获，不能连同本地 catalog 一起跳过。
     try:
         from backend.services.vector_service import get_vector_store_manager
         vector_store = get_vector_store_manager()
-        docs = vector_store.list_user_documents(user_id=current_user.id)
-        return {
-            'success': True,
-            'documents': docs,
-            'total': len(docs),
-            'timestamp': datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f'列出文档失败：{e}')
-        raise HTTPException(
-            status_code=500,
-            detail=f'列出文档失败：{str(e)}'
+        chroma_docs = vector_store.list_user_documents(
+            user_id=current_user.id,
+            strict=True,
         )
+    except Exception as e:
+        chroma_ok = False
+        logger.error('列出普通文档失败（Chroma 不可用）：%s', e)
+        warnings.append('语义索引列表暂时不可用，普通文档列表可能不完整')
+
+    try:
+        excel_docs = excel_store.list_excel_catalog(
+            user_id=current_user.id,
+            max_docs=None,
+        )
+    except Exception as e:
+        catalog_ok = False
+        logger.error('列出 Excel 本地文档失败：%s', e)
+        warnings.append('本地 Excel 文档列表暂时不可用')
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    chroma_ids = set()
+    catalog_ids = set()
+    for doc in chroma_docs:
+        doc_id = doc.get('document_id')
+        if not doc_id:
+            continue
+        chroma_ids.add(doc_id)
+        merged[doc_id] = dict(doc)
+
+    for local_doc in excel_docs:
+        doc_id = local_doc.get('document_id')
+        if not doc_id:
+            continue
+        catalog_ids.add(doc_id)
+        existing = merged.get(doc_id)
+        if existing:
+            # Excel 本地元数据是文件存在性/大小/状态的权威来源；
+            # Chroma 提供实际 chunk 计数（若本地 meta 尚未更新时作为补充）。
+            merged_doc = dict(existing)
+            merged_doc.update(local_doc)
+            if existing.get('chunks') and not local_doc.get('chunks'):
+                merged_doc['chunks'] = existing['chunks']
+            if existing.get('size') and not local_doc.get('size'):
+                merged_doc['size'] = existing['size']
+            merged[doc_id] = merged_doc
+        else:
+            merged[doc_id] = dict(local_doc)
+
+    # 旧 meta 没有 index_status 时：只有 Chroma 确实有该文档，才可判定已索引。
+    for doc_id, doc in merged.items():
+        if doc.get('kind') != 'excel':
+            continue
+        status = doc.get('index_status')
+        if not status or status == 'unknown':
+            doc['index_status'] = 'indexed' if doc_id in chroma_ids else 'unknown'
+        doc.setdefault('local_available', doc_id in catalog_ids)
+
+    docs = list(merged.values())
+    partial = not chroma_ok or not catalog_ok
+    return {
+        'success': True,
+        'documents': docs,
+        'total': len(docs),
+        'partial': partial,
+        'warnings': warnings,
+        'timestamp': datetime.now().isoformat(),
+    }
 
 
 @router.get('/documents/{document_id}')

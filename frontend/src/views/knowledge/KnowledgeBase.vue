@@ -36,8 +36,8 @@
                       <span class="filename">{{ item.filename }}</span>
                     </div>
                     <div class="file-stats">
-                      <el-tag size="small" :type="item.status === 'success' ? 'success' : 'danger'">
-                        {{ item.status === 'success' ? '成功' : '失败' }}
+                      <el-tag size="small" :type="item.status === 'success' ? 'success' : (item.status === 'partial' ? 'warning' : 'danger')">
+                        {{ item.status === 'success' ? '成功' : (item.status === 'partial' ? '部分成功' : '失败') }}
                       </el-tag>
                       <span class="chunks-count">{{ item.chunks }} chunk</span>
                     </div>
@@ -78,6 +78,10 @@
             </el-input>
           </div>
 
+          <div v-if="documentsWarnings.length" class="excel-warn">
+            <div v-for="(w, i) in documentsWarnings" :key="i">· {{ w }}</div>
+          </div>
+
           <!-- 文档列表 -->
           <div class="documents-list">
             <el-table
@@ -114,6 +118,22 @@
                     style="margin-left: 6px">
                     表格
                   </el-tag>
+                </template>
+              </el-table-column>
+
+              <el-table-column
+                label="语义索引"
+                width="130"
+              >
+                <template #default="scope">
+                  <el-tag
+                    v-if="scope.row.kind === 'excel'"
+                    size="small"
+                    :type="indexStatusTagType(scope.row.index_status)"
+                  >
+                    {{ indexStatusLabel(scope.row.index_status) }}
+                  </el-tag>
+                  <span v-else>-</span>
                 </template>
               </el-table-column>
 
@@ -440,6 +460,7 @@ import type { ExcelPreviewResult, ExcelQueryResult } from '@/services/api'
 
 // 数据
 const documents = ref<any[]>([])
+const documentsWarnings = ref<string[]>([])
 const uploadHistory = ref<any[]>([])
 const searchQuery = ref('')
 const quickQuery = ref('')
@@ -544,10 +565,29 @@ const formatTime = (timestamp: string) => {
   return new Date(timestamp).toLocaleDateString()
 }
 
+const indexStatusLabel = (status?: string) => {
+  const labels: Record<string, string> = {
+    pending: '待索引',
+    indexing: '索引中',
+    indexed: '语义索引可用',
+    index_failed: '索引失败',
+    unknown: '状态未知'
+  }
+  return labels[status || 'unknown'] || '状态未知'
+}
+
+const indexStatusTagType = (status?: string) => {
+  if (status === 'indexed') return 'success'
+  if (status === 'index_failed') return 'danger'
+  if (status === 'pending' || status === 'indexing') return 'warning'
+  return 'info'
+}
+
 const loadDocuments = async () => {
   try {
-    // 真实调用后端：按当前用户隔离的文档列表（不再使用 mock）
+    // 真实调用后端：普通文档来自 Chroma，Excel 来自本地 catalog，后端已合并/去重。
     const res = await ragApi.getDocuments()
+    documentsWarnings.value = (res as any).warnings || []
     documents.value = (res.documents || []).map((d: any) => ({
       id: d.document_id,
       document_id: d.document_id,
@@ -557,10 +597,13 @@ const loadDocuments = async () => {
       sheet_count: d.sheet_count || 0,
       size: d.size || 0,
       chunks: d.chunks || 0,
+      index_status: d.index_status || (d.kind === 'excel' ? 'unknown' : ''),
+      local_available: d.local_available !== false,
       uploadTime: d.created_at ? new Date(d.created_at).toLocaleString() : ''
     }))
   } catch (error) {
     console.error('加载文档失败:', error)
+    documentsWarnings.value = []
     ElMessage.error('加载文档失败')
   }
 }
@@ -582,10 +625,22 @@ const handleFileUploaded = async (fileData: any) => {
     })
 
     const docId = (result as any).document_id
-    // 稳定性补丁：把"后端真实结果"回写给上传组件（否则失败时列表仍显示"上传成功"）
-    fileData.done?.(true)
+    const docKind = (result as any).doc_kind
+    const indexStatus = (result as any).index_status
+    const partial = Boolean((result as any).partial) || (
+      docKind === 'excel' && !!indexStatus && indexStatus !== 'indexed'
+    )
+    const partialMessage = (result as any).message
+      || 'Excel 已解析并保存在本地，精确查询和预览可用，但语义索引未完成。'
 
-    // 重新拉取真实文档列表（含后端聚合的 created_at/chunks），保证与删除闭环一致
+    // 把后端真实结果回写给上传组件；部分成功使用 warning，不显示普通全功能成功。
+    if (partial) {
+      fileData.done?.(true, partialMessage)
+    } else {
+      fileData.done?.(true)
+    }
+
+    // 重新拉取真实文档列表（含后端合并的 created_at/chunks/index_status）
     await loadDocuments()
 
     // 添加到上传历史（含 document_id）
@@ -593,12 +648,14 @@ const handleFileUploaded = async (fileData: any) => {
       id: docId || Date.now(),
       document_id: docId,
       filename: fileData.name,
-      status: 'success',
+      status: partial ? 'partial' : 'success',
       chunks: (result as any).total_chunks || 0,
       timestamp: new Date().toISOString()
     })
 
-    ElMessage.success(`文件"${fileData.name}" 上传成功`)
+    if (!partial) {
+      ElMessage.success(`文件"${fileData.name}" 上传成功`)
+    }
   } catch (error: any) {
     console.error('文件上传失败：', error)
 
@@ -889,8 +946,16 @@ const deleteDocument = async (doc: any) => {
 
   try {
     // 真实调用后端删除 API（自动携带 JWT）；无 document_id 的仅为本地占位数据
+    let result: any = null
     if (doc.document_id) {
-      await ragApi.deleteDocument([doc.document_id])
+      result = await ragApi.deleteDocument([doc.document_id])
+    }
+    if (result?.partial || result?.success === false) {
+      const warningText = (result?.warnings || []).join('；') || '删除未完全完成，请重试'
+      documentsWarnings.value = result?.warnings || [warningText]
+      ElMessage.warning(warningText)
+      await loadDocuments()
+      return
     }
     documents.value = documents.value.filter(d => d.id !== doc.id)
     uploadHistory.value = uploadHistory.value.filter(d => d.document_id !== doc.document_id)

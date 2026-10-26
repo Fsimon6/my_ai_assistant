@@ -31,14 +31,23 @@ EXCEL_PHASE_TAG = '1A'
 EXCEL_SUMMARY_PREVIEW_ROWS = 5
 # 单条摘要 chunk 的最大字符数（避免污染向量库）
 EXCEL_SUMMARY_MAX_CHARS = 2000
+EXCEL_LOCAL_READY_INDEX_FAILED = (
+    'Excel 已解析并保存在本地，精确查询和预览可用；语义索引未完成。'
+)
+
+
+class _ExcelIndexFailure(Exception):
+    """内部信号：Excel 本地已成功，索引阶段已处理并记录失败。"""
 
 
 class RagService:
     """RAG服务类(带缓存优化)"""
 
     def __init__(self):
-        self.llm = get_llm()
-        self.vector_store = get_vector_store_manager()
+        # Excel 本地解析/持久化不应因模型或 Chroma 配置失败而被阻断。
+        # LLM 与向量存储改为首次真正需要时再初始化；cache 无外部依赖，保持原行为。
+        self._llm = None
+        self._vector_store = None
         # 分块参数唯一来源：document_service.DocumentProcessor 的默认值
         # （chunk_size=1000 / chunk_overlap=200）；process_and_store_document 以无参方式构造它
         # （见本文件下方 processor = DocumentProcessor()）。
@@ -46,6 +55,32 @@ class RagService:
         # 已在 6A-8 P3 删除以消除歧义；请勿在此新增第二套分块配置。
         self.cache = get_cache_service()
         logger.info(' RAG服务初始化（带缓存）')
+
+    def _get_llm(self):
+        if self._llm is None:
+            self._llm = get_llm()
+        return self._llm
+
+    def _get_vector_store(self):
+        if self._vector_store is None:
+            self._vector_store = get_vector_store_manager()
+        return self._vector_store
+
+    @property
+    def llm(self):
+        return self._get_llm()
+
+    @llm.setter
+    def llm(self, value):
+        self._llm = value
+
+    @property
+    def vector_store(self):
+        return self._get_vector_store()
+
+    @vector_store.setter
+    def vector_store(self, value):
+        self._vector_store = value
 
     async def process_and_store_document(
         self,
@@ -190,72 +225,217 @@ class RagService:
         original_filename: Optional[str] = None,
         file_size: int = 0,
     ) -> Dict[str, Any]:
-        """Phase 1A：Excel 上传处理链路。
+        """Excel 上传处理链路。
 
-        流程：原文件 -> ExcelParser -> Unified Representation -> 落盘（原文件 + json）
-              -> 生成“每 Sheet 一条摘要 chunk”写入 Chroma（临时兼容层）
-              -> 删除临时文件
+        阶段 A：解析 + 本地 artifacts 持久化。成功后即时具备预览和精确查询能力。
+        阶段 B：尽力建立语义摘要索引；失败不删除本地文档，只更新索引状态。
         """
         document_id = uuid.uuid4().hex
         display_name = original_filename or os.path.basename(file_path)
+        local_ready = False
         try:
-            parser = ExcelParser()
-            representation = parser.parse(
-                file_path=file_path,
-                document_id=document_id,
-                user_id=user_id,
-                filename=display_name,
-                file_type=os.path.splitext(file_path)[1].lstrip('.').lower(),
-            )
-
-            # 空白工作簿 / 全部 Sheet 均无列时，representation 仍然“合法”，但
-            # 后续查询无法生成任何 SELECT/DDL。必须在落盘和写向量前拒绝，
-            # 避免返回上传成功后得到不可查询的文档。
-            # 注意：只检查“是否存在可用列”，不因 row_count == 0 拒绝；
-            # 有表头但暂时没有数据行的表格仍允许上传。混合工作簿中只要
-            # 至少一个 Sheet 有列，就允许通过，空白 Sheet 的查询由引擎层校验。
-            if not representation.sheets or all(
-                sheet.column_count <= 0 for sheet in representation.sheets
-            ):
-                raise ExcelQueryError(
-                    ERR_INVALID_PARAM,
-                    '工作簿没有任何可用的表格列结构（未找到有效表头或列）。'
-                    '请检查文件是否为空或表头是否有效。',
+            # ---------- 阶段 A：本地解析与持久化 ----------
+            try:
+                parser = ExcelParser()
+                representation = parser.parse(
+                    file_path=file_path,
+                    document_id=document_id,
+                    user_id=user_id,
+                    filename=display_name,
+                    file_type=os.path.splitext(file_path)[1].lstrip('.').lower(),
                 )
 
-            # 1) 持久化原始文件 + representation（后续阶段复用；Preview 只读 representation）
-            excel_store.save_artifacts(representation, file_path, display_name)
+                # 空白工作簿 / 全部 Sheet 均无列时，representation 仍然“合法”，但
+                # 后续查询无法生成任何 SELECT/DDL。必须在落盘和写向量前拒绝。
+                # 只检查“是否存在可用列”，不因 row_count == 0 拒绝。
+                if not representation.sheets or all(
+                    sheet.column_count <= 0 for sheet in representation.sheets
+                ):
+                    raise ExcelQueryError(
+                        ERR_INVALID_PARAM,
+                        '工作簿没有任何可用的表格列结构（未找到有效表头或列）。'
+                        '请检查文件是否为空或表头是否有效。',
+                    )
 
-            # 2) Phase 1A 临时兼容层：仅写摘要 chunk，不把全部数据塞进向量库
-            chunks = self._build_excel_chunks(
-                representation=representation,
-                metadata=metadata,
-                original_filename=display_name,
-                file_size=file_size,
-                user_id=user_id,
-            )
-            ids = await self.vector_store.add_documents(chunks) if chunks else []
+                excel_store.save_artifacts(
+                    representation,
+                    file_path,
+                    display_name,
+                    file_size=file_size,
+                )
+                local_ready = True
+            except Exception as e:
+                # 本地阶段失败：保持原来的失败契约，清理临时文件和半成品。
+                await self._cleanup_failed_upload(document_id, file_path, user_id)
+                classified = classify_upload_error(e)
+                log_classified('excel_upload', classified)
+                return {
+                    'success': False,
+                    'error': classified.detail or str(e),
+                    'error_code': classified.error_code,
+                    'message': classified.message,
+                    'http_status': classified.http_status,
+                    'filename': os.path.basename(file_path),
+                }
 
-            # 3) 清理与新文档相关的缓存
-            await self._clear_related_cache(display_name, chunks)
+            # ---------- 阶段 B：可选语义索引 ----------
+            index_status = 'pending'
+            index_error_code = ''
+            index_error = ''
+            index_message = ''
+            chunks: List[Dict[str, Any]] = []
+            ids: List[str] = []
 
-            # 4) 删除临时上传文件（原文件已持久化到 data/excel/<document_id>/）
             try:
-                os.remove(file_path)
-            except OSError as e:
-                logger.debug('清理临时表格文件失败：%s, 错误：%s', file_path, e)
+                chunks = self._build_excel_chunks(
+                    representation=representation,
+                    metadata=metadata,
+                    original_filename=display_name,
+                    file_size=file_size,
+                    user_id=user_id,
+                )
+
+                # 先初始化向量存储；初始化失败时尚未开始写入，vector_write_started 保持 false。
+                try:
+                    vector_store = self._get_vector_store()
+                except Exception as e:
+                    classified = classify_upload_error(e)
+                    index_status = 'index_failed'
+                    index_error_code = classified.error_code
+                    index_error = classified.detail or str(e)
+                    index_message = (
+                        f'{EXCEL_LOCAL_READY_INDEX_FAILED} {classified.message}'
+                        if classified.message else EXCEL_LOCAL_READY_INDEX_FAILED
+                    )
+                    excel_store.update_meta(
+                        document_id,
+                        index_status=index_status,
+                        index_error_code=index_error_code,
+                        index_error=index_error,
+                        chunks=0,
+                        vector_write_started=False,
+                    )
+                    raise _ExcelIndexFailure from e
+
+                # 写入意图必须先持久化；失败则绝不继续写入。
+                try:
+                    excel_store.update_meta(
+                        document_id,
+                        index_status='indexing',
+                        vector_write_started=True,
+                    )
+                except Exception as e:
+                    index_status = 'unknown'
+                    index_error_code = 'INDEX_STATUS_PERSIST_FAILED'
+                    index_error = '索引状态无法持久化'
+                    index_message = 'Excel 已保存在本地，但无法可靠记录语义索引状态。'
+                    logger.warning('Excel 索引状态持久化失败：%s', e)
+                    raise _ExcelIndexFailure from e
+
+                try:
+                    ids = await vector_store.add_documents(chunks) if chunks else []
+                    if chunks and len(ids or []) != len(chunks):
+                        raise RuntimeError(
+                            f'向量写入数量异常：期望 {len(chunks)} 条，实际 {len(ids or [])} 条'
+                        )
+                except Exception as e:
+                    classified = classify_upload_error(e)
+                    index_status = 'index_failed'
+                    index_error_code = classified.error_code
+                    index_error = classified.detail or str(e)
+                    index_message = (
+                        f'{EXCEL_LOCAL_READY_INDEX_FAILED} {classified.message}'
+                        if classified.message else EXCEL_LOCAL_READY_INDEX_FAILED
+                    )
+
+                    # 部分写入可能已经发生。只有严格删除确认成功，才允许把
+                    # vector_write_started 改回 false；否则保留可能残留的标记。
+                    cleanup_confirmed = False
+                    try:
+                        await vector_store.delete_documents(
+                            [document_id], user_id=user_id, strict=True
+                        )
+                        cleanup_confirmed = True
+                    except Exception as cleanup_err:
+                        logger.warning('清理可能残留的 Excel 向量失败：%s', cleanup_err)
+
+                    try:
+                        excel_store.update_meta(
+                            document_id,
+                            index_status=index_status,
+                            index_error_code=index_error_code,
+                            index_error=index_error,
+                            chunks=0,
+                            vector_write_started=not cleanup_confirmed,
+                        )
+                    except Exception as meta_err:
+                        logger.warning('写入 Excel 索引失败状态失败：%s', meta_err)
+                    raise _ExcelIndexFailure from e
+
+                # 向量写入成功；若状态持久化失败，则保留向量但把状态标为 unknown。
+                try:
+                    excel_store.update_meta(
+                        document_id,
+                        index_status='indexed',
+                        index_error_code='',
+                        index_error='',
+                        indexed_at=datetime.now().isoformat(),
+                        chunks=len(chunks),
+                        vector_write_started=True,
+                    )
+                    index_status = 'indexed'
+                except Exception as meta_err:
+                    index_status = 'unknown'
+                    index_error_code = 'INDEX_STATUS_PERSIST_FAILED'
+                    index_error = '索引状态无法持久化'
+                    index_message = 'Excel 向量已写入，但索引状态无法可靠持久化。'
+                    logger.warning('写入 Excel 索引成功状态失败：%s', meta_err)
+            except _ExcelIndexFailure:
+                pass
+            except Exception as e:
+                # 摘要构造等索引前错误：没有调用 add_documents，vector_write_started 仍为 false。
+                classified = classify_upload_error(e)
+                index_status = 'index_failed'
+                index_error_code = classified.error_code
+                index_error = classified.detail or str(e)
+                index_message = (
+                    f'{EXCEL_LOCAL_READY_INDEX_FAILED} {classified.message}'
+                    if classified.message else EXCEL_LOCAL_READY_INDEX_FAILED
+                )
+                try:
+                    excel_store.update_meta(
+                        document_id,
+                        index_status=index_status,
+                        index_error_code=index_error_code,
+                        index_error=index_error,
+                        chunks=0,
+                        vector_write_started=False,
+                    )
+                except Exception as meta_err:
+                    logger.warning('写入 Excel 索引失败状态失败：%s', meta_err)
+
+            try:
+                await self._clear_related_cache(display_name, chunks)
+            except Exception as cache_err:
+                logger.warning('清理 Excel 相关缓存失败（忽略）：%s', cache_err)
 
             logger.info(
-                'Excel 处理完成 document_id=%s sheets=%d rows=%d chunks=%d',
+                'Excel 本地处理完成 document_id=%s sheets=%d rows=%d index_status=%s',
                 document_id, representation.sheet_count,
-                representation.total_rows, len(chunks),
+                representation.total_rows, index_status,
             )
             return {
                 'success': True,
                 'doc_kind': 'excel',
-                'total_chunks': len(chunks),
+                'local_status': 'ready',
+                'index_status': index_status,
+                'partial': index_status != 'indexed',
+                'index_error_code': index_error_code,
+                'index_error': index_error,
+                'index_message': index_message,
+                'total_chunks': len(chunks) if index_status == 'indexed' else 0,
                 'document_id': document_id,
-                'chunk_ids': ids,
+                'chunk_ids': ids if index_status == 'indexed' else [],
                 'filename': display_name,
                 'file_type': representation.file_type,
                 'sheet_count': representation.sheet_count,
@@ -265,26 +445,13 @@ class RagService:
                 'warnings': list(representation.warnings),
             }
 
-        except Exception as e:
-            # 失败清理：移除半成品附件目录 / 临时文件 / 可能已写入的向量，
-            # 保证"失败即无残留"，用户不会看到一个查不到的幽灵文档。
-            await self._cleanup_failed_upload(document_id, file_path, user_id)
-            classified = classify_upload_error(e)
-            log_classified('excel_upload', classified)
-            return {
-                'success': False,
-                'error': classified.detail or str(e),
-                'error_code': classified.error_code,
-                'message': classified.message,
-                'http_status': classified.http_status,
-                'filename': os.path.basename(file_path),
-            }
         except BaseException:
-            # 取消类异常不属于 Exception：清理后原样抛出（同 process_and_store_document 的说明）。
-            try:
-                await self._cleanup_failed_upload(document_id, file_path, user_id)
-            except Exception as cleanup_err:  # noqa: BLE001 - 清理失败不得覆盖原始取消异常
-                logger.warning(f'取消路径清理失败（忽略，finally 仍兜底删除临时文件）：{cleanup_err}')
+            # 取消类异常不属于 Exception；本地尚未成功时清理，已经本地成功时保留。
+            if not local_ready:
+                try:
+                    await self._cleanup_failed_upload(document_id, file_path, user_id)
+                except Exception as cleanup_err:  # noqa: BLE001
+                    logger.warning(f'取消路径清理失败（忽略，finally 仍兜底删除临时文件）：{cleanup_err}')
             raise
         finally:
             # 兜底：无论成功 / 失败 / 取消，都不允许临时文件残留。
@@ -309,8 +476,11 @@ class RagService:
         except Exception as de:
             logger.warning('清理 Excel 附件目录失败（忽略）：%s', de)
         try:
-            if getattr(self, 'vector_store', None) is not None:
-                deleted = await self.vector_store.delete_documents([document_id], user_id=user_id)
+            # 仅当向量存储已经初始化过时才清理；绝不能通过 vector_store property
+            # 在失败清理阶段反向触发 LLM/Chroma 初始化。
+            vector_store = getattr(self, '_vector_store', None)
+            if vector_store is not None:
+                deleted = await vector_store.delete_documents([document_id], user_id=user_id)
                 if deleted:
                     logger.info('已清理失败上传残留向量：document_id=%s count=%s', document_id, deleted)
         except Exception as ve:

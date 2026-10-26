@@ -83,7 +83,7 @@
           </el-button>
 
           <el-button
-            v-if="file.status === 'success'"
+            v-if="file.status === 'success' || file.status === 'warning'"
             type="text"
             size="small"
             @click="previewFile(file)"
@@ -149,7 +149,7 @@ interface UploadFile {
   size: number
   ext: string
   type: string
-  status: 'pending' | 'uploading' | 'success' | 'error'
+  status: 'pending' | 'uploading' | 'success' | 'warning' | 'error'
   progress: number
   content?: string
   preview?: string
@@ -325,6 +325,7 @@ const getStatusText = (status: UploadFile['status']) => {
     pending: isAttachMode.value ? '等待添加' : '等待上传',
     uploading: isAttachMode.value ? '处理中' : '上传中',
     success: isAttachMode.value ? '已添加' : '上传成功',
+    warning: '部分成功',
     error: isAttachMode.value ? '添加失败' : '上传失败'
   }
   return texts[status]
@@ -418,7 +419,17 @@ const uploadFile = async (index: number) => {
     // 否则后端失败（如 embedding 欠费）时，列表仍会显示"上传成功"，
     // 与"文档列表为空/历史显示失败"自相矛盾。
     const done = (ok: boolean, message?: string) => {
-      if (ok) {
+      if (ok && message) {
+        fileItem.status = 'warning'
+        fileItem.error = message
+        fileItem.content = content
+        ElMessage({
+          type: 'warning',
+          duration: 8000,
+          showClose: true,
+          message: `文件 "${fileItem.name}"：${message}`
+        })
+      } else if (ok) {
         fileItem.status = 'success'
         fileItem.error = undefined
         fileItem.content = content
@@ -485,10 +496,13 @@ const uploadAll = async () => {
     // （真正的结果由父组件通过 done 回调写回 fileItem.status）
     await new Promise(resolve => setTimeout(resolve, 300))
     const failed = files.value.filter(f => f.status === 'error')
-    if (failed.length === 0) {
+    const partial = files.value.filter(f => f.status === 'warning')
+    if (failed.length === 0 && partial.length === 0) {
       ElMessage.success(isAttachMode.value ? '所有文件已添加到输入框' : '所有文件上传成功')
-    } else if (failed.length < files.value.length) {
+    } else if (failed.length > 0 && failed.length < files.value.length) {
       ElMessage.warning(`${failed.length} 个文件${isAttachMode.value ? '添加' : '上传'}失败，请查看列表中的失败原因`)
+    } else if (failed.length === 0 && partial.length > 0) {
+      ElMessage.warning(`${partial.length} 个文件已保存到本地，但语义索引未完成`)
     }
   } catch (error) {
     console.error('批量上传失败：', error)
@@ -705,6 +719,11 @@ const emit = defineEmits<{
               &.uploading {
                 background: rgba(103, 194, 58, 0.1);
                 color: var(--success-color);
+              }
+
+              &.warning {
+                background: rgba(230, 162, 60, 0.15);
+                color: var(--warning-color, #e6a23c);
               }
 
               &.error {

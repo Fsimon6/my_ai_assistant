@@ -159,11 +159,15 @@ class VectorStoreManager:
         self,
         document_ids: List[str],
         user_id: Optional[int] = None,
+        strict: bool = False,
     ) -> int:
         """按 document_id（文档级）+ user_id 精确删除向量。
 
         仅删除归属当前用户、且 document_id 在给定列表中的向量；不会误删其他文档或
         其他用户数据。返回实际删除的向量数量（0 表示无匹配 / 越权）。
+
+        ``strict=True``：删除操作异常会向上抛出，调用方可区分“成功删除 0 条”和
+        “删除失败、无法确认”。默认 False 保留上传失败清理的容错行为。
         """
         try:
             collection = self.vector_store._collection
@@ -186,6 +190,8 @@ class VectorStoreManager:
 
         except Exception as e:
             logger.error(f'删除文档失败：{e}')
+            if strict:
+                raise
             return 0
 
     def get_collection_info(self) -> Dict[str, Any]:
@@ -205,11 +211,16 @@ class VectorStoreManager:
             return {'total_documents': 0}
 
 
-    def list_user_documents(self, user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def list_user_documents(
+        self,
+        user_id: Optional[int] = None,
+        strict: bool = False,
+    ) -> List[Dict[str, Any]]:
         """按归属用户列出其全部文档（聚合 document_id），仅返回该用户自己的文档，
         用于知识库文档列表。无需新增数据库表，直接基于 Chroma 向量 metadata 聚合。
 
         user_id: 服务端强制隔离；只聚合 metadata.user_id == user_id 的向量，杜绝跨用户泄露。
+        strict=True: Chroma 读取异常向上抛出，便于列表路由区分“无文档”和“后端不可用”。
         """
         try:
             collection = self.vector_store._collection
@@ -253,6 +264,8 @@ class VectorStoreManager:
             return list(docs.values())
         except Exception as e:
             logger.error(f'列出用户文档失败：{e}')
+            if strict:
+                raise
             return []
 
     async def get_document_chunks(
