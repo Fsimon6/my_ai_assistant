@@ -14,6 +14,7 @@ from backend.services.document_service import DocumentProcessor, EXCEL_EXT
 from backend.services.cache_service import get_cache_service, CacheKey
 from backend.excel import ExcelParser
 from backend.excel import store as excel_store
+from backend.excel.query import ERR_INVALID_PARAM, ExcelQueryError
 from backend.utils.provider_errors import (
     classify_upload_error,
     log_classified,
@@ -206,6 +207,21 @@ class RagService:
                 filename=display_name,
                 file_type=os.path.splitext(file_path)[1].lstrip('.').lower(),
             )
+
+            # 空白工作簿 / 全部 Sheet 均无列时，representation 仍然“合法”，但
+            # 后续查询无法生成任何 SELECT/DDL。必须在落盘和写向量前拒绝，
+            # 避免返回上传成功后得到不可查询的文档。
+            # 注意：只检查“是否存在可用列”，不因 row_count == 0 拒绝；
+            # 有表头但暂时没有数据行的表格仍允许上传。混合工作簿中只要
+            # 至少一个 Sheet 有列，就允许通过，空白 Sheet 的查询由引擎层校验。
+            if not representation.sheets or all(
+                sheet.column_count <= 0 for sheet in representation.sheets
+            ):
+                raise ExcelQueryError(
+                    ERR_INVALID_PARAM,
+                    '工作簿没有任何可用的表格列结构（未找到有效表头或列）。'
+                    '请检查文件是否为空或表头是否有效。',
+                )
 
             # 1) 持久化原始文件 + representation（后续阶段复用；Preview 只读 representation）
             excel_store.save_artifacts(representation, file_path, display_name)

@@ -583,6 +583,14 @@ class _DocDatabase:
 
     def ensure_table(self, rep: WorkbookRepresentation, sheet_index: int) -> Dict[str, Any]:
         sheet = rep.sheets[sheet_index]
+        if not sheet.columns or sheet.column_count <= 0:
+            # 零列 Sheet 不能生成任何 DDL（否则会得到
+            # CREATE TABLE "x" (, "__excel_row__" BIGINT) 的语法错误）。
+            # 这里在建立连接/生成 SQL 前就返回可分类的 4xx 业务错误。
+            raise excel_query.ExcelQueryError(
+                excel_query.ERR_INVALID_PARAM,
+                '该 Sheet 没有任何列，无法执行查询',
+            )
         fingerprint = (sheet.row_count, sheet.column_count, len(sheet.columns),
                        rep.schema_version, sheet.sheet_name)
         cached = self.tables.get(sheet_index)
