@@ -570,6 +570,7 @@ async def list_documents(
         excel_docs = excel_store.list_excel_catalog(
             user_id=current_user.id,
             max_docs=None,
+            include_legacy_marker=True,
         )
     except Exception as e:
         catalog_ok = False
@@ -591,6 +592,8 @@ async def list_documents(
         if not doc_id:
             continue
         catalog_ids.add(doc_id)
+        # 私有兼容标记只用于区分“旧 meta 完全缺字段”和“显式 unknown”。
+        legacy_missing = bool(local_doc.pop('_legacy_index_status_missing', False))
         existing = merged.get(doc_id)
         if existing:
             # Excel 本地元数据是文件存在性/大小/状态的权威来源；
@@ -601,16 +604,27 @@ async def list_documents(
                 merged_doc['chunks'] = existing['chunks']
             if existing.get('size') and not local_doc.get('size'):
                 merged_doc['size'] = existing['size']
+            if legacy_missing:
+                merged_doc['_legacy_index_status_missing'] = True
             merged[doc_id] = merged_doc
         else:
-            merged[doc_id] = dict(local_doc)
+            merged_doc = dict(local_doc)
+            if legacy_missing:
+                merged_doc['_legacy_index_status_missing'] = True
+            merged[doc_id] = merged_doc
 
-    # 旧 meta 没有 index_status 时：只有 Chroma 确实有该文档，才可判定已索引。
     for doc_id, doc in merged.items():
+        # 兼容标记属于内部实现细节，必须在返回前移除，绝不进入公开 API。
+        legacy_missing = bool(doc.pop('_legacy_index_status_missing', False))
         if doc.get('kind') != 'excel':
             continue
         status = doc.get('index_status')
-        if not status or status == 'unknown':
+        if not status:
+            # 只有完全没有状态来源的旧 Chroma Excel 记录才允许旧兼容推断。
+            doc['index_status'] = 'indexed' if doc_id in chroma_ids else 'unknown'
+        elif status == 'unknown' and legacy_missing:
+            # meta 真正缺失 index_status 的旧文档，才可按 Chroma 存在推断；
+            # 显式 unknown / 旧 indexing 归一后的 unknown 一律保持 unknown。
             doc['index_status'] = 'indexed' if doc_id in chroma_ids else 'unknown'
         doc.setdefault('local_available', doc_id in catalog_ids)
 

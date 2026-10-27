@@ -318,10 +318,12 @@ class RagService:
                     raise _ExcelIndexFailure from e
 
                 # 写入意图必须先持久化；失败则绝不继续写入。
+                # 这里写 unknown 而不是 indexing：若后续最终状态（indexed/index_failed）
+                # 持久化失败，meta 只能保留“未知”，绝不能永久停在“索引中”而误导列表。
                 try:
                     excel_store.update_meta(
                         document_id,
-                        index_status='indexing',
+                        index_status='unknown',
                         vector_write_started=True,
                     )
                 except Exception as e:
@@ -329,7 +331,9 @@ class RagService:
                     index_error_code = 'INDEX_STATUS_PERSIST_FAILED'
                     index_error = '索引状态无法持久化'
                     index_message = 'Excel 已保存在本地，但无法可靠记录语义索引状态。'
-                    logger.warning('Excel 索引状态持久化失败：%s', e)
+                    logger.warning(
+                        'Excel 索引状态持久化失败 document_id=%s：%s', document_id, e
+                    )
                     raise _ExcelIndexFailure from e
 
                 try:
@@ -369,7 +373,10 @@ class RagService:
                             vector_write_started=not cleanup_confirmed,
                         )
                     except Exception as meta_err:
-                        logger.warning('写入 Excel 索引失败状态失败：%s', meta_err)
+                        logger.warning(
+                            '写入 Excel 索引失败状态失败 document_id=%s：%s',
+                            document_id, meta_err,
+                        )
                     raise _ExcelIndexFailure from e
 
                 # 向量写入成功；若状态持久化失败，则保留向量但把状态标为 unknown。
@@ -389,7 +396,10 @@ class RagService:
                     index_error_code = 'INDEX_STATUS_PERSIST_FAILED'
                     index_error = '索引状态无法持久化'
                     index_message = 'Excel 向量已写入，但索引状态无法可靠持久化。'
-                    logger.warning('写入 Excel 索引成功状态失败：%s', meta_err)
+                    logger.warning(
+                        '写入 Excel 索引成功状态失败 document_id=%s：%s',
+                        document_id, meta_err,
+                    )
             except _ExcelIndexFailure:
                 pass
             except Exception as e:
@@ -412,7 +422,10 @@ class RagService:
                         vector_write_started=False,
                     )
                 except Exception as meta_err:
-                    logger.warning('写入 Excel 索引失败状态失败：%s', meta_err)
+                    logger.warning(
+                        '写入 Excel 索引失败状态失败 document_id=%s：%s',
+                        document_id, meta_err,
+                    )
 
             try:
                 await self._clear_related_cache(display_name, chunks)

@@ -28,6 +28,16 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# 与 rag_service / 前端展示保持一致；indexing 是旧版可能遗留的合法状态，
+# 但列表读取时不再视为当前可确认的进行中状态。
+VALID_INDEX_STATUSES = frozenset({
+    'pending',
+    'indexing',
+    'indexed',
+    'index_failed',
+    'unknown',
+})
+
 
 def _resolve_excel_root() -> Path:
     """Excel 原件/解析产物根目录（F2 统一配置）。
@@ -205,6 +215,7 @@ def list_excel_catalog(
     user_id: Optional[int] = None,
     max_docs: Optional[int] = 10,
     include_status: bool = True,
+    include_legacy_marker: bool = False,
 ) -> List[Dict[str, Any]]:
     """列出某用户可查询的 Excel 表格目录（**仅 schema，不含任何数据行**）。
 
@@ -272,15 +283,31 @@ def list_excel_catalog(
             'sheets': sheets,
         }
         if include_status:
+            # 旧版本可能在最终状态写入失败后遗留 indexing；本地索引流程是同步的，
+            # 列表读取时无法确认它是否仍在进行，故保守展示为 unknown，避免永久“索引中”。
+            raw_index_status = meta.get('index_status')
+            # 只有键完全不存在才是旧 meta；显式 null/空字符串仍属于“已记录但未确认”。
+            legacy_missing = 'index_status' not in meta
+            # 非法状态统一保守归为 unknown，但不因此触发旧版缺失兼容。
+            if (isinstance(raw_index_status, str)
+                    and raw_index_status in VALID_INDEX_STATUSES):
+                index_status = raw_index_status
+            else:
+                index_status = 'unknown'
+            if index_status == 'indexing':
+                index_status = 'unknown'
             doc.update({
                 # 旧 meta 没有状态：明确为 unknown，不能默认声称已索引。
-                'index_status': meta.get('index_status') or 'unknown',
+                'index_status': index_status,
                 'index_error_code': meta.get('index_error_code') or '',
                 # index_error 仅保留在 meta.json 供内部诊断，禁止进入列表 API 响应。
                 'indexed_at': meta.get('indexed_at') or '',
                 # None 表示旧数据未知；False 才是本代码可靠记录的“从未开始写入”。
                 'vector_write_started': meta.get('vector_write_started'),
             })
+            # 只给 /documents 的内部合并逻辑使用；不是公开字段，调用方必须 pop。
+            if include_legacy_marker and legacy_missing:
+                doc['_legacy_index_status_missing'] = True
         docs.append(doc)
 
     docs.sort(key=lambda d: d.get('created_at') or '', reverse=True)

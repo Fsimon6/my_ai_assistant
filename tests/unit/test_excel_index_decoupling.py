@@ -63,6 +63,21 @@ def _run(svc, path: Path, user_id=7):
     ))
 
 
+def _fail_meta_on(monkeypatch, predicate):
+    """让指定的一次 update_meta 调用失败，其余调用保持真实落盘。"""
+    original = excel_store.update_meta
+    calls = []
+
+    def update(document_id, **updates):
+        calls.append(dict(updates))
+        if predicate(updates):
+            raise OSError('simulated meta persistence failure')
+        return original(document_id, **updates)
+
+    monkeypatch.setattr(excel_store, 'update_meta', update)
+    return calls
+
+
 def test_constructor_does_not_initialize_llm_or_vector(monkeypatch):
     """RagService() 本身不能因缺少 API Key/Chroma 配置失败。"""
     def fail():
@@ -157,6 +172,117 @@ def test_successful_index_writes_status_and_chunks(tmp_path, monkeypatch):
     assert meta['index_status'] == 'indexed'
     assert meta['vector_write_started'] is True
     assert meta['chunks'] == 1
+
+
+def test_final_index_status_persist_failure_keeps_unknown_and_does_not_cleanup_vectors(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(excel_store, 'EXCEL_DATA_ROOT', tmp_path / 'excel')
+    xlsx = tmp_path / 'final-meta-fail.xlsx'
+    _make_xlsx(xlsx)
+    vs = FakeVectorStore()
+    svc = _service(vs)
+    calls = _fail_meta_on(
+        monkeypatch,
+        lambda updates: updates.get('index_status') == 'indexed',
+    )
+
+    out = _run(svc, xlsx)
+
+    assert out['success'] is True
+    assert out['index_status'] == 'unknown'
+    assert out['partial'] is True
+    assert out['index_error_code'] == 'INDEX_STATUS_PERSIST_FAILED'
+    assert len(vs.added) == 1
+    assert vs.deleted == []          # 最终状态写入失败不得盲目清理向量
+
+    doc_dir = tmp_path / 'excel' / out['document_id']
+    assert (doc_dir / 'representation.json').exists()  # 本地文件不得被删除
+    meta = excel_store.load_meta(out['document_id'])
+    assert meta['index_status'] == 'unknown'
+    assert meta['vector_write_started'] is True
+    assert any(
+        c.get('index_status') == 'unknown' and c.get('vector_write_started') is True
+        for c in calls
+    )
+
+    catalog = excel_store.list_excel_catalog(user_id=7, max_docs=None)
+    assert catalog[0]['index_status'] == 'unknown'
+
+
+def test_vector_failure_and_error_status_persist_failure_keeps_unknown(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(excel_store, 'EXCEL_DATA_ROOT', tmp_path / 'excel')
+    xlsx = tmp_path / 'error-meta-fail.xlsx'
+    _make_xlsx(xlsx)
+    vs = FakeVectorStore(fail_add=True)
+    svc = _service(vs)
+    _fail_meta_on(
+        monkeypatch,
+        lambda updates: updates.get('index_status') == 'index_failed',
+    )
+
+    out = _run(svc, xlsx)
+
+    assert out['success'] is True
+    assert out['index_status'] == 'index_failed'
+    assert out['partial'] is True
+    assert len(vs.added) == 1
+    assert vs.deleted and vs.deleted[0][2] is True
+
+    doc_dir = tmp_path / 'excel' / out['document_id']
+    assert (doc_dir / 'representation.json').exists()
+    meta = excel_store.load_meta(out['document_id'])
+    # 失败状态写入也失败时，保留索引前写入的 unknown，不能伪装成 indexed。
+    assert meta['index_status'] == 'unknown'
+    assert meta['vector_write_started'] is True
+
+
+def test_pre_index_meta_persist_failure_does_not_start_vector_write(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(excel_store, 'EXCEL_DATA_ROOT', tmp_path / 'excel')
+    xlsx = tmp_path / 'pre-index-meta-fail.xlsx'
+    _make_xlsx(xlsx)
+    vs = FakeVectorStore()
+    svc = _service(vs)
+    _fail_meta_on(
+        monkeypatch,
+        lambda updates: updates.get('index_status') == 'unknown',
+    )
+
+    out = _run(svc, xlsx)
+
+    assert out['success'] is True
+    assert out['index_status'] == 'unknown'
+    assert out['partial'] is True
+    assert vs.added == []
+    doc_dir = tmp_path / 'excel' / out['document_id']
+    assert (doc_dir / 'representation.json').exists()
+    meta = excel_store.load_meta(out['document_id'])
+    assert meta['index_status'] == 'pending'
+    assert meta['vector_write_started'] is False
+
+
+def test_catalog_maps_legacy_indexing_to_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(excel_store, 'EXCEL_DATA_ROOT', tmp_path / 'excel')
+    source = tmp_path / 'source.xlsx'
+    source.write_bytes(b'synthetic')
+    rep = WorkbookRepresentation(
+        schema_version='1.0',
+        document_id='legacy-indexing',
+        user_id=7,
+        filename='legacy-indexing.xlsx',
+        file_type='xlsx',
+        parser='test',
+        sheet_count=0,
+        sheets=[],
+        created_at='2026-10-26T00:00:00',
+    )
+    excel_store.save_artifacts(rep, str(source), rep.filename, file_size=8)
+    excel_store.update_meta(rep.document_id, index_status='indexing')
+
+    docs = excel_store.list_excel_catalog(user_id=7, max_docs=None)
+
+    assert docs[0]['index_status'] == 'unknown'
 
 
 def test_catalog_returns_unknown_for_legacy_meta_and_can_return_all(tmp_path, monkeypatch):

@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """Excel 本地成功 / 语义索引失败解耦的 API 回归（合成数据 + fake provider）。"""
 import io
+import json
 
+import pytest
 from openpyxl import Workbook
 
 from backend.excel import store as excel_store
@@ -23,6 +25,14 @@ def _xlsx_bytes() -> bytes:
 
 def _upload(api, headers):
     return api.upload_bytes(headers, 'decoupled.xlsx', _xlsx_bytes(), XLSX_MIME)
+
+
+def _listed_match(api, headers, doc_id):
+    resp = api.client.get('/api/v1/rag/documents', headers=headers)
+    assert resp.status_code == 200, resp.text
+    matches = [d for d in resp.json()['documents'] if d.get('document_id') == doc_id]
+    assert len(matches) == 1
+    return resp, matches[0]
 
 
 def test_index_failed_excel_is_listed_and_queryable(api):
@@ -186,3 +196,99 @@ def test_index_failed_excel_is_isolated_by_owner(api):
     assert doc_id not in [d.get('document_id') for d in listed_b['documents']]
     assert api.client.get('/api/v1/rag/excel/%s/preview' % doc_id,
                           headers=user_b).status_code == 404
+
+
+def test_documents_does_not_upgrade_explicit_unknown(api):
+    headers = api.user('decoupled_unknown_status_user')
+    body = _upload(api, headers).json()
+    doc_id = body['document_id']
+    excel_store.update_meta(doc_id, index_status='unknown')
+
+    listed, match = _listed_match(api, headers, doc_id)
+
+    assert match['index_status'] == 'unknown'
+    assert '_legacy_index_status_missing' not in match
+    assert '_legacy_index_status_missing' not in listed.text
+
+
+def test_documents_does_not_upgrade_legacy_indexing(api):
+    headers = api.user('decoupled_indexing_status_user')
+    body = _upload(api, headers).json()
+    doc_id = body['document_id']
+    excel_store.update_meta(doc_id, index_status='indexing')
+
+    listed, match = _listed_match(api, headers, doc_id)
+
+    assert match['index_status'] == 'unknown'
+    assert '_legacy_index_status_missing' not in match
+    # 列表读取只归一返回值，不得改写原始 meta。
+    assert excel_store.load_meta(doc_id)['index_status'] == 'indexing'
+
+
+@pytest.mark.parametrize('explicit_status', [None, ''])
+def test_documents_does_not_upgrade_explicit_null_or_empty(api, explicit_status):
+    suffix = 'null' if explicit_status is None else 'empty'
+    headers = api.user('decoupled_explicit_%s_user' % suffix)
+    body = _upload(api, headers).json()
+    doc_id = body['document_id']
+    excel_store.update_meta(doc_id, index_status=explicit_status)
+
+    listed, match = _listed_match(api, headers, doc_id)
+
+    assert match['index_status'] == 'unknown'
+    assert '_legacy_index_status_missing' not in match
+    assert '_legacy_index_status_missing' not in listed.text
+    # 显式 null/空字符串不是旧字段缺失，列表读取不得改写 meta。
+    assert excel_store.load_meta(doc_id)['index_status'] == explicit_status
+
+
+def test_documents_normalizes_invalid_status_without_legacy_upgrade(api):
+    headers = api.user('decoupled_invalid_status_user')
+    body = _upload(api, headers).json()
+    doc_id = body['document_id']
+    excel_store.update_meta(doc_id, index_status='bogus')
+
+    listed, match = _listed_match(api, headers, doc_id)
+
+    assert match['index_status'] == 'unknown'
+    assert 'bogus' not in listed.text
+    assert '_legacy_index_status_missing' not in match
+    # 非法值不是字段缺失，不得改写原始 meta。
+    assert excel_store.load_meta(doc_id)['index_status'] == 'bogus'
+
+
+def test_documents_upgrades_only_truly_missing_legacy_status(api):
+    headers = api.user('decoupled_missing_status_user')
+    body = _upload(api, headers).json()
+    doc_id = body['document_id']
+
+    meta_path = excel_store.EXCEL_DATA_ROOT / doc_id / 'meta.json'
+    meta = json.loads(meta_path.read_text(encoding='utf-8'))
+    meta.pop('index_status', None)
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding='utf-8')
+
+    listed, match = _listed_match(api, headers, doc_id)
+
+    assert match['index_status'] == 'indexed'
+    assert '_legacy_index_status_missing' not in match
+    assert '_legacy_index_status_missing' not in listed.text
+    assert 'index_status' not in excel_store.load_meta(doc_id)
+
+
+def test_documents_does_not_upgrade_index_failed_with_chroma(api):
+    headers = api.user('decoupled_failed_with_chroma_user')
+    sensitive_detail = 'SENSITIVE_FAILED_STATUS_DETAIL'
+    body = _upload(api, headers).json()
+    doc_id = body['document_id']
+    excel_store.update_meta(
+        doc_id,
+        index_status='index_failed',
+        index_error=sensitive_detail,
+    )
+
+    listed, match = _listed_match(api, headers, doc_id)
+
+    assert match['index_status'] == 'index_failed'
+    assert 'index_error' not in match
+    assert sensitive_detail not in listed.text
+    assert '_legacy_index_status_missing' not in match
