@@ -8,21 +8,20 @@
 - JWT_SECRET / API_KEY / LLM_* / DATABASE_URL / BACKEND_CORS_ORIGINS 优先取自
   pydantic Settings（它已通过 .env / 环境变量加载），避免“pydantic 读 .env 但
   os.getenv 读不到”的不一致。
-- ALLOWED_HOSTS / HOST / PORT / LOG_* 等仅生产相关的项取自环境变量；ALLOWED_HOSTS
-  缺失或含通配符 '*' 时，在 validate_config（启动期）安全失败，而非导入期崩溃。
+- ALLOWED_HOSTS / HOST / PORT 也取自统一 Settings（因此项目根 `.env` 生效）；
+  LOG_* 等仅生产相关的项仍取自环境变量；ALLOWED_HOSTS 缺失或含通配符 '*'
+  时，在 validate_config（启动期）安全失败，而非导入期崩溃。
 """
-import os
-
-from backend.config.settings import settings
+from backend.config.settings import parse_allowed_hosts, settings
 
 
 class ProductionConfig:
     """生产环境配置"""
 
-    # 服务器配置
+    # 服务器配置：统一从 Settings 读取；未配置时保留生产原有默认值。
     DEBUG = False
-    HOST = os.getenv('HOST', '0.0.0.0')
-    PORT = int(os.getenv('PORT', '8000'))
+    HOST = settings.HOST or '0.0.0.0'
+    PORT = settings.PORT or 8000
 
     # 应用元信息（供 main.py 使用）
     APP_NAME = 'My AI Assistant API'
@@ -33,10 +32,9 @@ class ProductionConfig:
     # 安全配置：JWT_SECRET 必填（取自已加载的 settings，缺失即启动失败）
     SECRET_KEY = settings.JWT_SECRET
 
-    # ALLOWED_HOSTS：导入期不崩溃；空列表在 validate_config 中安全失败（不允许通配符 '*'）
-    ALLOWED_HOSTS = [
-        h.strip() for h in os.getenv('ALLOWED_HOSTS', '').split(',') if h.strip()
-    ]
+    # ALLOWED_HOSTS：从统一 Settings 读取（进程环境变量 > 项目根 .env > 默认值）；
+    # 导入期不崩溃，空列表在 validate_config 中安全失败（不允许通配符 '*'）。
+    ALLOWED_HOSTS = parse_allowed_hosts(settings.ALLOWED_HOSTS)
 
     # 数据库配置
     DATABASE_URL = settings.DATABASE_URL

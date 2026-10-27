@@ -37,7 +37,7 @@ MAX_UPLOAD_BYTES = 99 * 1024 * 1024
 _CLEAR_ENV = (
     'ENVIRONMENT', 'JWT_SECRET', 'DATABASE_URL', 'LLM_MODEL', 'LLM_TIMEOUT',
     'MAX_UPLOAD_SIZE', 'HOST', 'PORT', 'API_KEY', 'LLM_PROVIDER', 'LLM_BASE_URL',
-    'EMBEDDING_MODEL',
+    'EMBEDDING_MODEL', 'ALLOWED_HOSTS',
 )
 
 
@@ -124,6 +124,196 @@ def _make_env_file(tmp_path, name, **pairs):
     path = tmp_path / (name + '.env')
     path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     return path
+
+
+ALLOWED_HOSTS_SETTINGS_PROBE = (
+    "import json\n"
+    "from backend.config.settings import Settings, parse_allowed_hosts\n"
+    "s = Settings(_env_file=%r)\n"
+    "print('PROBE_JSON:' + json.dumps({'raw': s.ALLOWED_HOSTS,"
+    " 'parsed': parse_allowed_hosts(s.ALLOWED_HOSTS)}))\n"
+)
+
+PRODUCTION_ALLOWED_HOSTS_PROBE = (
+    "import json\n"
+    "from backend.config.settings import settings\n"
+    "settings.ALLOWED_HOSTS = 'api.example.com, localhost,, '\n"
+    "from backend.config.production import ProductionConfig\n"
+    "print('PROBE_JSON:' + json.dumps({"
+    "'hosts': ProductionConfig.ALLOWED_HOSTS}))\n"
+)
+
+PRODUCTION_ALLOWED_HOSTS_EMPTY_PROBE = (
+    "import json\n"
+    "from backend.config.settings import settings\n"
+    "settings.ALLOWED_HOSTS = ''\n"
+    "from backend.config.production import ProductionConfig\n"
+    "try:\n"
+    "    ProductionConfig.validate_config()\n"
+    "except ValueError as exc:\n"
+    "    print('PROBE_JSON:' + json.dumps({'error': 'ValueError',"
+    " 'message': str(exc)}))\n"
+    "else:\n"
+    "    print('PROBE_JSON:' + json.dumps({'error': None}))\n"
+)
+
+HOST_PORT_SETTINGS_PROBE = (
+    "import json\n"
+    "from backend.config.settings import Settings\n"
+    "s = Settings(_env_file=%r)\n"
+    "print('PROBE_JSON:' + json.dumps({'host': s.HOST, 'port': s.PORT}))\n"
+)
+
+HOST_PORT_INVALID_PROBE = (
+    "import json\n"
+    "from pydantic import ValidationError\n"
+    "from backend.config.settings import Settings\n"
+    "try:\n"
+    "    Settings(_env_file=%r)\n"
+    "except ValidationError as exc:\n"
+    "    print('PROBE_JSON:' + json.dumps({'error': 'ValidationError',"
+    " 'message': str(exc)[:600]}))\n"
+    "else:\n"
+    "    print('PROBE_JSON:' + json.dumps({'error': None}))\n"
+)
+
+DEV_SERVER_CONFIG_PROBE = (
+    "import json\n"
+    "import backend.config as c\n"
+    "print('PROBE_JSON:' + json.dumps({'host': c.Config.HOST,"
+    " 'port': c.Config.PORT}))\n"
+)
+
+PRODUCTION_SERVER_CONFIG_PROBE = (
+    "import json\n"
+    "from backend.config.production import ProductionConfig as C\n"
+    "print('PROBE_JSON:' + json.dumps({'host': C.HOST, 'port': C.PORT}))\n"
+)
+
+MAIN_SERVER_CONFIG_PROBE = (
+    "import json\n"
+    "import backend.main as m\n"
+    "print('PROBE_JSON:' + json.dumps({'host': m.Config.HOST,"
+    " 'port': m.Config.PORT}))\n"
+)
+
+
+# ==========================================================================
+# ALLOWED_HOSTS：统一 Settings 来源与生产配置消费
+# ==========================================================================
+def test_allowed_hosts_reads_tmp_env_and_strips_empty_entries(tmp_path):
+    path = _make_env_file(
+        tmp_path,
+        'allowed-hosts',
+        ALLOWED_HOSTS='api.example.com, localhost,,',
+    )
+
+    data = _probe(ALLOWED_HOSTS_SETTINGS_PROBE % str(path))
+
+    assert data['raw'] == 'api.example.com, localhost,,'
+    assert data['parsed'] == ['api.example.com', 'localhost']
+
+
+def test_allowed_hosts_process_env_overrides_tmp_env(tmp_path):
+    path = _make_env_file(
+        tmp_path,
+        'allowed-hosts-priority',
+        ALLOWED_HOSTS='file.example.com',
+    )
+
+    data = _probe(
+        ALLOWED_HOSTS_SETTINGS_PROBE % str(path),
+        {'ALLOWED_HOSTS': 'env.example.com, env2.example.com'},
+    )
+
+    assert data['raw'] == 'env.example.com, env2.example.com'
+    assert data['parsed'] == ['env.example.com', 'env2.example.com']
+
+
+def test_production_config_uses_settings_allowed_hosts():
+    data = _probe(PRODUCTION_ALLOWED_HOSTS_PROBE)
+
+    assert data['hosts'] == ['api.example.com', 'localhost']
+
+
+def test_production_config_still_rejects_empty_allowed_hosts():
+    data = _probe(PRODUCTION_ALLOWED_HOSTS_EMPTY_PROBE)
+
+    assert data['error'] == 'ValueError'
+    assert 'ALLOWED_HOSTS' in data['message']
+
+
+# ==========================================================================
+# HOST / PORT：统一 Settings、环境优先级与异常校验
+# ==========================================================================
+def test_host_port_reads_tmp_env(tmp_path):
+    path = _make_env_file(
+        tmp_path,
+        'server-bind',
+        HOST='127.0.0.1',
+        PORT='9001',
+    )
+
+    data = _probe(HOST_PORT_SETTINGS_PROBE % str(path))
+
+    assert data == {'host': '127.0.0.1', 'port': 9001}
+
+
+def test_host_port_process_env_overrides_tmp_env(tmp_path):
+    path = _make_env_file(
+        tmp_path,
+        'server-bind-priority',
+        HOST='file.example.com',
+        PORT='9001',
+    )
+
+    data = _probe(
+        HOST_PORT_SETTINGS_PROBE % str(path),
+        {'HOST': 'env.example.com', 'PORT': '9002'},
+    )
+
+    assert data == {'host': 'env.example.com', 'port': 9002}
+
+
+@pytest.mark.parametrize('bad_port', ['', 'abc', '0', '70000'])
+def test_invalid_port_is_rejected(tmp_path, bad_port):
+    path = _make_env_file(
+        tmp_path,
+        'server-bind-invalid',
+        PORT=bad_port,
+    )
+
+    data = _probe(HOST_PORT_INVALID_PROBE % str(path))
+
+    assert data['error'] == 'ValidationError'
+    assert 'PORT' in data['message']
+
+
+def test_development_config_uses_settings_host_port():
+    data = _probe(
+        DEV_SERVER_CONFIG_PROBE,
+        {'ENVIRONMENT': 'development', 'HOST': '127.0.0.1', 'PORT': '9001'},
+    )
+
+    assert data == {'host': '127.0.0.1', 'port': 9001}
+
+
+def test_production_config_uses_settings_host_port():
+    data = _probe(
+        PRODUCTION_SERVER_CONFIG_PROBE,
+        {'ENVIRONMENT': 'production', 'HOST': '127.0.0.1', 'PORT': '9002'},
+    )
+
+    assert data == {'host': '127.0.0.1', 'port': 9002}
+
+
+def test_main_uses_resolved_host_port_config():
+    data = _probe(
+        MAIN_SERVER_CONFIG_PROBE,
+        {'ENVIRONMENT': 'development', 'HOST': '127.0.0.1', 'PORT': '9003'},
+    )
+
+    assert data == {'host': '127.0.0.1', 'port': 9003}
 
 
 # ==========================================================================
@@ -359,18 +549,22 @@ def test_configured_limit_above_legacy_10mb_is_honored(tmp_path):
 def test_dev_default_port_is_8021():
     code = ("import backend.config as c\n"
             "print('ENV=' + c.env)\n"
+            "print('HOST=%s' % c.Config.HOST)\n"
             "print('PORT=%s' % c.Config.PORT)\n")
     proc = _run(code)
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert 'ENV=development' in proc.stdout
+    assert 'HOST=0.0.0.0' in proc.stdout
     assert 'PORT=8021' in proc.stdout
 
 
 def test_production_default_port_stays_8000():
     code = ("from backend.config.production import ProductionConfig as C\n"
+            "print('HOST=%s' % C.HOST)\n"
             "print('PORT=%s' % C.PORT)\n")
     proc = _run(code, {'ENVIRONMENT': 'production'})
     assert proc.returncode == 0, proc.stderr[-2000:]
+    assert 'HOST=0.0.0.0' in proc.stdout
     assert 'PORT=8000' in proc.stdout
 
 
@@ -389,13 +583,21 @@ def test_frontend_and_readme_use_same_dev_ports():
 
 
 def test_start_scripts_use_dev_ports():
-    # 仓库内跟踪的脚本：必须存在且端口正确
+    # 仓库内跟踪的脚本：默认端口保持 8021 / 5181，且启动参数来自 Settings。
     text = (REPO_ROOT / 'start.sh').read_text('utf-8', errors='ignore')
     assert '8021' in text and '5181' in text
+    assert 'settings.HOST' in text and 'settings.PORT' in text
+    assert '--host "$BACKEND_HOST"' in text
+    assert '--port "$BACKEND_PORT"' in text
+    assert '--host 127.0.0.1 --port 8021' not in text
 
     bat = (REPO_ROOT / 'start_backend.bat').read_text('utf-8', errors='ignore')
     assert '8021' in bat
     assert '8000' not in bat
+    assert 'settings.HOST' in bat and 'settings.PORT' in bat
+    assert '--host "%BACKEND_HOST%"' in bat
+    assert '--port "%BACKEND_PORT%"' in bat
+    assert '--host 127.0.0.1 --port 8021' not in bat
 
     # 本地便利脚本（.gitignore: /start_*.ps1，干净检出中不存在）→ 存在时才校验
     for name in ('start_servers.ps1', 'start_copy.ps1'):

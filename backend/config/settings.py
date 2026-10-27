@@ -83,6 +83,35 @@ class Settings(BaseSettings):
     # CORS
     BACKEND_CORS_ORIGINS: list[str] | str = []
 
+    # 生产环境允许的 Host（逗号分隔）。放在 Settings 中，确保项目根 .env
+    # 与进程环境变量共用同一加载/优先级机制，而不是依赖 os.getenv。
+    ALLOWED_HOSTS: str = ""
+
+    # 服务监听地址与端口（可选，用于保留开发/生产各自的默认端口）。
+    # 优先级：显式启动参数 > 进程环境变量 > 项目根 .env > 环境默认值。
+    HOST: str | None = None
+    PORT: int | None = Field(default=None, ge=1, le=65535)
+
+    @field_validator("HOST", mode="before")
+    @classmethod
+    def normalize_host(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("HOST 不能为空")
+        return value
+
+    @field_validator("PORT", mode="before")
+    @classmethod
+    def normalize_port(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("PORT 不能为空")
+        return value
+
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v):
@@ -154,6 +183,11 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+
+def parse_allowed_hosts(value: str) -> list[str]:
+    """解析逗号分隔的 ALLOWED_HOSTS，丢弃空白项。"""
+    return [host.strip() for host in (value or '').split(',') if host.strip()]
 
 
 settings = Settings()

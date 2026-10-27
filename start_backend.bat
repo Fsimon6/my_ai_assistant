@@ -22,10 +22,26 @@ if not exist ".env" (
     exit /b 1
 )
 
-echo 后端地址 : http://127.0.0.1:8021
-echo API 文档 : http://127.0.0.1:8021/docs
+set "BACKEND_HOST="
+for /f "delims=" %%H in ('call ".venv\Scripts\python.exe" -c "from backend.config.settings import settings; print(settings.HOST or '127.0.0.1')"') do set "BACKEND_HOST=%%H"
+if not defined BACKEND_HOST (
+    echo [ERROR] 无法解析后端 HOST，请检查 .env 中的 HOST 配置
+    pause
+    exit /b 1
+)
+
+set "BACKEND_PORT="
+for /f "delims=" %%P in ('call ".venv\Scripts\python.exe" -c "from backend.config.settings import settings; print(settings.PORT or 8021)"') do set "BACKEND_PORT=%%P"
+if not defined BACKEND_PORT (
+    echo [ERROR] 无法解析后端 PORT，请检查 .env 中的 PORT 配置
+    pause
+    exit /b 1
+)
+
+echo 后端地址 : http://%BACKEND_HOST%:%BACKEND_PORT%
+echo API 文档 : http://%BACKEND_HOST%:%BACKEND_PORT%/docs
 echo 按 Ctrl+C 停止
 echo.
 
-".venv\Scripts\python.exe" -m uvicorn backend.main:app --host 127.0.0.1 --port 8021 --reload
+".venv\Scripts\python.exe" -m uvicorn backend.main:app --host "%BACKEND_HOST%" --port "%BACKEND_PORT%" --reload
 pause

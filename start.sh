@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 一键启动（Git Bash / WSL）：后端 8021 + 前端 5181
 # 说明：
-#   * 后端端口由 `uvicorn --port` 显式指定（开发环境的唯一实际生效来源）；
+#   * 后端 HOST / PORT 先由统一 Settings 解析（进程环境变量 > 根 .env > 脚本默认 127.0.0.1:8021）；
 #   * `.env` 在进程启动时读取一次，改完需重跑本脚本；
 #   * 前端端口来自 frontend/vite.config.ts 的 server.port（5181）。
 set -u
@@ -14,6 +14,7 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+BACKEND_HOST=127.0.0.1
 BACKEND_PORT=8021
 FRONTEND_PORT=5181
 
@@ -57,8 +58,17 @@ elif [ "$DB_STATE" = "NON_SQLITE" ]; then
   echo -e "${YELLOW}非 SQLite 的 DATABASE_URL：请按部署文档手动执行一次 python -m backend.init_db${NC}"
 fi
 
-echo -e "${GREEN}backend  -> http://127.0.0.1:${BACKEND_PORT}${NC}"
-"$PY" -m uvicorn backend.main:app --host 127.0.0.1 --port "$BACKEND_PORT" --reload &
+BACKEND_HOST="$("$PY" -c 'from backend.config.settings import settings; print(settings.HOST or "127.0.0.1")')" || {
+  echo -e "${RED}无法解析后端 HOST，请检查 .env 中的 HOST 配置${NC}"
+  exit 1
+}
+BACKEND_PORT="$("$PY" -c 'from backend.config.settings import settings; print(settings.PORT or 8021)')" || {
+  echo -e "${RED}无法解析后端 PORT，请检查 .env 中的 PORT 配置${NC}"
+  exit 1
+}
+
+echo -e "${GREEN}backend  -> http://${BACKEND_HOST}:${BACKEND_PORT}${NC}"
+"$PY" -m uvicorn backend.main:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" --reload &
 BACKEND_PID=$!
 
 echo -e "${GREEN}frontend -> http://127.0.0.1:${FRONTEND_PORT}${NC}"
@@ -72,5 +82,5 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-echo -e "${YELLOW}Ctrl+C 停止；后端 :${BACKEND_PORT}，前端 :${FRONTEND_PORT}${NC}"
+echo -e "${YELLOW}Ctrl+C 停止；后端 :${BACKEND_HOST}:${BACKEND_PORT}，前端 :${FRONTEND_PORT}${NC}"
 wait

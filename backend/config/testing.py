@@ -103,9 +103,10 @@ class TestingConfig:
     APP_VERSION: str = '1.0.0'
     APP_DESCRIPTION: str = '基于大模型的本地知识库智能问答助手API'
     API_V1_PREFIX: str = '/api/v1'
-    # 测试默认使用本机回环地址与独立端口，避免与开发 8021 / 生产 8000 冲突。
-    HOST: str = os.getenv('TEST_HOST', '127.0.0.1')
-    PORT: int = int(os.getenv('TEST_PORT', '8022'))
+    # 优先使用统一 Settings（HOST/PORT）；未配置时保留 TEST_HOST/TEST_PORT
+    # 兼容变量及测试默认值，避免与开发 8021 / 生产 8000 冲突。
+    HOST: str = settings.HOST or os.getenv('TEST_HOST', '127.0.0.1')
+    PORT: int = settings.PORT or int(os.getenv('TEST_PORT', '8022'))
 
     # ========== 基础配置 ==========
     DEBUG: bool = True

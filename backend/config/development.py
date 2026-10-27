@@ -24,9 +24,17 @@ class DevelopmentConfig:
     APP_VERSION: str = '1.0.0'
     APP_DESCRIPTION: str = '基于大模型的本地知识库智能问答助手API'
     API_V1_PREFIX: str = '/api/v1'
-    HOST: str = os.getenv('HOST', '0.0.0.0')
+    # HOST / PORT 统一从 Settings 读取；未配置时保留开发环境原有默认值。
+    HOST: str = (
+        getattr(_unified_settings, 'HOST', None)
+        if _unified_settings else os.getenv('HOST')
+    ) or '0.0.0.0'
     # 开发默认端口：与 README / 启动脚本 / Vite 代理保持一致（8021）
-    PORT: int = int(os.getenv('PORT', '8021'))
+    PORT: int = int(
+        (getattr(_unified_settings, 'PORT', None)
+         if _unified_settings else os.getenv('PORT'))
+        or 8021
+    )
 
     # 基础配置
     # F1：DEBUG 委托给统一配置（`.env` 的 DEBUG 生效）；统一配置不可用时保持原默认 True。
