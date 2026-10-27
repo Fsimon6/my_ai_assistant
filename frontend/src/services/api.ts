@@ -54,6 +54,19 @@ export interface RagUploadResult {
   [key: string]: any
 }
 
+export interface RagIndexRetryResult {
+  success?: boolean
+  partial?: boolean
+  document_id?: string
+  filename?: string
+  index_status?: 'pending' | 'indexing' | 'indexed' | 'index_failed' | 'unknown' | string
+  index_error_code?: string
+  index_message?: string
+  can_retry_index?: boolean
+  total_chunks?: number
+  [key: string]: any
+}
+
 export interface RagQueryResult {
   success?: boolean | string
   response?: string
@@ -428,6 +441,14 @@ export const ragApi = {
       timeout: 300000
     })
     return res as unknown as RagUploadResult
+  },
+
+  // 显式重试 Excel 语义索引（仅后端判定可重试的本地 Excel）
+  retryExcelIndex: async (documentId: string): Promise<RagIndexRetryResult> => {
+    const res = await api.post(`/rag/documents/${documentId}/retry-index`, {}, {
+      timeout: 300000
+    })
+    return res as unknown as RagIndexRetryResult
   },
 
   // 查询文档（可选 documentId 限定只在该文档内检索）

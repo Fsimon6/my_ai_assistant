@@ -78,6 +78,19 @@ def _fail_meta_on(monkeypatch, predicate):
     return calls
 
 
+def _failed_local(tmp_path, monkeypatch):
+    """创建一份本地可重试的 index_failed/false Excel。"""
+    monkeypatch.setattr(excel_store, 'EXCEL_DATA_ROOT', tmp_path / 'excel')
+    xlsx = tmp_path / 'retry-local.xlsx'
+    _make_xlsx(xlsx)
+    vs = FakeVectorStore(fail_add=True)
+    svc = _service(vs)
+    out = _run(svc, xlsx)
+    assert out['index_status'] == 'index_failed'
+    assert out['partial'] is True
+    return svc, out['document_id']
+
+
 def test_constructor_does_not_initialize_llm_or_vector(monkeypatch):
     """RagService() 本身不能因缺少 API Key/Chroma 配置失败。"""
     def fail():
@@ -283,6 +296,109 @@ def test_catalog_maps_legacy_indexing_to_unknown(tmp_path, monkeypatch):
     docs = excel_store.list_excel_catalog(user_id=7, max_docs=None)
 
     assert docs[0]['index_status'] == 'unknown'
+
+
+def test_retry_failure_cleanup_confirmed_allows_retry(tmp_path, monkeypatch):
+    svc, doc_id = _failed_local(tmp_path, monkeypatch)
+    vs = FakeVectorStore(fail_add=True)
+    svc.vector_store = vs
+
+    out = asyncio.run(svc.retry_excel_index(doc_id, 7))
+
+    assert out['success'] is False
+    assert out['partial'] is True
+    assert out['index_status'] == 'index_failed'
+    assert out['can_retry_index'] is True
+    assert vs.deleted and vs.deleted[0][2] is True
+    meta = excel_store.load_meta(doc_id)
+    assert meta['index_status'] == 'index_failed'
+    assert meta['vector_write_started'] is False
+    assert excel_store.load_representation(doc_id) is not None
+
+
+def test_retry_failure_cleanup_unconfirmed_blocks_retry(tmp_path, monkeypatch):
+    svc, doc_id = _failed_local(tmp_path, monkeypatch)
+    vs = FakeVectorStore(fail_add=True, fail_cleanup=True)
+    svc.vector_store = vs
+
+    out = asyncio.run(svc.retry_excel_index(doc_id, 7))
+
+    assert out['success'] is False
+    assert out['partial'] is True
+    assert out['index_status'] == 'index_failed'
+    assert out['can_retry_index'] is False
+    meta = excel_store.load_meta(doc_id)
+    assert meta['index_status'] == 'index_failed'
+    assert meta['vector_write_started'] is True
+    assert excel_store.load_representation(doc_id) is not None
+
+
+def test_retry_failure_status_persist_failure_keeps_unknown(tmp_path, monkeypatch):
+    svc, doc_id = _failed_local(tmp_path, monkeypatch)
+    vs = FakeVectorStore(fail_add=True)
+    svc.vector_store = vs
+    _fail_meta_on(
+        monkeypatch,
+        lambda updates: updates.get('index_status') == 'index_failed',
+    )
+
+    out = asyncio.run(svc.retry_excel_index(doc_id, 7))
+
+    assert out['success'] is False
+    assert out['partial'] is True
+    assert out['index_status'] == 'index_failed'
+    assert out['can_retry_index'] is False
+    meta = excel_store.load_meta(doc_id)
+    assert meta['index_status'] == 'unknown'
+    assert meta['vector_write_started'] is True
+    assert excel_store.load_representation(doc_id) is not None
+
+
+class BlockingVectorStore(FakeVectorStore):
+    def __init__(self, started: asyncio.Event, release: asyncio.Event):
+        super().__init__()
+        self.calls = 0
+        self.started = started
+        self.release = release
+
+    async def add_documents(self, documents):
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        self.added.extend(documents)
+        return [d['id'] for d in documents]
+
+
+def test_retry_same_document_is_serialized(tmp_path, monkeypatch):
+    svc, doc_id = _failed_local(tmp_path, monkeypatch)
+
+    async def run_both():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        vs = BlockingVectorStore(started, release)
+        svc.vector_store = vs
+        first = asyncio.create_task(svc.retry_excel_index(doc_id, 7))
+        second = None
+        try:
+            # 第一请求已经进入 add_documents；此时第二请求必须被拒绝。
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            second = await svc.retry_excel_index(doc_id, 7)
+            assert second['success'] is False
+            assert second['error_code'] == 'INDEX_RETRY_IN_PROGRESS'
+            assert vs.calls == 1
+        finally:
+            # 无论断言是否失败都释放阻塞，避免测试挂起。
+            release.set()
+            first_result = await first
+        return first_result, second, vs
+
+    first_result, second, vs = asyncio.run(run_both())
+
+    assert first_result['success'] is True
+    assert vs.calls == 1
+    assert second is not None
+    assert second['success'] is False
+    assert second['error_code'] == 'INDEX_RETRY_IN_PROGRESS'
 
 
 def test_catalog_returns_unknown_for_legacy_meta_and_can_return_all(tmp_path, monkeypatch):

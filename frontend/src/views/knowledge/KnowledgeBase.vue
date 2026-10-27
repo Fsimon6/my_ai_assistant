@@ -159,7 +159,7 @@
 
               <el-table-column
                 label="操作"
-                width="200"
+                width="260"
                 fixed="right">
                 <template #default="scope">
                   <div class="action-buttons">
@@ -176,6 +176,16 @@
                       @click="previewDocument(scope.row)"
                     >
                       预览
+                    </el-button>
+                    <el-button
+                      v-if="scope.row.kind === 'excel' && scope.row.can_retry_index"
+                      type="warning"
+                      size="small"
+                      :loading="retryingIndexId === scope.row.document_id"
+                      :disabled="!!retryingIndexId && retryingIndexId !== scope.row.document_id"
+                      @click="retryIndex(scope.row)"
+                    >
+                      重试索引
                     </el-button>
                     <el-button
                       type="danger"
@@ -465,6 +475,7 @@ const uploadHistory = ref<any[]>([])
 const searchQuery = ref('')
 const quickQuery = ref('')
 const queryResult = ref('')
+const retryingIndexId = ref('')
 
 // 文档预览（拉取该文档全部分块原文）
 const previewVisible = ref(false)
@@ -598,6 +609,7 @@ const loadDocuments = async () => {
       size: d.size || 0,
       chunks: d.chunks || 0,
       index_status: d.index_status || (d.kind === 'excel' ? 'unknown' : ''),
+      can_retry_index: d.can_retry_index === true,
       local_available: d.local_available !== false,
       uploadTime: d.created_at ? new Date(d.created_at).toLocaleString() : ''
     }))
@@ -964,6 +976,34 @@ const deleteDocument = async (doc: any) => {
     console.error('删除文档失败：', error)
     const detail = error?.response?.data?.detail || error?.message || '请重试'
     ElMessage.error('删除失败：' + detail)
+  }
+}
+
+const retryIndex = async (doc: any) => {
+  if (!doc?.can_retry_index) {
+    await loadDocuments()
+    ElMessage.warning('当前文档不满足重试条件，已刷新状态')
+    return
+  }
+  if (retryingIndexId.value) return
+  retryingIndexId.value = doc.document_id
+  try {
+    const result = await ragApi.retryExcelIndex(doc.document_id)
+    if (result?.success) {
+      ElMessage.success('语义索引重试成功')
+    } else {
+      ElMessage.warning(result?.index_message || result?.message || '索引重试未完成，请查看状态后重试')
+    }
+    await loadDocuments()
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail
+    const message = typeof detail === 'string'
+      ? detail
+      : (detail?.message || error?.message || '请稍后重试')
+    ElMessage.error('索引重试失败：' + message)
+    await loadDocuments()
+  } finally {
+    retryingIndexId.value = ''
   }
 }
 

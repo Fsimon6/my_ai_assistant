@@ -86,6 +86,7 @@ def save_artifacts(
     source_path: str,
     original_filename: str,
     file_size: int = 0,
+    custom_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     """保存原始文件 + representation.json + meta.json，返回落盘路径。"""
     doc_dir = _doc_dir(representation.document_id)
@@ -121,6 +122,9 @@ def save_artifacts(
         'index_error': '',
         'indexed_at': '',
         'file_size': int(file_size or 0),
+        # 保留上传时用于 chunk 的自定义 metadata，供显式索引重试恢复；
+        # 仅内部持久化，不进入 /documents 公开响应。
+        'custom_metadata': dict(custom_metadata) if isinstance(custom_metadata, dict) else {},
         'chunks': 0,
         'updated_at': now,
         # 只有真正准备调用 add_documents 前才允许置为 True。
@@ -192,6 +196,35 @@ def load_meta(document_id: str) -> Optional[Dict[str, Any]]:
 
 def artifacts_exist(document_id: str) -> bool:
     return (_doc_dir(document_id) / 'representation.json').exists()
+
+
+def retry_materials_ready(meta: Optional[Dict[str, Any]], document_id: str) -> bool:
+    """重试索引前的保守本地材料检查。
+
+    这里只检查状态、写入标记和文件存在性；调用方仍需重新读取并解析
+    representation、校验用户所有权，最后以后端重试流程的检查为准。
+    """
+    if not meta:
+        return False
+    if meta.get('index_status') != 'index_failed':
+        return False
+    # 必须是明确的布尔 False；缺失/None/True 都不允许重试。
+    if meta.get('vector_write_started') is not False:
+        return False
+    # 旧版 meta 没有记录自定义 metadata，无法安全保证重试 chunk 与首次索引一致。
+    if 'custom_metadata' not in meta or not isinstance(meta.get('custom_metadata'), dict):
+        return False
+    original_path = meta.get('original_path')
+    if not original_path:
+        return False
+    representation_path = (
+        meta.get('representation_path')
+        or str(_doc_dir(document_id) / 'representation.json')
+    )
+    try:
+        return os.path.isfile(original_path) and os.path.isfile(representation_path)
+    except (OSError, TypeError):
+        return False
 
 
 def delete_artifacts(document_id: str) -> bool:
@@ -304,6 +337,14 @@ def list_excel_catalog(
                 'indexed_at': meta.get('indexed_at') or '',
                 # None 表示旧数据未知；False 才是本代码可靠记录的“从未开始写入”。
                 'vector_write_started': meta.get('vector_write_started'),
+                # 仅供 UI 展示；最终重试资格仍由重试 API 重新校验。
+                'can_retry_index': bool(
+                    retry_materials_ready(meta, doc_dir.name)
+                    and any(
+                        int(sh.get('column_count') or 0) > 0
+                        for sh in data.get('sheets', [])
+                    )
+                ),
             })
             # 只给 /documents 的内部合并逻辑使用；不是公开字段，调用方必须 pop。
             if include_legacy_marker and legacy_missing:

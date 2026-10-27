@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
@@ -49,8 +49,9 @@ class QueryWithHistoryRequest(BaseModel):
 
 @router.post('/upload')
 async def upload_document(
+    request: Request = None,
     file: UploadFile = File(...),
-    metadata: Optional[str] = None,
+    metadata: Optional[str] = Form(None),
     current_user: User = Depends(get_current_active_user)
 ):
     """上传并处理文档（需登录；文档归属当前用户）"""
@@ -80,13 +81,17 @@ async def upload_document(
         except OSError:
             file_size = 0
 
-        # 解析元数据
+        # 解析元数据：表单 metadata 优先，兼容旧调用方的查询参数 metadata。
+        # 表单未提供（None）时才回退到 ?metadata=；显式空表单值仍按表单值处理。
+        metadata_value = metadata
+        if metadata_value is None and request is not None:
+            metadata_value = request.query_params.get('metadata')
         parsed_metadata = {}
-        if metadata:
+        if metadata_value:
             try:
-                parsed_metadata = json.loads(metadata)
-            except:
-                parsed_metadata = {'custom_metadata': metadata}
+                parsed_metadata = json.loads(metadata_value)
+            except Exception:
+                parsed_metadata = {'custom_metadata': metadata_value}
 
         # 处理文档（归属当前用户，用于向量隔离）
         result = await rag_service.process_and_store_document(
@@ -535,6 +540,44 @@ async def delete_documents(
         raise HTTPException(
             status_code=500,
             detail=f'删除文档失败：{str(e)}'
+        )
+
+
+@router.post('/documents/{document_id}/retry-index')
+async def retry_excel_index(
+    document_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """显式重试本地 Excel 的语义索引。
+
+    仅允许当前用户拥有、index_failed、vector_write_started 明确为 false、
+    且本地原始文件和 representation 完整的文档。最终资格以服务层锁内检查为准。
+    """
+    try:
+        result = await get_rag_service().retry_excel_index(
+            document_id=document_id,
+            user_id=current_user.id,
+        )
+        http_status = int(result.get('http_status') or 200)
+        if http_status >= 400:
+            raise HTTPException(
+                status_code=http_status,
+                detail={
+                    'error_code': result.get('error_code') or 'INDEX_RETRY_NOT_ALLOWED',
+                    'message': result.get('message') or '当前文档不满足重试条件。',
+                },
+            )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error('Excel 索引重试失败 document_id=%s：%s', document_id, e)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                'error_code': 'INDEX_RETRY_INTERNAL_ERROR',
+                'message': '索引重试失败，请稍后重试。',
+            },
         )
 
 

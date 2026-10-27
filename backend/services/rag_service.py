@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os
+import asyncio
 import os
 import uuid
 from typing import List, Dict, Any, Optional
@@ -48,6 +48,8 @@ class RagService:
         # LLM 与向量存储改为首次真正需要时再初始化；cache 无外部依赖，保持原行为。
         self._llm = None
         self._vector_store = None
+        # 单进程内按文档串行化显式索引重试；不提供跨进程/分布式互斥。
+        self._retry_locks: Dict[str, asyncio.Lock] = {}
         # 分块参数唯一来源：document_service.DocumentProcessor 的默认值
         # （chunk_size=1000 / chunk_overlap=200）；process_and_store_document 以无参方式构造它
         # （见本文件下方 processor = DocumentProcessor()）。
@@ -262,6 +264,7 @@ class RagService:
                     file_path,
                     display_name,
                     file_size=file_size,
+                    custom_metadata=metadata,
                 )
                 local_ready = True
             except Exception as e:
@@ -279,153 +282,19 @@ class RagService:
                 }
 
             # ---------- 阶段 B：可选语义索引 ----------
-            index_status = 'pending'
-            index_error_code = ''
-            index_error = ''
-            index_message = ''
-            chunks: List[Dict[str, Any]] = []
-            ids: List[str] = []
-
-            try:
-                chunks = self._build_excel_chunks(
-                    representation=representation,
-                    metadata=metadata,
-                    original_filename=display_name,
-                    file_size=file_size,
-                    user_id=user_id,
-                )
-
-                # 先初始化向量存储；初始化失败时尚未开始写入，vector_write_started 保持 false。
-                try:
-                    vector_store = self._get_vector_store()
-                except Exception as e:
-                    classified = classify_upload_error(e)
-                    index_status = 'index_failed'
-                    index_error_code = classified.error_code
-                    index_error = classified.detail or str(e)
-                    index_message = (
-                        f'{EXCEL_LOCAL_READY_INDEX_FAILED} {classified.message}'
-                        if classified.message else EXCEL_LOCAL_READY_INDEX_FAILED
-                    )
-                    excel_store.update_meta(
-                        document_id,
-                        index_status=index_status,
-                        index_error_code=index_error_code,
-                        index_error=index_error,
-                        chunks=0,
-                        vector_write_started=False,
-                    )
-                    raise _ExcelIndexFailure from e
-
-                # 写入意图必须先持久化；失败则绝不继续写入。
-                # 这里写 unknown 而不是 indexing：若后续最终状态（indexed/index_failed）
-                # 持久化失败，meta 只能保留“未知”，绝不能永久停在“索引中”而误导列表。
-                try:
-                    excel_store.update_meta(
-                        document_id,
-                        index_status='unknown',
-                        vector_write_started=True,
-                    )
-                except Exception as e:
-                    index_status = 'unknown'
-                    index_error_code = 'INDEX_STATUS_PERSIST_FAILED'
-                    index_error = '索引状态无法持久化'
-                    index_message = 'Excel 已保存在本地，但无法可靠记录语义索引状态。'
-                    logger.warning(
-                        'Excel 索引状态持久化失败 document_id=%s：%s', document_id, e
-                    )
-                    raise _ExcelIndexFailure from e
-
-                try:
-                    ids = await vector_store.add_documents(chunks) if chunks else []
-                    if chunks and len(ids or []) != len(chunks):
-                        raise RuntimeError(
-                            f'向量写入数量异常：期望 {len(chunks)} 条，实际 {len(ids or [])} 条'
-                        )
-                except Exception as e:
-                    classified = classify_upload_error(e)
-                    index_status = 'index_failed'
-                    index_error_code = classified.error_code
-                    index_error = classified.detail or str(e)
-                    index_message = (
-                        f'{EXCEL_LOCAL_READY_INDEX_FAILED} {classified.message}'
-                        if classified.message else EXCEL_LOCAL_READY_INDEX_FAILED
-                    )
-
-                    # 部分写入可能已经发生。只有严格删除确认成功，才允许把
-                    # vector_write_started 改回 false；否则保留可能残留的标记。
-                    cleanup_confirmed = False
-                    try:
-                        await vector_store.delete_documents(
-                            [document_id], user_id=user_id, strict=True
-                        )
-                        cleanup_confirmed = True
-                    except Exception as cleanup_err:
-                        logger.warning('清理可能残留的 Excel 向量失败：%s', cleanup_err)
-
-                    try:
-                        excel_store.update_meta(
-                            document_id,
-                            index_status=index_status,
-                            index_error_code=index_error_code,
-                            index_error=index_error,
-                            chunks=0,
-                            vector_write_started=not cleanup_confirmed,
-                        )
-                    except Exception as meta_err:
-                        logger.warning(
-                            '写入 Excel 索引失败状态失败 document_id=%s：%s',
-                            document_id, meta_err,
-                        )
-                    raise _ExcelIndexFailure from e
-
-                # 向量写入成功；若状态持久化失败，则保留向量但把状态标为 unknown。
-                try:
-                    excel_store.update_meta(
-                        document_id,
-                        index_status='indexed',
-                        index_error_code='',
-                        index_error='',
-                        indexed_at=datetime.now().isoformat(),
-                        chunks=len(chunks),
-                        vector_write_started=True,
-                    )
-                    index_status = 'indexed'
-                except Exception as meta_err:
-                    index_status = 'unknown'
-                    index_error_code = 'INDEX_STATUS_PERSIST_FAILED'
-                    index_error = '索引状态无法持久化'
-                    index_message = 'Excel 向量已写入，但索引状态无法可靠持久化。'
-                    logger.warning(
-                        '写入 Excel 索引成功状态失败 document_id=%s：%s',
-                        document_id, meta_err,
-                    )
-            except _ExcelIndexFailure:
-                pass
-            except Exception as e:
-                # 摘要构造等索引前错误：没有调用 add_documents，vector_write_started 仍为 false。
-                classified = classify_upload_error(e)
-                index_status = 'index_failed'
-                index_error_code = classified.error_code
-                index_error = classified.detail or str(e)
-                index_message = (
-                    f'{EXCEL_LOCAL_READY_INDEX_FAILED} {classified.message}'
-                    if classified.message else EXCEL_LOCAL_READY_INDEX_FAILED
-                )
-                try:
-                    excel_store.update_meta(
-                        document_id,
-                        index_status=index_status,
-                        index_error_code=index_error_code,
-                        index_error=index_error,
-                        chunks=0,
-                        vector_write_started=False,
-                    )
-                except Exception as meta_err:
-                    logger.warning(
-                        '写入 Excel 索引失败状态失败 document_id=%s：%s',
-                        document_id, meta_err,
-                    )
+            index_result = await self._index_excel_representation(
+                representation=representation,
+                metadata=metadata,
+                original_filename=display_name,
+                file_size=file_size,
+                user_id=user_id,
+            )
+            index_status = index_result['index_status']
+            index_error_code = index_result['index_error_code']
+            index_error = index_result['index_error']
+            index_message = index_result['index_message']
+            chunks = index_result['chunks']
+            ids = index_result['ids']
 
             try:
                 await self._clear_related_cache(display_name, chunks)
@@ -473,6 +342,329 @@ class RagService:
                     os.remove(file_path)
             except OSError as fe:
                 logger.debug('兜底清理临时表格文件失败：%s, 错误：%s', file_path, fe)
+
+    async def _index_excel_representation(
+        self,
+        representation,
+        metadata: Optional[Dict[str, Any]],
+        original_filename: str,
+        file_size: int,
+        user_id: Optional[int],
+    ) -> Dict[str, Any]:
+        """对已落盘的 Excel representation 执行一次语义索引。
+
+        上传和显式重试都复用本方法；调用方负责本地文件/所有权/重试资格校验。
+        本方法不删除本地 artifacts，只按既有契约处理向量和 meta 状态。
+        """
+        document_id = representation.document_id
+        index_status = 'pending'
+        index_error_code = ''
+        index_error = ''
+        index_message = ''
+        chunks: List[Dict[str, Any]] = []
+        ids: List[str] = []
+
+        try:
+            chunks = self._build_excel_chunks(
+                representation=representation,
+                metadata=metadata,
+                original_filename=original_filename,
+                file_size=file_size,
+                user_id=user_id,
+            )
+
+            # 先初始化向量存储；初始化失败时尚未开始写入，vector_write_started 保持 false。
+            try:
+                vector_store = self._get_vector_store()
+            except Exception as e:
+                classified = classify_upload_error(e)
+                index_status = 'index_failed'
+                index_error_code = classified.error_code
+                index_error = classified.detail or str(e)
+                index_message = (
+                    f'{EXCEL_LOCAL_READY_INDEX_FAILED} {classified.message}'
+                    if classified.message else EXCEL_LOCAL_READY_INDEX_FAILED
+                )
+                excel_store.update_meta(
+                    document_id,
+                    index_status=index_status,
+                    index_error_code=index_error_code,
+                    index_error=index_error,
+                    chunks=0,
+                    vector_write_started=False,
+                )
+                raise _ExcelIndexFailure from e
+
+            # 写入意图必须先持久化；失败则绝不继续写入。
+            # 这里写 unknown 而不是 indexing：若后续最终状态（indexed/index_failed）
+            # 持久化失败，meta 只能保留“未知”，绝不能永久停在“索引中”而误导列表。
+            try:
+                excel_store.update_meta(
+                    document_id,
+                    index_status='unknown',
+                    vector_write_started=True,
+                )
+            except Exception as e:
+                index_status = 'unknown'
+                index_error_code = 'INDEX_STATUS_PERSIST_FAILED'
+                index_error = '索引状态无法持久化'
+                index_message = 'Excel 已保存在本地，但无法可靠记录语义索引状态。'
+                logger.warning(
+                    'Excel 索引状态持久化失败 document_id=%s：%s', document_id, e
+                )
+                raise _ExcelIndexFailure from e
+
+            try:
+                ids = await vector_store.add_documents(chunks) if chunks else []
+                if chunks and len(ids or []) != len(chunks):
+                    raise RuntimeError(
+                        f'向量写入数量异常：期望 {len(chunks)} 条，实际 {len(ids or [])} 条'
+                    )
+            except Exception as e:
+                classified = classify_upload_error(e)
+                index_status = 'index_failed'
+                index_error_code = classified.error_code
+                index_error = classified.detail or str(e)
+                index_message = (
+                    f'{EXCEL_LOCAL_READY_INDEX_FAILED} {classified.message}'
+                    if classified.message else EXCEL_LOCAL_READY_INDEX_FAILED
+                )
+
+                # 部分写入可能已经发生。只有严格删除确认成功，才允许把
+                # vector_write_started 改回 false；否则保留可能残留的标记。
+                cleanup_confirmed = False
+                try:
+                    await vector_store.delete_documents(
+                        [document_id], user_id=user_id, strict=True
+                    )
+                    cleanup_confirmed = True
+                except Exception as cleanup_err:
+                    logger.warning('清理可能残留的 Excel 向量失败：%s', cleanup_err)
+
+                try:
+                    excel_store.update_meta(
+                        document_id,
+                        index_status=index_status,
+                        index_error_code=index_error_code,
+                        index_error=index_error,
+                        chunks=0,
+                        vector_write_started=not cleanup_confirmed,
+                    )
+                except Exception as meta_err:
+                    logger.warning(
+                        '写入 Excel 索引失败状态失败 document_id=%s：%s',
+                        document_id, meta_err,
+                    )
+                raise _ExcelIndexFailure from e
+
+            # 向量写入成功；若状态持久化失败，则保留向量但把状态标为 unknown。
+            try:
+                excel_store.update_meta(
+                    document_id,
+                    index_status='indexed',
+                    index_error_code='',
+                    index_error='',
+                    indexed_at=datetime.now().isoformat(),
+                    chunks=len(chunks),
+                    vector_write_started=True,
+                )
+                index_status = 'indexed'
+            except Exception as meta_err:
+                index_status = 'unknown'
+                index_error_code = 'INDEX_STATUS_PERSIST_FAILED'
+                index_error = '索引状态无法持久化'
+                index_message = 'Excel 向量已写入，但索引状态无法可靠持久化。'
+                logger.warning(
+                    '写入 Excel 索引成功状态失败 document_id=%s：%s',
+                    document_id, meta_err,
+                )
+        except _ExcelIndexFailure:
+            pass
+        except Exception as e:
+            # 摘要构造等索引前错误：没有调用 add_documents，vector_write_started 仍为 false。
+            classified = classify_upload_error(e)
+            index_status = 'index_failed'
+            index_error_code = classified.error_code
+            index_error = classified.detail or str(e)
+            index_message = (
+                f'{EXCEL_LOCAL_READY_INDEX_FAILED} {classified.message}'
+                if classified.message else EXCEL_LOCAL_READY_INDEX_FAILED
+            )
+            try:
+                excel_store.update_meta(
+                    document_id,
+                    index_status=index_status,
+                    index_error_code=index_error_code,
+                    index_error=index_error,
+                    chunks=0,
+                    vector_write_started=False,
+                )
+            except Exception as meta_err:
+                logger.warning(
+                    '写入 Excel 索引失败状态失败 document_id=%s：%s',
+                    document_id, meta_err,
+                )
+
+        return {
+            'index_status': index_status,
+            'index_error_code': index_error_code,
+            'index_error': index_error,
+            'index_message': index_message,
+            'chunks': chunks,
+            'ids': ids,
+        }
+
+    def _get_retry_lock(self, document_id: str) -> asyncio.Lock:
+        """获取单进程内的同文档重试锁（不提供跨进程互斥）。"""
+        locks = getattr(self, '_retry_locks', None)
+        if locks is None:
+            locks = {}
+            self._retry_locks = locks
+        lock = locks.get(document_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[document_id] = lock
+        return lock
+
+    @staticmethod
+    def _retry_error(
+        error_code: str,
+        message: str,
+        http_status: int = 409,
+    ) -> Dict[str, Any]:
+        return {
+            'success': False,
+            'partial': False,
+            'error_code': error_code,
+            'message': message,
+            'http_status': http_status,
+        }
+
+    async def retry_excel_index(
+        self,
+        document_id: str,
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """显式重试一个本地 Excel 的语义索引。
+
+        只接受 index_failed + vector_write_started is False 的本地文档；
+        add_documents 前由公共索引 helper 先持久化 unknown/True。
+        """
+        lock = self._get_retry_lock(document_id)
+        if lock.locked():
+            return self._retry_error(
+                'INDEX_RETRY_IN_PROGRESS',
+                '该文档正在重试索引，请稍后再试。',
+            )
+
+        async with lock:
+            # 锁内重新读取，避免等待期间状态被其他请求改变。
+            representation = excel_store.load_representation(
+                document_id, user_id=user_id
+            )
+            if representation is None:
+                return self._retry_error(
+                    'EXCEL_DOCUMENT_NOT_FOUND',
+                    '表格文档不存在或无权访问。',
+                    404,
+                )
+
+            meta = excel_store.load_meta(document_id)
+            if not meta:
+                return self._retry_error(
+                    'INDEX_RETRY_MATERIALS_MISSING',
+                    '本地索引材料不完整，无法重试。',
+                    409,
+                )
+            if meta.get('user_id') not in (None, user_id):
+                return self._retry_error(
+                    'EXCEL_DOCUMENT_NOT_FOUND',
+                    '表格文档不存在或无权访问。',
+                    404,
+                )
+            if meta.get('index_status') != 'index_failed':
+                return self._retry_error(
+                    'INDEX_RETRY_NOT_ALLOWED',
+                    '当前索引状态不允许重试。',
+                    409,
+                )
+            if meta.get('vector_write_started') is not False:
+                # 不能把 True/缺失/None 当成已清理，否则可能重复或覆盖向量。
+                return self._retry_error(
+                    'INDEX_RETRY_NOT_SAFE',
+                    '上次向量写入结果尚未确认清理，不能安全重试。',
+                    409,
+                )
+            custom_metadata = meta.get('custom_metadata')
+            if not isinstance(custom_metadata, dict):
+                # 旧版 meta 未记录自定义 metadata，不能伪造“已恢复”。
+                return self._retry_error(
+                    'INDEX_RETRY_METADATA_MISSING',
+                    '该旧文档未记录可恢复的自定义元数据，无法安全重试。',
+                    409,
+                )
+            if not excel_store.retry_materials_ready(meta, document_id):
+                return self._retry_error(
+                    'INDEX_RETRY_MATERIALS_MISSING',
+                    '本地原始文件或表示层缺失，无法重试。',
+                    409,
+                )
+            if not representation.sheets or all(
+                sheet.column_count <= 0 for sheet in representation.sheets
+            ):
+                return self._retry_error(
+                    'INDEX_RETRY_MATERIALS_MISSING',
+                    '本地表示层没有可用列，无法重试。',
+                    409,
+                )
+
+            try:
+                file_size = int(meta.get('file_size') or 0)
+            except (TypeError, ValueError):
+                file_size = 0
+            display_name = meta.get('filename') or representation.filename
+
+            result = await self._index_excel_representation(
+                representation=representation,
+                # 恢复首次上传时用于 chunk metadata 的自定义字段；旧文档已在上面拒绝。
+                metadata=custom_metadata,
+                original_filename=display_name,
+                file_size=file_size,
+                user_id=user_id,
+            )
+
+            # 与上传成功路径保持一致，避免旧的 RAG 查询缓存掩盖新索引。
+            try:
+                await self._clear_related_cache(display_name, result['chunks'])
+            except Exception as cache_err:
+                logger.warning('清理 Excel 重试后缓存失败（忽略）：%s', cache_err)
+
+            fresh_meta = excel_store.load_meta(document_id) or {}
+            can_retry = bool(
+                fresh_meta.get('index_status') == 'index_failed'
+                and fresh_meta.get('vector_write_started') is False
+                and excel_store.retry_materials_ready(fresh_meta, document_id)
+                and any(
+                    sheet.column_count > 0 for sheet in representation.sheets
+                )
+            )
+            success = result['index_status'] == 'indexed'
+            return {
+                'success': success,
+                'partial': not success,
+                'document_id': document_id,
+                'filename': display_name,
+                'index_status': result['index_status'],
+                'index_error_code': result['index_error_code'],
+                'index_message': (
+                    '语义索引重试成功'
+                    if success
+                    else (result['index_message'] or '索引重试未完成，请检查状态后重试。')
+                ),
+                'total_chunks': len(result['chunks']) if success else 0,
+                'can_retry_index': can_retry,
+                'http_status': 200,
+            }
 
     async def _cleanup_failed_upload(
         self,
