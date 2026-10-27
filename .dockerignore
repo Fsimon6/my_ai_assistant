@@ -1,21 +1,39 @@
 # ===== Secrets / Env =====
 .env
 .env.*
-!.env.example
+**/.env
+**/.env.*
+# 示例文件必须只含占位符；两个前端环境文件是已跟踪的非秘密构建配置。
+!**/.env.example
+!frontend/.env.development
+!frontend/.env.production
+
+# ===== 证书 / 凭据 =====
+**/*.pem
+**/*.key
+**/*.p12
+**/*credentials*.json
 
 # ===== Python =====
 __pycache__/
+**/__pycache__/
 *.pyc
 .venv/
 venv/
 *.db
+**/*.db
 *.db-wal
 *.db-shm
+**/*.db-wal
+**/*.db-shm
+**/*.sqlite3
+**/*.duckdb
 backend/*.log
 backend_e2e*.log
 
 # ===== Node / Frontend =====
 node_modules/
+**/node_modules/
 frontend/node_modules/
 frontend/dist/
 dist/
@@ -25,6 +43,24 @@ data/
 cache/
 logs/
 coverage/
+**/chroma_db/
+**/uploads/
+**/backups/
+
+# ===== 本地缓存 / 工具 / 日志 =====
+.coverage
+.pytest_cache/
+.idea/
+.workbuddy/
+.codebuddy/
+.playwright-cli/
+**/*.log
+**/*.err
+
+# ===== 业务文件（构建不需要） =====
+**/*.xlsx
+**/*.xls
+**/*.xlsm
 
 # ===== 测试 / 文档 / 工具 =====
 test/

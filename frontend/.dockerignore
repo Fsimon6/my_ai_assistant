@@ -1,0 +1,36 @@
+# 该文件是 frontend/ 作为构建上下文时的忽略规则，
+# 适用于 docker-compose-dev.yml 的 frontend-dev -> frontend/Dockerfile.dev。
+
+# ===== Secrets / Env =====
+.env
+.env.*
+**/.env
+**/.env.*
+# 仅保留已跟踪、非秘密的 Vite 配置；.env.local / .env.*.local 等仍被排除。
+!.env.development
+!.env.production
+
+# ===== 证书 / 凭据 =====
+**/*.pem
+**/*.key
+**/*.p12
+**/*credentials*.json
+
+# ===== Node 依赖和构建产物 =====
+node_modules/
+dist/
+dist-ssr/
+coverage/
+.vite/
+*.tsbuildinfo
+.eslintcache
+
+# ===== 本地缓存 / IDE / 日志 =====
+__screenshots__/
+**/*.log
+**/*.err
+.idea/
+.vscode/
+.workbuddy/
+.codebuddy/
+.playwright-cli/

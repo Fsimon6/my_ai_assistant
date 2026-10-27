@@ -82,14 +82,23 @@ def init_admin_user():
                 else:
                     print('     密码（随机生成，仅显示这一次）：%s' % test_password)
     except Exception as e:
-        print(f'?? 初始化用户失败：{e}')
+        # 不输出异常正文，避免数据库/Provider 细节中的敏感信息进入日志。
+        print(f'?? 初始化用户失败：{type(e).__name__}')
         db.rollback()
+        # 用户初始化是启动前置条件：必须让调用方和进程退出状态感知失败。
+        raise RuntimeError('数据库用户初始化失败') from None
     finally:
         db.close()
 
-if __name__ == '__main__':
+
+def main():
+    """执行数据库初始化的 CLI 入口，失败时向上抛出以产生非零退出码。"""
     print(' 开始初始化数据库')
     init_db()   # 创建表
     init_admin_user()   # 初始化用户
     print(' 数据库初始化完成！')
+
+
+if __name__ == '__main__':
+    main()
 

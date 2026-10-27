@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# ÑÕÉ«¶¨Òå
+# é¢œè‰²å®šä¹‰
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'  # No Color
 
-# ´òÓ¡´øÑÕÉ«µÄÏûÏ¢
+# æ‰“å°å¸¦é¢œè‰²çš„æ¶ˆæ¯
 print_message() {
   echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -19,142 +19,152 @@ print_error() {
   echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# ¼ì²éDockerºÍDocker Compose
+# æ£€æŸ¥Dockerå’ŒDocker Compose
 check_dependencies() {
-  print_message '¼ì²éÒÀÀµ...'
+  print_message 'æ£€æŸ¥ä¾èµ–...'
 
   if ! command -v docker &> /dev/null; then
-    print_error 'DockerÎ´°²×°'
+    print_error 'Dockeræœªå®‰è£…'
     exit 1
   fi
 
   if ! command -v docker-compose &> /dev/null; then
-    print_error 'Docker ComposeÎ´°²×°'
+    print_error 'Docker Composeæœªå®‰è£…'
     exit 1
   fi
 
-  print_message 'ÒÀÀµ¼ì²éÍ¨¹ı'
+  print_message 'ä¾èµ–æ£€æŸ¥é€šè¿‡'
 }
 
-# ¼ÓÔØ»·¾³±äÁ¿
+# æ£€æŸ¥å¿…è¦çš„è¿è¡Œæ—¶é…ç½®ï¼›ä¸è¾“å‡ºé…ç½®å€¼
+validate_required_env() {
+  if [ -z "${JWT_SECRET:-}" ] || [ "${JWT_SECRET}" = "change-me-to-a-random-secret-string" ]; then
+    print_error 'JWT_SECRET å°šæœªé…ç½®ï¼šè¯·ç¼–è¾‘ .env å¹¶è®¾ç½®å¼ºéšæœº JWT_SECRET åé‡è¯•'
+    exit 1
+  fi
+}
+
+# åŠ è½½ç¯å¢ƒå˜é‡
 load_env() {
   if [ -f .env ]; then
-    print_message '¼ÓÔØ»·¾³±äÁ¿...'
+    print_message 'åŠ è½½ç¯å¢ƒå˜é‡...'
     source .env
+    validate_required_env
   else
-    print_warning '.envÎÄ¼ş²»´æÔÚ£¬´´½¨Ê¾Àı...'
+    print_warning '.envæ–‡ä»¶ä¸å­˜åœ¨ï¼Œåˆ›å»ºç¤ºä¾‹...'
     cp .env.example .env 2>/dev/null || create_example_env
-    print_warning 'Çë±à¼­.envÎÄ¼ş²¢ÖØĞÂÔËĞĞ½Å±¾'
+    print_warning 'è¯·ç¼–è¾‘.envæ–‡ä»¶å¹¶é‡æ–°è¿è¡Œè„šæœ¬'
     exit 1
   fi
 }
 
-# ´´½¨Ê¾Àı»·¾³ÎÄ¼ş
+# åˆ›å»ºç¤ºä¾‹ç¯å¢ƒæ–‡ä»¶ï¼ˆä»…å ä½ç¬¦ï¼Œä¸ç”Ÿæˆå¯ç”¨å‡­æ®ï¼‰
 create_example_env() {
-  cat > .env.example << EOF
-# Ó¦ÓÃÅäÖÃ
-ENV=production
+  cat > .env.example << 'EOF'
+# åº”ç”¨é…ç½®ï¼ˆæœ¬æ–‡ä»¶ä»…åŒ…å«å ä½ç¬¦ï¼Œè¯·å¤åˆ¶ä¸º .env åå¡«å†™çœŸå®å€¼ï¼‰
+ENVIRONMENT=production
 HOST=0.0.0.0
 PORT=8000
 DEBUG=False
 
-# °²È«ÅäÖÃ
-SECRET_KEY='iBaE6BgWJTzMBjm0yoHLhzWrzSe9dVWv'
+# å®‰å…¨é…ç½®ï¼ˆå¿…é¡»æ›¿æ¢ä¸ºå¼ºéšæœºå€¼ï¼‰
+JWT_SECRET=change-me-to-a-random-secret-string
+SECRET_KEY=change-me-to-a-random-secret-string
 
-# ´óÄ£ĞÍÅäÖÃ
-LLM_PROVIDER=qianfan
-QIANFAN_API_KEY='k1S3A8bVjorhQdrs2dBXkgmY'
-QIANFAN_SECRET_KEY'iBaE6BgWJTzMBjm0yoHLhzWrzSe9dVWv'
+# å¤§æ¨¡å‹é…ç½®ï¼ˆå¿…é¡»å¡«å†™ Provider å‡­æ®ï¼‰
+LLM_PROVIDER=openai
+QIANFAN_API_KEY=replace-with-provider-key
+QIANFAN_SECRET_KEY=replace-with-provider-secret
 
-# Êı¾İ¿âÅäÖÃ
+# æ•°æ®åº“é…ç½®
 DATABASE_URL=sqlite:///./data/ai_assistant.db
 
-# CORSÅäÖÃ
+# CORSé…ç½®
 BACKEND_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 
-# ÈÕÖ¾ÅäÖÃ
+# æ—¥å¿—é…ç½®
 LOG_LEVEL=INFO
 EOF
 }
 
-# ¹¹½¨Docker¾µÏñ
+# æ„å»ºDockeré•œåƒ
 build_images() {
-  print_message '¹¹½¨Docker¾µÏñ...'
+  print_message 'æ„å»ºDockeré•œåƒ...'
   docker-compose build
 }
 
-# Æô¶¯·şÎñ
+# å¯åŠ¨æœåŠ¡
 start_services() {
-  print_message 'Æô¶¯·şÎñ...'
+  print_message 'å¯åŠ¨æœåŠ¡...'
   docker-compose up -d
 
-  # µÈ´ı·şÎñÆô¶¯
-  print_message 'µÈ´ı·şÎñÆô¶¯...'
+  # ç­‰å¾…æœåŠ¡å¯åŠ¨
+  print_message 'ç­‰å¾…æœåŠ¡å¯åŠ¨...'
   sleep 10
 
-  # ¼ì²é·şÎñ×´Ì¬
+  # æ£€æŸ¥æœåŠ¡çŠ¶æ€
   check_service_health
 }
 
-# ¼ì²é·şÎñ½¡¿µ×´Ì¬
+# æ£€æŸ¥æœåŠ¡å¥åº·çŠ¶æ€
 check_service_health() {
-  print_message '¼ì²é·şÎñ½¡¿µ×´Ì¬...'
+  print_message 'æ£€æŸ¥æœåŠ¡å¥åº·çŠ¶æ€...'
 
   if curl -f http://localhost:8000/health >/dev/null 2>&1; then
-    print_message ' ºó¶Ë·şÎñÔËĞĞÕı³£'
+    print_message ' åç«¯æœåŠ¡è¿è¡Œæ­£å¸¸'
   else
-    print_error ' ºó¶Ë·şÎñ¿ÉÄÜÓÖÎÊÌâ'
+    print_error ' åç«¯æœåŠ¡å¯èƒ½åˆé—®é¢˜'
   fi
 }
 
-# Í£Ö¹·şÎñ
+# åœæ­¢æœåŠ¡
 stop_services() {
-  print_message 'Í£Ö¹·şÎñ...'
+  print_message 'åœæ­¢æœåŠ¡...'
   docker-compose down
 }
 
-# ²é¿´ÈÕÖ¾
+# æŸ¥çœ‹æ—¥å¿—
 view_logs() {
-  print_message '²é¿´ÈÕÖ¾...'
+  print_message 'æŸ¥çœ‹æ—¥å¿—...'
   docker-compose logs -f
 }
 
-# ÇåÀí×ÊÔ´
+# æ¸…ç†èµ„æº
 cleanup() {
-  print_message 'ÇåÀíÎ´Ê¹ÓÃµÄDocker×ÊÔ´...'
+  print_message 'æ¸…ç†æœªä½¿ç”¨çš„Dockerèµ„æº...'
   docker-compose prune -f
 }
 
-# ±¸·İÊı¾İ
+# å¤‡ä»½æ•°æ®
 backup_data() {
-  print_message '±¸·İÊı¾İ...'
+  print_message 'å¤‡ä»½æ•°æ®...'
   timestamp=$(date +%Y%m%d_%H%M%S)
   backup_dir='backups/$timestamp'
 
   mkdir -p "$backup_dir"
 
-  # ±¸·İÊı¾İ¾í
+  # å¤‡ä»½æ•°æ®å·
   docker run --rm -v ai_assistant_data:/data -v $(pwd)/$backup_dir:/backup alpine \
   tar czf /backup/data.tar.gz -C /data .
 
-  print_message 'Êı¾İÒÑ±¸·İµ½£º$backup_dir/data.tar.gz'
+  print_message 'æ•°æ®å·²å¤‡ä»½åˆ°ï¼š$backup_dir/data.tar.gz'
 }
 
-# Ö÷²Ëµ¥
+# ä¸»èœå•
 main_menu() {
   echo '============================'
-  echo '    AIÖúÊÖ²¿Êğ½Å±¾'
+  echo '    AIåŠ©æ‰‹éƒ¨ç½²è„šæœ¬'
   echo '============================'
-  echo '1. ÍêÕû²¿Êğ£¨¹¹½¨+Æô¶¯£©'
-  echo '2. ½öÆô¶¯·şÎñ'
-  echo '3. Í£Ö¹·şÎñ'
-  echo '4. ²é¿´ÈÕÖ¾'
-  echo '5. ±¸·İÊı¾İ'
-  echo '6. Çå³ı×ÊÔ´'
-  echo '7. ÍË³ö'
+  echo '1. å®Œæ•´éƒ¨ç½²ï¼ˆæ„å»º+å¯åŠ¨ï¼‰'
+  echo '2. ä»…å¯åŠ¨æœåŠ¡'
+  echo '3. åœæ­¢æœåŠ¡'
+  echo '4. æŸ¥çœ‹æ—¥å¿—'
+  echo '5. å¤‡ä»½æ•°æ®'
+  echo '6. æ¸…é™¤èµ„æº'
+  echo '7. é€€å‡º'
   echo '============================'
 
-  read -p 'ÇëÑ¡Ôñ²Ù×÷ [1-7]: ' choice
+  read -p 'è¯·é€‰æ‹©æ“ä½œ [1-7]: ' choice
 
   case $choice in
     1)
@@ -181,17 +191,17 @@ main_menu() {
       cleanup
       ;;
     7)
-      print_message 'ÍË³ö½Å±¾'
+      print_message 'é€€å‡ºè„šæœ¬'
       exit 0
       ;;
     *)
-      print_error 'ÎŞĞ§Ñ¡Ôñ'
+      print_error 'æ— æ•ˆé€‰æ‹©'
       ;;
   esac
 
-  # ·µ»ØÖ÷²Ëµ¥
+  # è¿”å›ä¸»èœå•
   main_menu
 }
 
-# Ö´ĞĞÖ÷²Ëµ¥
+# æ‰§è¡Œä¸»èœå•
 main_menu

@@ -12,8 +12,8 @@ RUN npm install
 # 复制源代码
 COPY . .
 
-# 暴露端口
-EXPOSE 5173
+# 暴露端口（与 frontend/vite.config.ts 和 docker-compose-dev.yml 保持一致）
+EXPOSE 5181
 
 # 开发服务器指令
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5181"]

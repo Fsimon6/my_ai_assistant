@@ -1,4 +1,9 @@
 # 使用Python 3.10官方镜像
+#
+# 说明：这是历史/手动备用构建入口，不是当前标准部署路径。
+# 标准生产构建请使用：
+#   docker-compose.yml -> backend/Dockerfile / frontend/Dockerfile
+# 本文件不会复制 .env；运行时配置由 Compose environment 注入。
 FROM python:3.10-slim
 
 # 设置工作目录
@@ -27,10 +32,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY ./backend /app/backend
 
 # 复制前端构建文件（生产环境）
+# 注意：frontend/dist 默认被 .dockerignore 排除，本历史入口不能保证可直接构建。
 COPY ./frontend/dist /app/frontend/dist
-
-# 复制配置文件
-COPY .env /app/.env
 
 # 创建非root用户
 RUN useradd -m -u 1000 appuser && \

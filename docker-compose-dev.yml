@@ -1,44 +1,57 @@
-# �������� Docker Compose ����
+# 开发环境 Docker Compose 配置
 version: '3.8'
 
 services:
-  # ��˷���
+  # 后端服务
   backend-dev:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      # backend/Dockerfile 使用仓库根上下文中的 backend/... 路径；
+      # 开发入口也使用同一上下文，避免 COPY 路径和上下文不一致。
+      context: .
+      dockerfile: backend/Dockerfile
+    # 仅向后端容器注入运行时配置；.env 不会进入镜像。
+    # Compose 的 environment 会覆盖 env_file 中的同名值。
+    env_file:
+      - .env
     ports:
-      - "8000:8000"
+      # 宿主机继续使用 8021；容器内部仍使用 Docker 约定的 8000。
+      - "8021:8000"
     environment:
       - ENVIRONMENT=development
+      - DEBUG=true
+      - HOST=0.0.0.0
+      - PORT=8000
       - DATABASE_URL=sqlite:////app/my_ai_assistant.db
       - REDIS_URL=redis://redis:6379/0
     volumes:
-      - ./backend:/app
+      - ./backend:/app/backend
       - ./data:/app/data
     depends_on:
       - redis
       - chroma
     command: >
-      sh -c "python init_db.py && python main.py"
+      sh -c "python -m backend.init_db && if [ \"$${DEBUG:-false}\" = \"true\" ]; then exec uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload; else exec uvicorn backend.main:app --host 0.0.0.0 --port 8000; fi"
     restart: unless-stopped
 
-  # ǰ�˿���������
+  # 前端开发服务器
   frontend-dev:
     build:
       context: ./frontend
       dockerfile: Dockerfile.dev
     ports:
-      - "5173:5173"
+      # 宿主机与项目 Vite 开发端口保持一致。
+      - "5181:5181"
     volumes:
       - ./frontend:/app
       - /app/node_modules
     environment:
       - NODE_ENV=development
-    command: npm run dev -- --host 0.0.0.0
+      # 仅容器内 Vite 代理使用；不是浏览器公开的 VITE_* 配置。
+      - DEV_PROXY_TARGET=http://backend-dev:8000
+    command: npm run dev -- --host 0.0.0.0 --port 5181
     restart: unless-stopped
 
-  # Redis����
+  # Redis缓存
   redis:
     image: redis:7-alpine
     ports:
@@ -48,7 +61,7 @@ services:
     command: redis-server --appendonly yes
     restart: unless-stopped
 
-  # ChromaDB�������ݿ�
+  # ChromaDB向量数据库
   chroma:
     image: chromadb/chroma:latest
     ports:
@@ -61,7 +74,7 @@ services:
       - ANONYMIZED_TELEMETRY=FALSE
     restart: unless-stopped
 
-  # PostgreSQL����ѡ����������������
+  # PostgreSQL（可选，用于生产开发）
   postgres:
     image: postgres:15-alpine
     ports:
@@ -74,7 +87,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
 
-  # pgAdmin��PostgreSQL�������棩
+  # pgAdmin（PostgreSQL管理界面）
   pgadmin:
     image: dpage/pgadmin4:latest
     ports:
@@ -86,7 +99,7 @@ services:
       - pgadmin_data:/var/lib/pgadmin
     restart: unless-stopped
 
-  # Redis��������
+  # Redis管理界面
   redis-commander:
     image: rediscommander/redis-commander:latest
     ports:
@@ -97,7 +110,7 @@ services:
       - redis
     restart: unless-stopped
 
-  # ��ط���
+  # 监控服务
   prometheus:
     image: prom/prometheus:latest
     ports:
