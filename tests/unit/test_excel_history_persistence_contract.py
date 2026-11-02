@@ -9,10 +9,9 @@
 本文件用与端点**完全相同**的写入口 ``persist_excel_turn``（真实 pipeline 产出的 outcome），
 写入**临时 SQLite**，再经 ``get_history`` 读回，直接断言最终 DB 行的结构。
 不触碰用户 DB、不调用 LLM。
+Excel 输入由 ``synthetic_excel_catalog`` 在 tmp_path 内合成，不读取正式 data/excel。
 """
 import asyncio
-import os
-import tempfile
 
 import pytest
 from sqlalchemy import create_engine
@@ -28,13 +27,20 @@ from backend.excel import aggregate as ag
 from backend.excel import multi_step as ms
 from backend.excel import nl_query as nq
 from backend.excel import store as excel_store
+from backend.excel.representation import (
+    HEADER_SINGLE,
+    ColumnMeta,
+    SheetRepresentation,
+    WorkbookRepresentation,
+)
 from backend.models import character as _models          # noqa: F401  （注册表）
 from backend.services import conversation_service as conv_mod
 from backend.services.conversation_service import (
     SOURCE_CHAT, SOURCE_EXCEL, SOURCE_RAG, conversation_service as conv,
 )
 
-USER = int(os.environ.get('P_USER', '87'))
+# 固定测试用户：不读取调用者 P_USER，也不接触任何真实业务用户。
+USER = 990001
 MODEL = 'contract-test-model'
 
 
@@ -89,10 +95,86 @@ async def _run_pipeline(msg, turn, key):
 
 
 @pytest.fixture()
-def temp_db(monkeypatch):
-    """临时 SQLite（与生产同 schema），把 conversation_service 的会话工厂指向它。"""
-    tmpdir = tempfile.mkdtemp(prefix='hist_contract_')
-    engine = create_engine('sqlite:///%s' % os.path.join(tmpdir, 'contract.db'))
+def synthetic_excel_catalog(tmp_path, monkeypatch):
+    """在 tmp_path 内建立生产同构的 Excel catalog/representation。
+
+    使用固定测试用户，不读取正式 data/excel，也不依赖 P_USER。
+    通过 monkeypatch EXCEL_DATA_ROOT 让生产读取路径落到临时目录。
+    """
+    root = tmp_path / 'excel'
+    root.mkdir()
+    monkeypatch.setattr(excel_store, 'EXCEL_DATA_ROOT', root)
+
+    columns = [
+        ColumnMeta(
+            name='Order ID', index=0, excel_column=1, excel_column_letter='A',
+            dtype='string', header_row_excel=1, non_empty=4, null_count=0,
+            semantic_type='identifier',
+        ),
+        ColumnMeta(
+            name='Order Amount', index=1, excel_column=2, excel_column_letter='B',
+            dtype='number', header_row_excel=1, non_empty=4, null_count=0,
+            semantic_type='number',
+        ),
+        ColumnMeta(
+            name='Shipping Provider Name', index=2, excel_column=3,
+            excel_column_letter='C', dtype='string', header_row_excel=1,
+            non_empty=4, null_count=0, semantic_type='text',
+        ),
+        ColumnMeta(
+            name='SKU ID', index=3, excel_column=4, excel_column_letter='D',
+            dtype='string', header_row_excel=1, non_empty=4, null_count=0,
+            semantic_type='identifier',
+        ),
+    ]
+    rows = [
+        ['O-1', 10, 'SF', 'SKU-A'],
+        ['O-2', 20, 'UPS', 'SKU-B'],
+        ['O-3', 30, 'SF', 'SKU-A'],
+        ['O-4', 40, 'SF', 'SKU-C'],
+    ]
+    sheet = SheetRepresentation(
+        sheet_name='OrderSKUList',
+        sheet_index=0,
+        header_mode=HEADER_SINGLE,
+        header_rows_excel=[1],
+        header_depth=1,
+        columns=columns,
+        rows=rows,
+        row_excel_numbers=[2, 3, 4, 5],
+        row_count=len(rows),
+        column_count=len(columns),
+        excel_range={
+            'row_start': 1, 'row_end': 5,
+            'column_start': 1, 'column_end': 4,
+        },
+    )
+    rep = WorkbookRepresentation(
+        schema_version='1.0',
+        document_id='contract-synthetic-orders',
+        user_id=USER,
+        filename='synthetic_orders.xlsx',
+        file_type='xlsx',
+        parser='openpyxl',
+        sheet_count=1,
+        sheets=[sheet],
+        created_at='2026-01-01T00:00:00',
+    )
+
+    # save_artifacts 是生产真实落盘入口；这里只复制一个占位原文件，
+    # 不解析它，确保 meta.json / representation.json 与生产结构一致。
+    source = tmp_path / 'synthetic_orders.xlsx'
+    source.write_bytes(b'synthetic fixture placeholder, never parsed')
+    excel_store.save_artifacts(
+        rep, str(source), rep.filename, file_size=len(source.read_bytes()))
+    return rep
+
+
+@pytest.fixture()
+def temp_db(tmp_path, monkeypatch, synthetic_excel_catalog):
+    """临时 SQLite（与生产同 schema），并复用临时 Excel catalog。"""
+    db_path = tmp_path / 'contract.db'
+    engine = create_engine('sqlite:///%s' % db_path.as_posix())
     Base.metadata.create_all(engine)
     monkeypatch.setattr(conv_mod, 'SessionLocal',
                         sessionmaker(bind=engine, autocommit=False, autoflush=False))
