@@ -486,7 +486,9 @@ def test_advanced_features():
     print(f'   角色名设置成功：{assistant.name}')
 
     # 测试API Key安全访问
-    assistant.api_key = 'sk-1234567890abcdefghijklmn'
+    # 仅用于演示属性验证与打码显示：显式占位符，不是、也不应被当作真实凭据。
+    # 注意：setter 现有规则要求以 'sk-' 开头且长度 >= 20、不含空格，故此处保留 'sk-' 前缀。
+    assistant.api_key = 'sk-DEMO_ONLY_NOT_A_REAL_API_KEY_123456'
     print(f'   API Key安全显示{assistant.api_key}')
 
     # 3.测试魔法方法
