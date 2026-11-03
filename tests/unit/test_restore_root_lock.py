@@ -20,7 +20,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import restore_registry as registry  # noqa: E402
-from restore_root_lock import RootLock  # noqa: E402
+from restore_root_lock import RootLock, RootLockReleaseError  # noqa: E402
 
 
 def _reg(tmp_path: Path) -> Path:
@@ -226,6 +226,129 @@ def test_second_process_root_lock_busy(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_release_failure_closes_all_resources_and_os_lock(tmp_path, monkeypatch):
+    target = tmp_path / 'release-failure-target'
+    target.mkdir()
+    registry_root = _reg(tmp_path)
+    lock = RootLock(target, registry_root)
+    lock.acquire('release-failure')
+
+    def fail_root_release():
+        raise RuntimeError('simulated root lock release failure')
+
+    monkeypatch.setattr(lock.root_lock, 'release', fail_root_release)
+    with pytest.raises(RootLockReleaseError) as caught:
+        lock.release()
+    assert any(name == 'root_lock' for name, _ in caught.value.errors)
+    # abort() must force-close the native handle even though release raised.
+    assert lock.root_lock._handle is None
+    assert lock.target.closed
+    assert lock.registry.root_handle is None
+    assert lock.registry.roots_handle is None
+
+    retry = RootLock(target, registry_root)
+    retry.acquire('after-release-failure')
+    retry.release()
+
+
+def test_registry_close_failure_still_closes_owned_target(tmp_path, monkeypatch):
+    target = tmp_path / 'registry-close-failure-target'
+    target.mkdir()
+    registry_root = _reg(tmp_path)
+    lock = RootLock(target, registry_root)
+    lock.acquire('registry-close-failure')
+
+    original_close = lock.registry.close
+
+    def fail_registry_close():
+        raise RuntimeError('simulated registry close failure')
+
+    monkeypatch.setattr(lock.registry, 'close', fail_registry_close)
+    with pytest.raises(RootLockReleaseError) as caught:
+        lock.release()
+    assert any(name == 'registry' for name, _ in caught.value.errors)
+    assert lock.target.closed
+    # Restore and explicitly close resources that the injected close skipped.
+    monkeypatch.setattr(lock.registry, 'close', original_close)
+    lock.registry.close()
+
+
+def test_caller_owned_target_is_not_closed_by_root_lock(tmp_path, monkeypatch):
+    target = tmp_path / 'caller-owned-target'
+    target.mkdir()
+    registry_root = _reg(tmp_path)
+    handle = __import__('restore_path_security').open_secure_directory(target)
+    lock = RootLock.from_target_handle(handle, registry_root=registry_root)
+    lock.acquire('caller-owned')
+
+    def fail_registry_close():
+        raise RuntimeError('simulated registry close failure')
+
+    monkeypatch.setattr(lock.registry, 'close', fail_registry_close)
+    with pytest.raises(RootLockReleaseError):
+        lock.release()
+    assert not handle.closed
+    handle.close()
+
+
+def test_multiple_release_failures_are_all_reported(tmp_path, monkeypatch):
+    target = tmp_path / 'multi-release-failure-target'
+    target.mkdir()
+    registry_root = _reg(tmp_path)
+    lock = RootLock(target, registry_root)
+    lock.acquire('multi-failure')
+    original_target_close = lock.target.close
+
+    def fail_root_release():
+        raise RuntimeError('root lock release failure')
+
+    def fail_registry_close():
+        raise RuntimeError('registry close failure')
+
+    def fail_target_close():
+        raise RuntimeError('target close failure')
+
+    monkeypatch.setattr(lock, '_cleanup_root_lock', lambda errors: errors.append(
+        ('root_lock', RuntimeError('root lock release failure'))))
+    monkeypatch.setattr(lock, '_cleanup_registry', lambda errors: errors.append(
+        ('registry', RuntimeError('registry close failure'))))
+    monkeypatch.setattr(lock, '_cleanup_target', lambda errors: errors.append(
+        ('target', RuntimeError('target close failure'))))
+    with pytest.raises(RootLockReleaseError) as caught:
+        lock.release()
+    assert {name for name, _ in caught.value.errors} == {
+        'root_lock', 'registry', 'target'}
+    # Restore the real close functions and release underlying resources.
+    lock._cleanup_root_lock = lambda errors: RootLock._cleanup_root_lock(lock, errors)
+    lock._cleanup_registry = lambda errors: RootLock._cleanup_registry(lock, errors)
+    lock._cleanup_target = lambda errors: RootLock._cleanup_target(lock, errors)
+    lock._held = True
+    lock._cleanup_root_lock([])
+    lock._cleanup_registry([])
+    lock._cleanup_target([])
+
+
+def test_acquire_failure_registry_close_failure_still_closes_target(
+        tmp_path, monkeypatch):
+    target = tmp_path / 'acquire-cleanup-target'
+    target.mkdir()
+    registry_root = _reg(tmp_path)
+    holder = RootLock(target, registry_root)
+    holder.acquire('holder')
+    second = RootLock(target, registry_root)
+
+    def fail_registry_close():
+        raise RuntimeError('simulated acquire cleanup close failure')
+
+    monkeypatch.setattr(second.registry, 'close', fail_registry_close)
+    try:
+        with pytest.raises(RootLockReleaseError):
+            second.acquire('second')
+        assert second.target.closed
+    finally:
+        holder.release()
 
 
 def test_crash_stale_registry_is_reprobed(tmp_path):

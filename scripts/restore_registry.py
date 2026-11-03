@@ -652,16 +652,26 @@ class RegistryLock:
         self._handle = (kernel32, handle, overlapped)
         self.identity = (volume_serial, file_id)
 
-    def release(self) -> None:
+    def _close_handle(self, unlock: bool) -> None:
         if self._handle is None:
             return
         kernel32, handle, overlapped = self._handle
         try:
-            kernel32.UnlockFileEx(handle, 0, 1, 0, ctypes.byref(overlapped))
+            if unlock:
+                kernel32.UnlockFileEx(
+                    handle, 0, 1, 0, ctypes.byref(overlapped))
         finally:
+            # CloseHandle releases the OS lock even if unlock itself fails.
             kernel32.CloseHandle(handle)
             self._handle = None
             self.identity = None
+
+    def release(self) -> None:
+        self._close_handle(unlock=True)
+
+    def abort(self) -> None:
+        """Force-close the handle without requiring UnlockFileEx to succeed."""
+        self._close_handle(unlock=False)
 
 
 class RegistryStore:
@@ -728,32 +738,66 @@ class RegistryStore:
             raise
 
     def _close_handles(self) -> None:
-        if self._roots_handle is not None:
-            self._roots_handle.close()
-            self._roots_handle = None
-        if self._root_handle is not None:
-            self._root_handle.close()
-            self._root_handle = None
+        errors: list[tuple[str, BaseException]] = []
+        for name, attr in (('roots', '_roots_handle'), ('root', '_root_handle')):
+            handle = getattr(self, attr)
+            if handle is None:
+                continue
+            try:
+                handle.close()
+            except BaseException as exc:  # noqa: BLE001 - collect all close errors
+                errors.append((name, exc))
+            finally:
+                setattr(self, attr, None)
         self._root_identity = None
         self._roots_identity = None
         self._prepared = False
+        if errors:
+            raise RegistryLockError(
+                'Registry 目录句柄关闭失败：' + '; '.join(
+                    '%s=%s: %s' % (name, type(exc).__name__, exc)
+                    for name, exc in errors))
 
     def close(self) -> None:
+        errors: list[tuple[str, BaseException]] = []
         try:
             self._lock.release()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(('registry_lock', exc))
         finally:
             self._locked = False
+        try:
             self._close_handles()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(('registry_handles', exc))
+        finally:
             self._owns_handles = False
+        if errors:
+            raise RegistryLockError(
+                'Registry 释放失败：' + '; '.join(
+                    '%s=%s: %s' % (name, type(exc).__name__, exc)
+                    for name, exc in errors))
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        errors: list[tuple[str, BaseException]] = []
         try:
             self._lock.release()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(('registry_lock', exc))
         finally:
             self._locked = False
-            if self._owns_handles:
+        if self._owns_handles:
+            try:
                 self._close_handles()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(('registry_handles', exc))
+            finally:
                 self._owns_handles = False
+        if errors:
+            raise RegistryLockError(
+                'Registry 释放失败：' + '; '.join(
+                    '%s=%s: %s' % (name, type(exc).__name__, exc)
+                    for name, exc in errors))
         return False
 
     def _require_lock(self) -> None:

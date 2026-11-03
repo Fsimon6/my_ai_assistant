@@ -24,6 +24,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -56,6 +57,32 @@ def _load_script(path: Path, module_name: str):
 
 backup_db = _load_script(BACKUP_SCRIPT, '_backup_db_for_e2e')
 restore_db = _load_script(RESTORE_SCRIPT, '_restore_db_for_e2e')
+
+# restore_db inserts scripts/ into sys.path during import.
+import restore_registry as registry_module  # noqa: E402
+from restore_path_security import open_secure_directory  # noqa: E402
+import restore_win32_native as native  # noqa: E402
+
+
+def _file_identity(path: Path) -> tuple[int, str]:
+    with open_secure_directory(path.parent) as parent:
+        status, handle = native.nt_create_file(
+            parent.native_handle,
+            path.name,
+            native.FILE_OPEN,
+            access=native.FILE_READ_ATTRIBUTES | native.SYNCHRONIZE,
+            share=(native.FILE_SHARE_READ | native.FILE_SHARE_WRITE |
+                   native.FILE_SHARE_DELETE),
+            options=(native.FILE_OPEN_REPARSE_POINT |
+                     native.FILE_NON_DIRECTORY_FILE |
+                     native.FILE_SYNCHRONOUS_IO_NONALERT),
+        )
+        if status < 0:
+            raise RuntimeError('FileId open failed: %s' % native.status_hex(status))
+        try:
+            return native.get_file_id(handle)
+        finally:
+            native.close_handle(handle)
 
 
 def _create_source_db(db_path: Path) -> sqlite3.Connection:
@@ -174,6 +201,10 @@ def _run_backup(monkeypatch, source_root: Path, backup_dir: Path) -> Path:
 
 def _run_restore(monkeypatch, backup_set: Path, target_root: Path,
                  pre_root: Path, confirm: bool = True) -> int:
+    monkeypatch.setenv(
+        'MY_AI_ASSISTANT_RESTORE_REGISTRY_ROOT',
+        str(pre_root.parent / 'restore-registry'),
+    )
     argv = [
         'restore_db.py',
         '--from', str(backup_set),
@@ -1602,26 +1633,25 @@ def test_b1_restore_lock_is_released_after_process_crash(tmp_path):
     target = tmp_path / 'lock-crash-target'
     target.mkdir()
     registry = tmp_path / 'lock-registry'
-    source = Path(__file__).resolve().parents[2] / 'scripts' / 'restore_db.py'
+    scripts = Path(__file__).resolve().parents[2] / 'scripts'
     script = tmp_path / 'hold_lock.py'
     script.write_text(
-        "import importlib.util, os, sys\n"
+        "import os, sys\n"
         "from pathlib import Path\n"
-        "spec = importlib.util.spec_from_file_location('rd_child', %r)\n"
-        "module = importlib.util.module_from_spec(spec)\n"
-        "spec.loader.exec_module(module)\n"
-        "lock = module.RestoreLock(Path(sys.argv[1]), Path(sys.argv[2]))\n"
-        "lock.acquire()\n"
+        "sys.path.insert(0, %r)\n"
+        "from restore_root_lock import RootLock\n"
+        "lock = RootLock(Path(sys.argv[1]), Path(sys.argv[2]))\n"
+        "lock.acquire('child')\n"
         "print('LOCKED', flush=True)\n"
-        "os._exit(0)\n" % str(source),
+        "os._exit(0)\n" % str(scripts),
         encoding='utf-8')
     result = subprocess.run(
         [sys.executable, str(script), str(target), str(registry)],
         capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert 'LOCKED' in result.stdout
-    lock = restore_db.RestoreLock(target, registry)
-    lock.acquire()
+    lock = restore_db.RootLock(target, registry_root=registry)
+    lock.acquire('after-crash')
     lock.release()
 
 
@@ -1629,17 +1659,103 @@ def test_b1_restore_lock_failure_has_no_target_state(
         full_backup_and_target, monkeypatch, tmp_path):
     backup_set, target = full_backup_and_target
     pre_root = tmp_path / 'pre_restore'
-    lock = restore_db.RestoreLock(target)
-    lock.acquire()
+    registry_root = pre_root.parent / 'restore-registry'
+    with restore_db.open_secure_directory(target) as handle:
+        before_identity = handle.identity
+    lock = restore_db.RootLock(target, registry_root=registry_root)
+    lock.acquire('holder')
     try:
+        before = _business_snapshot(target)
+        business_files = [
+            target / 'my_ai_assistant.db',
+            target / 'data' / 'chroma_db' / 'old-chroma-marker.txt',
+            target / 'data' / 'excel' / 'old-excel-marker.txt',
+        ]
+        before_ids = {str(path): _file_identity(path) for path in business_files}
+        assert _run_restore(monkeypatch, backup_set, target, pre_root) == (
+            restore_db.EXIT_LOCKED)
+        assert _business_snapshot(target) == before
+        assert {str(path): _file_identity(path) for path in business_files} == before_ids
+        with restore_db.open_secure_directory(target) as handle:
+            assert handle.identity == before_identity
+        with registry_module.RegistryStore(registry_root) as registry_store:
+            entries = registry_store.load().entries
+            assert [entry.run_id for entry in entries] == ['holder']
+        assert not (target / '.restore_state').exists()
+        assert not (target / '.restore_staging').exists()
+        assert not list(pre_root.glob('pre_restore_*'))
+    finally:
+        lock.release()
+
+
+def test_b1_second_real_main_process_is_locked_out(
+        full_backup_and_target, monkeypatch, tmp_path):
+    """A second real restore_db.main() must not enter staging."""
+    backup_set, target = full_backup_and_target
+    pre_root = tmp_path / 'pre_restore'
+    registry_root = pre_root.parent / 'restore-registry'
+    marker = tmp_path / 'main-held.marker'
+    scripts = Path(__file__).resolve().parents[2] / 'scripts'
+    child = tmp_path / 'hold_main_lock.py'
+    child.write_text(
+        "import importlib.util, os, sys, time\n"
+        "from pathlib import Path\n"
+        "scripts = Path(%r)\n"
+        "sys.path.insert(0, str(scripts))\n"
+        "spec = importlib.util.spec_from_file_location('rd_holder', %r)\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "original = module._build_state\n"
+        "def hold(*args, **kwargs):\n"
+        "    Path(%r).write_text('LOCKED', encoding='utf-8')\n"
+        "    time.sleep(30)\n"
+        "    return original(*args, **kwargs)\n"
+        "module._build_state = hold\n"
+        "os.environ['MY_AI_ASSISTANT_RESTORE_REGISTRY_ROOT'] = %r\n"
+        "sys.argv = ['restore_db.py', '--from', %r, '--target-root', %r,\n"
+        "            '--backup-dir', %r, '--yes']\n"
+        "raise SystemExit(module.main())\n" % (
+            str(scripts), str(RESTORE_SCRIPT), str(marker),
+            str(registry_root), str(backup_set), str(target), str(pre_root)),
+        encoding='utf-8')
+    process = subprocess.Popen(
+        [sys.executable, str(child)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.time() + 15
+        while not marker.exists() and time.time() < deadline:
+            if process.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert marker.exists(), process.stderr.read()
         before = _business_snapshot(target)
         assert _run_restore(monkeypatch, backup_set, target, pre_root) == (
             restore_db.EXIT_LOCKED)
         assert _business_snapshot(target) == before
         assert not (target / '.restore_state').exists()
-        assert not list(pre_root.glob('pre_restore_*'))
+        assert not (target / '.restore_staging').exists()
     finally:
-        lock.release()
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+    # The crashed holder leaves a stale registry record; the next main must
+    # re-probe the OS lock and proceed without auto-recovering its state.
+    assert _run_restore(monkeypatch, backup_set, target, pre_root) == 0
+
+
+def test_b1_main_does_not_call_legacy_restore_lock(
+        full_backup_and_target, monkeypatch, tmp_path):
+    backup_set, target = full_backup_and_target
+
+    def fail_legacy(*_args, **_kwargs):
+        raise AssertionError('legacy RestoreLock must not be called')
+
+    monkeypatch.setattr(restore_db, 'RestoreLock', fail_legacy)
+    assert _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore') == 0
 
 
 def test_b1_restore_lock_released_after_success(
@@ -1647,8 +1763,9 @@ def test_b1_restore_lock_released_after_success(
     backup_set, target = full_backup_and_target
     assert _run_restore(monkeypatch, backup_set, target,
                         tmp_path / 'pre_restore') == 0
-    lock = restore_db.RestoreLock(target)
-    lock.acquire()
+    lock = restore_db.RootLock(
+        target, registry_root=tmp_path / 'restore-registry')
+    lock.acquire('after-success')
     lock.release()
 
 
@@ -1662,8 +1779,9 @@ def test_b1_restore_lock_released_after_rollback(
     monkeypatch.setattr(restore_db, '_switch_sqlite', fail_switch)
     assert _run_restore(monkeypatch, backup_set, target,
                         tmp_path / 'pre_restore') == restore_db.EXIT_TRANSACTION
-    lock = restore_db.RestoreLock(target)
-    lock.acquire()
+    lock = restore_db.RootLock(
+        target, registry_root=tmp_path / 'restore-registry')
+    lock.acquire('after-rollback')
     lock.release()
 
 

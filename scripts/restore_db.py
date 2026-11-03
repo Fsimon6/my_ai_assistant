@@ -12,7 +12,7 @@
   * 切换前把旧 SQLite（含 WAL/SHM）、Chroma、Excel 保护到 pre_restore /
     `.restore_rollback/<run_id>/`；逐对象切换，任一失败自动逆序回滚；
   * 持久化 `.restore_state/<run_id>/state.json`，发现未完成 run 时拒绝新恢复；
-  * 使用目标根 `.restore_control/restore.lock` 的 OS 文件锁做跨进程互斥；
+  * 使用目标根物理身份对应的 Registry Root Lock 做跨进程互斥；
   * 恢复后校验实际 Chroma collection、Excel artifacts 和 staging 文件清单；
   * **不是三类数据的全局原子事务**：只承诺逐对象可切换、可回滚、可识别失败；
   * `--target-root` 支持恢复到演练目录（不碰真实数据），用于定期演练。
@@ -53,6 +53,20 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+# Keep sibling safety modules importable when this script is loaded by path
+# (tests and direct CLI invocation both use scripts/ as the module home).
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from restore_path_security import PathSecurityError, open_secure_directory
+from restore_registry import (
+    RegistryConflictError,
+    RegistryLockBusy,
+    RegistryLockError,
+)
+from restore_root_lock import RootLock, RootLockError
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 EXIT_INVALID_BACKUP = 2
@@ -72,6 +86,7 @@ ROLLBACK_DIRNAME = '.restore_rollback'
 LOCK_DIRNAME = '.restore_control'
 LOCK_FILENAME = 'restore.lock'
 REGISTRY_DIRNAME = 'my_ai_assistant_restore_registry'
+RESTORE_REGISTRY_ROOT_ENV = 'MY_AI_ASSISTANT_RESTORE_REGISTRY_ROOT'
 # 与 backend/services/vector_service.py:92-95 的生产 collection 初始化保持一致。
 CHROMA_COLLECTION_NAME = 'ai_assistant_docs'
 CHROMA_SQLITE_NAME = 'chroma.sqlite3'
@@ -1588,17 +1603,27 @@ def main() -> int:
         print('\n这是预演（未加 --yes，未做任何写入）。确认后请追加 --yes。')
         return 0
 
+    target_handle = None
     lock = None
+    run_id = _new_run_id()
     try:
         try:
-            lock = RestoreLock(root)
-            lock.acquire()
-        except RestoreLockBusy as exc:
+            target_handle = open_secure_directory(root)
+        except (PathSecurityError, OSError) as exc:
+            print('恢复目标安全验证失败：%s' % exc)
+            return EXIT_PATH_MAPPING
+
+        registry_root = os.environ.get(RESTORE_REGISTRY_ROOT_ENV)
+        try:
+            lock = RootLock.from_target_handle(
+                target_handle,
+                registry_root=(Path(registry_root) if registry_root else None),
+            )
+            lock.acquire(run_id)
+        except (RegistryConflictError, RegistryLockBusy,
+                RegistryLockError, RootLockError, PathSecurityError) as exc:
             print('无法获取恢复锁：%s' % exc)
             print('同一或重叠目标已有恢复进程，本次未修改任何目标数据。')
-            return EXIT_LOCKED
-        except RestoreLockError as exc:
-            print('恢复锁错误：%s' % exc)
             return EXIT_LOCKED
         except Exception as exc:  # noqa: BLE001 - 锁初始化失败必须 fail-closed
             print('恢复锁初始化失败：%s' % exc)
@@ -1621,7 +1646,6 @@ def main() -> int:
             print('请先人工检查 .restore_state / .restore_staging / .restore_rollback。')
             return EXIT_INCOMPLETE_RUN
 
-        run_id = _new_run_id()
         try:
             state = _build_state(root, src, Path(args.backup_dir).resolve(), run_id)
             _execute(state, root, validated, Path(args.backup_dir).resolve())
@@ -1645,6 +1669,8 @@ def main() -> int:
                 lock.release()
             except Exception as exc:  # noqa: BLE001
                 print('警告：释放恢复锁失败：%s' % exc)
+        if target_handle is not None:
+            target_handle.close()
 
 
 if __name__ == '__main__':
