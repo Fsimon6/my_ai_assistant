@@ -25,6 +25,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 import zipfile
 from pathlib import Path
 
@@ -1815,3 +1816,495 @@ def test_b1_restore_lock_control_junction_rejected(tmp_path):
         assert outside.exists()
     finally:
         _remove_junction(link)
+
+
+class _FatalRestore(BaseException):
+    """Test-only non-Exception failure to verify primary traceback retention."""
+
+
+class _FailingTargetHandle:
+    """Delegate to a real target handle, then fail exactly once on close."""
+
+    def __init__(self, inner, error):
+        self._inner = inner
+        self._error = error
+        self.close_attempts = 0
+
+    @property
+    def closed(self):
+        return self._inner.closed
+
+    @property
+    def native_handle(self):
+        return self._inner.native_handle
+
+    @property
+    def identity(self):
+        return self._inner.identity
+
+    def close(self):
+        self.close_attempts += 1
+        self._inner.close()
+        raise self._error
+
+
+def _track_opened_handles(monkeypatch):
+    opened = []
+    original = restore_db.open_secure_directory
+
+    def tracked(path):
+        handle = original(path)
+        opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(restore_db, 'open_secure_directory', tracked)
+    return opened
+
+
+def _inject_target_close_failure(monkeypatch, error=None):
+    wrappers = []
+    original = restore_db.open_secure_directory
+    if error is None:
+        error = RuntimeError('simulated target close failure')
+
+    def wrapped(path):
+        wrapper = _FailingTargetHandle(original(path), error)
+        wrappers.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(restore_db, 'open_secure_directory', wrapped)
+    return wrappers
+
+
+def _inject_release_failure(monkeypatch, error=None):
+    calls = []
+    original = restore_db.RootLock.release
+    if error is None:
+        error = RuntimeError('simulated release failure')
+
+    def release_then_fail(lock):
+        calls.append(lock)
+        # Run the real release first so the test never leaks an OS lock.
+        original(lock)
+        raise error
+
+    monkeypatch.setattr(restore_db.RootLock, 'release', release_then_fail)
+    return calls
+
+
+def _assert_root_lock_released(target, registry_root, release=None):
+    """Prove the OS RootLock is free by acquiring it with a fresh RootLock."""
+    probe = restore_db.RootLock(target, registry_root=registry_root)
+    acquired = False
+    try:
+        probe.acquire('post-cleanup-probe')
+        acquired = True
+    finally:
+        if acquired:
+            if release is None:
+                probe.release()
+            else:
+                release(probe)
+
+
+def test_p1_1_root_lock_probe_success_releases(monkeypatch):
+    calls = []
+
+    class _Probe:
+        def __init__(self, target, registry_root=None):
+            self.target = target
+            self.registry_root = registry_root
+
+        def acquire(self, run_id):
+            calls.append(('acquire', run_id))
+
+        def release(self):
+            calls.append(('release',))
+
+    monkeypatch.setattr(restore_db, 'RootLock', _Probe)
+    _assert_root_lock_released('target', 'registry')
+    assert calls == [('acquire', 'post-cleanup-probe'), ('release',)]
+
+
+def test_p1_1_root_lock_probe_acquire_failure_skips_release(monkeypatch):
+    released = []
+
+    class _Probe:
+        def __init__(self, target, registry_root=None):
+            pass
+
+        @staticmethod
+        def acquire(_run_id):
+            raise RuntimeError('probe acquire failed')
+
+        @staticmethod
+        def release():
+            released.append(True)
+
+    monkeypatch.setattr(restore_db, 'RootLock', _Probe)
+    with pytest.raises(RuntimeError, match='probe acquire failed'):
+        _assert_root_lock_released('target', 'registry')
+    assert released == []
+
+
+def test_p1_1_root_lock_probe_release_failure_is_exposed(monkeypatch):
+    class _Probe:
+        def __init__(self, target, registry_root=None):
+            pass
+
+        @staticmethod
+        def acquire(_run_id):
+            return None
+
+        @staticmethod
+        def release():
+            raise RuntimeError('probe release failed')
+
+    monkeypatch.setattr(restore_db, 'RootLock', _Probe)
+    with pytest.raises(RuntimeError, match='probe release failed'):
+        _assert_root_lock_released('target', 'registry')
+
+
+def test_p1_1_main_success_cleanup_success(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    opened = _track_opened_handles(monkeypatch)
+    assert _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore') == 0
+    out, err = capsys.readouterr()
+    assert '恢复完成' in out
+    assert 'main 层资源释放失败' not in err
+    assert opened and opened[0].closed
+    _assert_root_lock_released(target, tmp_path / 'restore-registry')
+
+
+def test_p1_1_main_success_release_failure_returns_9(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    opened = _track_opened_handles(monkeypatch)
+    release_calls = _inject_release_failure(monkeypatch)
+
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert code == restore_db.EXIT_RELEASE_FAILURE
+    assert release_calls
+    assert opened and opened[0].closed
+    assert 'lock_release' in err
+    assert '数据阶段已完成，但资源释放失败' in err
+    assert '最终退出码：9' in err
+    assert '恢复完成' not in out
+
+
+def test_p1_1_main_failure_cleanup_success_keeps_code(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+
+    def fail_switch(*_args, **_kwargs):
+        raise RuntimeError('simulated switch failure for cleanup success')
+
+    monkeypatch.setattr(restore_db, '_switch_sqlite', fail_switch)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert code == restore_db.EXIT_TRANSACTION
+    assert 'simulated switch failure for cleanup success' in out
+    assert 'main 层资源释放失败' not in err
+
+
+def test_p1_1_main_failure_release_failure_keeps_original(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    opened = _track_opened_handles(monkeypatch)
+    release_calls = _inject_release_failure(monkeypatch)
+
+    def fail_switch(*_args, **_kwargs):
+        raise RuntimeError('simulated switch failure with release failure')
+
+    monkeypatch.setattr(restore_db, '_switch_sqlite', fail_switch)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert code == restore_db.EXIT_TRANSACTION
+    assert release_calls
+    assert opened and opened[0].closed
+    assert 'simulated switch failure with release failure' in out
+    assert 'lock_release' in err
+    assert '原始 Restore 退出码 7 保持不变' in err
+
+
+def test_p1_1_main_success_target_close_failure_returns_9(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    wrappers = _inject_target_close_failure(monkeypatch)
+
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert code == restore_db.EXIT_RELEASE_FAILURE
+    assert wrappers and wrappers[0].close_attempts == 1
+    assert wrappers[0].closed
+    assert 'target_close' in err
+    assert '数据阶段已完成，但资源释放失败' in err
+    assert '恢复完成' not in out
+    _assert_root_lock_released(target, tmp_path / 'restore-registry')
+
+
+def test_p1_1_main_exception_release_failure_preserves_traceback(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    opened = _track_opened_handles(monkeypatch)
+    _inject_release_failure(monkeypatch)
+    fatal = _FatalRestore('fatal restore failure')
+
+    def boom(*_args, **_kwargs):
+        raise fatal
+
+    monkeypatch.setattr(restore_db, '_execute', boom)
+    with pytest.raises(_FatalRestore) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert caught.value is fatal
+    assert str(caught.value) == 'fatal restore failure'
+    frames = traceback.extract_tb(caught.value.__traceback__)
+    assert any(frame.name == 'boom' for frame in frames)
+    assert opened and opened[0].closed
+    assert 'lock_release' in err
+    assert '原始 Restore 异常保留并原样传播' in err
+    assert '恢复完成' not in out
+
+
+def test_p1_1_main_preflight_failure_skips_cleanup(
+        full_backup_and_target, monkeypatch, tmp_path):
+    _backup_set, target = full_backup_and_target
+    opened = _track_opened_handles(monkeypatch)
+    release_calls = _inject_release_failure(monkeypatch)
+
+    code = _run_restore(monkeypatch, tmp_path / 'missing-backup',
+                        target, tmp_path / 'pre_restore')
+    assert code == restore_db.EXIT_INVALID_BACKUP
+    assert opened == []
+    assert release_calls == []
+
+
+def test_p1_1_main_success_both_cleanup_failures_return_9(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    original_release = restore_db.RootLock.release
+    wrappers = _inject_target_close_failure(monkeypatch)
+    release_calls = _inject_release_failure(monkeypatch)
+
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert code == restore_db.EXIT_RELEASE_FAILURE
+    assert release_calls
+    assert wrappers and wrappers[0].close_attempts == 1
+    assert wrappers[0].closed
+    assert 'lock_release' in err
+    assert 'target_close' in err
+    assert '恢复完成' not in out
+    _assert_root_lock_released(
+        target, tmp_path / 'restore-registry', release=original_release)
+
+
+def test_p1_1_main_failure_target_close_failure_keeps_code(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    wrappers = _inject_target_close_failure(monkeypatch)
+
+    def fail_switch(*_args, **_kwargs):
+        raise RuntimeError('simulated failure with target close failure')
+
+    monkeypatch.setattr(restore_db, '_switch_sqlite', fail_switch)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert code == restore_db.EXIT_TRANSACTION
+    assert 'simulated failure with target close failure' in out
+    assert 'target_close' in err
+    assert '原始 Restore 退出码 7 保持不变' in err
+    assert wrappers and wrappers[0].closed
+
+
+def test_p1_1_main_exception_target_close_failure_preserves_primary(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    wrappers = _inject_target_close_failure(monkeypatch)
+    fatal = _FatalRestore('fatal with target close failure')
+
+    def boom(*_args, **_kwargs):
+        raise fatal
+
+    monkeypatch.setattr(restore_db, '_execute', boom)
+    with pytest.raises(_FatalRestore) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert caught.value is fatal
+    assert any(frame.name == 'boom'
+               for frame in traceback.extract_tb(caught.value.__traceback__))
+    assert wrappers and wrappers[0].closed
+    assert 'target_close' in err
+    assert '原始 Restore 异常保留并原样传播' in err
+    assert '恢复完成' not in out
+
+
+def test_p1_1_main_exception_both_cleanup_failures_preserves_primary(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    wrappers = _inject_target_close_failure(monkeypatch)
+    release_calls = _inject_release_failure(monkeypatch)
+    fatal = _FatalRestore('fatal with both cleanup failures')
+
+    def boom(*_args, **_kwargs):
+        raise fatal
+
+    monkeypatch.setattr(restore_db, '_execute', boom)
+    with pytest.raises(_FatalRestore) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert caught.value is fatal
+    assert release_calls
+    assert wrappers and wrappers[0].closed
+    assert 'lock_release' in err
+    assert 'target_close' in err
+    assert '原始 Restore 异常保留并原样传播' in err
+    assert '恢复完成' not in out
+
+
+def test_p1_1_main_cleanup_keyboard_interrupt_propagates(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    opened = _track_opened_handles(monkeypatch)
+    _inject_release_failure(monkeypatch, KeyboardInterrupt('cleanup interrupt'))
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert opened and opened[0].closed
+    assert 'lock_release' in err
+    assert '清理阶段发生中断' in err
+    assert '恢复完成' not in out
+
+
+def test_p1_1_main_cleanup_system_exit_propagates(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    wrappers = _inject_target_close_failure(
+        monkeypatch, SystemExit('cleanup exit'))
+
+    with pytest.raises(SystemExit):
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert wrappers and wrappers[0].closed
+    assert 'target_close' in err
+    assert '清理阶段发生中断' in err
+    assert '恢复完成' not in out
+    _assert_root_lock_released(target, tmp_path / 'restore-registry')
+
+
+def test_p1_1_main_failure_cleanup_interrupt_propagates(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    opened = _track_opened_handles(monkeypatch)
+    _inject_release_failure(monkeypatch, KeyboardInterrupt('failure interrupt'))
+
+    def fail_switch(*_args, **_kwargs):
+        raise RuntimeError('data failure before cleanup interrupt')
+
+    monkeypatch.setattr(restore_db, '_switch_sqlite', fail_switch)
+    with pytest.raises(KeyboardInterrupt):
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert opened and opened[0].closed
+    assert 'data failure before cleanup interrupt' in out
+    assert 'lock_release' in err
+    assert '清理阶段发生中断' in err
+
+
+def test_p1_1_main_report_failure_preserves_primary(
+        full_backup_and_target, monkeypatch, tmp_path):
+    backup_set, target = full_backup_and_target
+    opened = _track_opened_handles(monkeypatch)
+    _inject_release_failure(monkeypatch)
+    fatal = _FatalRestore('fatal despite report failure')
+
+    def boom(*_args, **_kwargs):
+        raise fatal
+
+    def fail_report(_report):
+        raise RuntimeError('simulated report failure')
+
+    monkeypatch.setattr(restore_db, '_execute', boom)
+    monkeypatch.setattr(restore_db, '_report_cleanup_errors', fail_report)
+    with pytest.raises(_FatalRestore) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    assert caught.value is fatal
+    assert opened and opened[0].closed
+
+
+def test_p1_1_main_helper_failure_preserves_primary(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    opened = _track_opened_handles(monkeypatch)
+    fatal = _FatalRestore('fatal despite helper failure')
+    original = restore_db._release_main_resources
+
+    def helper_then_fail(report, lock, target_handle):
+        original(report, lock, target_handle)
+        raise RuntimeError('simulated helper failure')
+
+    def boom(*_args, **_kwargs):
+        raise fatal
+
+    monkeypatch.setattr(restore_db, '_execute', boom)
+    monkeypatch.setattr(
+        restore_db, '_release_main_resources', helper_then_fail)
+    with pytest.raises(_FatalRestore) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert caught.value is fatal
+    assert opened and opened[0].closed
+    assert 'helper' in err
+    assert '恢复完成' not in out
+
+
+def test_p1_1_cleanup_helper_internal_failure_still_closes_target():
+    closed = []
+
+    class _ExplodingReport:
+        def __init__(self):
+            self.target_error = None
+            self.helper_error = None
+
+        @property
+        def lock_error(self):
+            return None
+
+        @lock_error.setter
+        def lock_error(self, _value):
+            raise RuntimeError('slot write failure')
+
+    class _FailingLock:
+        @staticmethod
+        def release():
+            raise RuntimeError('lock release failure')
+
+    class _Target:
+        @staticmethod
+        def close():
+            closed.append(True)
+
+    report = restore_db._release_main_resources(
+        _ExplodingReport(), _FailingLock(), _Target())
+    assert closed == [True]
+    assert isinstance(report.helper_error, RuntimeError)
+    assert 'slot write failure' in str(report.helper_error)

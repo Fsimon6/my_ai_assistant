@@ -26,6 +26,7 @@
   6  自定义来源路径尚未实现目标映射，拒绝恢复到默认目录
   7  恢复事务失败（成功回滚返回 7；回滚失败会保留材料并要求人工处理）
   8  同一或重叠目标已有恢复进程持锁，本次未修改目标
+  9  数据阶段已完成，但 main 层资源释放失败；数据可能已提交，需检查锁/句柄
 
 用法：
     # 1) 先停止后端（Windows：Ctrl+C 结束 uvicorn；Docker：docker compose stop backend）
@@ -76,6 +77,7 @@ EXIT_INCOMPLETE_RUN = 5
 EXIT_PATH_MAPPING = 6
 EXIT_TRANSACTION = 7
 EXIT_LOCKED = 8
+EXIT_RELEASE_FAILURE = 9
 
 REQUIRED_TYPES = ('sqlite_database', 'vector_database', 'excel_artifacts')
 ZIP_TYPES = ('vector_database', 'excel_artifacts')
@@ -1561,6 +1563,172 @@ def _handle_failure(state: dict[str, Any], root: Path,
     return EXIT_TRANSACTION
 
 
+class _MainResources:
+    """Resources opened by main() that must be released after the data phase."""
+
+    def __init__(self) -> None:
+        self.lock = None
+        self.target_handle = None
+        self.state: dict[str, Any] | None = None
+
+
+class _CleanupReport:
+    """Fixed cleanup slots; avoids relying on repeated list appends."""
+
+    __slots__ = ('lock_error', 'target_error', 'helper_error')
+
+    def __init__(self) -> None:
+        self.lock_error: BaseException | None = None
+        self.target_error: BaseException | None = None
+        self.helper_error: BaseException | None = None
+
+    def has_errors(self) -> bool:
+        return (
+            self.lock_error is not None
+            or self.target_error is not None
+            or self.helper_error is not None
+        )
+
+
+def _release_main_resources(report: _CleanupReport, lock,
+                            target_handle) -> _CleanupReport:
+    """Attempt both resources; target is always tried from a finally block."""
+    try:
+        if lock is not None:
+            try:
+                lock.release()
+            except BaseException as exc:  # noqa: BLE001 - cleanup must continue
+                report.lock_error = exc
+    except BaseException as exc:  # noqa: BLE001 - protect the second resource
+        report.helper_error = exc
+    finally:
+        try:
+            if target_handle is not None:
+                target_handle.close()
+        except BaseException as exc:  # noqa: BLE001 - cleanup must continue
+            report.target_error = exc
+    return report
+
+
+def _safe_exception_text(exc: BaseException) -> tuple[str, str]:
+    try:
+        type_name = type(exc).__name__
+    except BaseException:  # noqa: BLE001 - diagnostics must not mask primary
+        type_name = '<unknown exception type>'
+    try:
+        text = str(exc)
+    except BaseException:  # noqa: BLE001 - diagnostics must not mask primary
+        text = '<unprintable exception>'
+    return type_name, text
+
+
+def _safe_stderr(message: str) -> bool:
+    """Best-effort diagnostic output that must not replace a primary error."""
+    try:
+        print(message, file=sys.stderr)
+    except BaseException:  # noqa: BLE001 - reporting must not mask primary
+        return False
+    return True
+
+
+def _report_cleanup_errors(report: _CleanupReport) -> None:
+    if not report.has_errors():
+        return
+    _safe_stderr('警告：main 层资源释放失败：')
+    for name, exc in (
+            ('lock_release', report.lock_error),
+            ('target_close', report.target_error),
+            ('helper', report.helper_error)):
+        if exc is None:
+            continue
+        type_name, text = _safe_exception_text(exc)
+        _safe_stderr('  - %s: %s: %s' % (name, type_name, text))
+
+
+def _safe_report_cleanup_errors(report: _CleanupReport) -> bool:
+    """Contain both formatting and stderr failures in the reporting path."""
+    try:
+        _report_cleanup_errors(report)
+    except BaseException:  # noqa: BLE001 - reporting must not mask primary
+        return False
+    return True
+
+
+def _first_cleanup_interrupt(report: _CleanupReport) -> BaseException | None:
+    for exc in (report.lock_error, report.target_error, report.helper_error):
+        if exc is not None and not isinstance(exc, Exception):
+            return exc
+    return None
+
+
+def _print_restore_success(state: dict[str, Any] | None) -> None:
+    if not isinstance(state, dict):
+        return
+    print('\n恢复完成（逐对象切换，非全局原子事务）。')
+    print('恢复后校验：SQLite integrity_check、Chroma 文件、Excel JSON 已通过。')
+    print('旧数据保留：pre_restore=%s；rollback=%s' % (
+        state['pre_restore'], state['rollback']))
+    print('请启动后端并确认：登录、知识库文档列表、Excel 预览、历史卡片均正常。')
+
+
+def _restore_locked(root: Path, src: Path, backup_dir: Path,
+                    validated: dict[str, Any], run_id: str,
+                    resources: _MainResources) -> int:
+    """Run the data phase after acquiring the Root Lock; return its exit code."""
+    try:
+        resources.target_handle = open_secure_directory(root)
+    except (PathSecurityError, OSError) as exc:
+        print('恢复目标安全验证失败：%s' % exc)
+        return EXIT_PATH_MAPPING
+
+    registry_root = os.environ.get(RESTORE_REGISTRY_ROOT_ENV)
+    try:
+        resources.lock = RootLock.from_target_handle(
+            resources.target_handle,
+            registry_root=(Path(registry_root) if registry_root else None),
+        )
+        resources.lock.acquire(run_id)
+    except (RegistryConflictError, RegistryLockBusy,
+            RegistryLockError, RootLockError, PathSecurityError) as exc:
+        print('无法获取恢复锁：%s' % exc)
+        print('同一或重叠目标已有恢复进程，本次未修改任何目标数据。')
+        return EXIT_LOCKED
+    except Exception as exc:  # noqa: BLE001 - 锁初始化失败必须 fail-closed
+        print('恢复锁初始化失败：%s' % exc)
+        return EXIT_LOCKED
+
+    try:
+        _validate_target_types(root)
+    except RestoreTransactionError as exc:
+        print('恢复前检查失败：%s' % exc)
+        return EXIT_TRANSACTION
+    except Exception as exc:  # noqa: BLE001
+        print('恢复前检查失败：%s' % exc)
+        return EXIT_TRANSACTION
+
+    incomplete = _scan_incomplete_runs(root, backup_dir)
+    if incomplete:
+        print('检测到未完成或未知的恢复 run，拒绝开始新的恢复：')
+        for item in incomplete:
+            print('  - %s' % item)
+        print('请先人工检查 .restore_state / .restore_staging / .restore_rollback。')
+        return EXIT_INCOMPLETE_RUN
+
+    state = None
+    try:
+        state = _build_state(root, src, backup_dir, run_id)
+        _execute(state, root, validated, backup_dir)
+        _cleanup_staging(Path(state['staging']), root, state)
+    except Exception as exc:  # noqa: BLE001
+        if not isinstance(state, dict):
+            print('恢复失败：%s' % exc)
+            return EXIT_TRANSACTION
+        return _handle_failure(state, root, exc)
+
+    resources.state = state
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description='从备份集恢复业务库 / 向量库 / Excel 原件')
     ap.add_argument('--from', dest='src', required=True, help='备份集目录')
@@ -1603,74 +1771,48 @@ def main() -> int:
         print('\n这是预演（未加 --yes，未做任何写入）。确认后请追加 --yes。')
         return 0
 
-    target_handle = None
-    lock = None
-    run_id = _new_run_id()
+    resources = _MainResources()
+    primary_exc: BaseException | None = None
+    primary_tb = None
+    exit_code = EXIT_TRANSACTION
+    cleanup_report = _CleanupReport()
     try:
-        try:
-            target_handle = open_secure_directory(root)
-        except (PathSecurityError, OSError) as exc:
-            print('恢复目标安全验证失败：%s' % exc)
-            return EXIT_PATH_MAPPING
-
-        registry_root = os.environ.get(RESTORE_REGISTRY_ROOT_ENV)
-        try:
-            lock = RootLock.from_target_handle(
-                target_handle,
-                registry_root=(Path(registry_root) if registry_root else None),
-            )
-            lock.acquire(run_id)
-        except (RegistryConflictError, RegistryLockBusy,
-                RegistryLockError, RootLockError, PathSecurityError) as exc:
-            print('无法获取恢复锁：%s' % exc)
-            print('同一或重叠目标已有恢复进程，本次未修改任何目标数据。')
-            return EXIT_LOCKED
-        except Exception as exc:  # noqa: BLE001 - 锁初始化失败必须 fail-closed
-            print('恢复锁初始化失败：%s' % exc)
-            return EXIT_LOCKED
-
-        try:
-            _validate_target_types(root)
-        except RestoreTransactionError as exc:
-            print('恢复前检查失败：%s' % exc)
-            return EXIT_TRANSACTION
-        except Exception as exc:  # noqa: BLE001
-            print('恢复前检查失败：%s' % exc)
-            return EXIT_TRANSACTION
-
-        incomplete = _scan_incomplete_runs(root, Path(args.backup_dir).resolve())
-        if incomplete:
-            print('检测到未完成或未知的恢复 run，拒绝开始新的恢复：')
-            for item in incomplete:
-                print('  - %s' % item)
-            print('请先人工检查 .restore_state / .restore_staging / .restore_rollback。')
-            return EXIT_INCOMPLETE_RUN
-
-        try:
-            state = _build_state(root, src, Path(args.backup_dir).resolve(), run_id)
-            _execute(state, root, validated, Path(args.backup_dir).resolve())
-            _cleanup_staging(Path(state['staging']), root, state)
-        except Exception as exc:  # noqa: BLE001
-            state = locals().get('state')
-            if not isinstance(state, dict):
-                print('恢复失败：%s' % exc)
-                return EXIT_TRANSACTION
-            return _handle_failure(state, root, exc)
-
-        print('\n恢复完成（逐对象切换，非全局原子事务）。')
-        print('恢复后校验：SQLite integrity_check、Chroma 文件、Excel JSON 已通过。')
-        print('旧数据保留：pre_restore=%s；rollback=%s' % (
-            state['pre_restore'], state['rollback']))
-        print('请启动后端并确认：登录、知识库文档列表、Excel 预览、历史卡片均正常。')
-        return 0
+        exit_code = _restore_locked(
+            root, src, Path(args.backup_dir).resolve(), validated,
+            _new_run_id(), resources)
+    except BaseException as exc:  # noqa: BLE001 - cleanup must run for any exit
+        primary_exc = exc
+        primary_tb = exc.__traceback__
     finally:
-        if lock is not None:
-            try:
-                lock.release()
-            except Exception as exc:  # noqa: BLE001
-                print('警告：释放恢复锁失败：%s' % exc)
-        if target_handle is not None:
-            target_handle.close()
+        try:
+            _release_main_resources(
+                cleanup_report, resources.lock, resources.target_handle)
+        except BaseException as exc:  # noqa: BLE001 - helper must not mask primary
+            if cleanup_report.helper_error is None:
+                cleanup_report.helper_error = exc
+
+    if primary_exc is not None:
+        if cleanup_report.has_errors():
+            _safe_report_cleanup_errors(cleanup_report)
+            _safe_stderr(
+                '原始 Restore 异常保留并原样传播；清理错误未改变主异常。')
+        raise primary_exc.with_traceback(primary_tb)
+
+    if cleanup_report.has_errors():
+        _safe_report_cleanup_errors(cleanup_report)
+        interrupt = _first_cleanup_interrupt(cleanup_report)
+        if interrupt is not None:
+            _safe_stderr('清理阶段发生中断，完成可执行清理后原样传播。')
+            raise interrupt.with_traceback(interrupt.__traceback__)
+        if exit_code == 0:
+            _safe_stderr('数据阶段已完成，但资源释放失败。')
+            _safe_stderr('最终退出码：%d' % EXIT_RELEASE_FAILURE)
+            return EXIT_RELEASE_FAILURE
+        _safe_stderr('原始 Restore 退出码 %d 保持不变。' % exit_code)
+
+    if exit_code == 0:
+        _print_restore_success(resources.state)
+    return exit_code
 
 
 if __name__ == '__main__':
