@@ -216,9 +216,110 @@ def nt_create_file(
     return int(status), int(handle.value or 0)
 
 
+class NativeHandleCloseError(OSError):
+    """CloseHandle failed or its result is unknown; the handle must not be retried."""
+
+    def __init__(self, *, operation: str, owner: str,
+                 winerror: int | None = None,
+                 handle_value: int | None = None,
+                 close_state: str = 'CLOSE_FAILED_UNKNOWN',
+                 error_source: str = 'CloseHandle',
+                 data_committed: bool | None = None,
+                 errors: tuple['NativeHandleCloseError', ...] = ()) -> None:
+        self.operation = operation
+        self.owner = owner
+        self.winerror = winerror
+        self.handle_value = handle_value
+        self.close_state = close_state
+        self.error_source = error_source
+        self.data_committed = data_committed
+        self.errors = tuple(errors)
+        if errors:
+            details = '; '.join(str(exc) for exc in errors)
+            message = '%s %s failed with %d close error(s): %s' % (
+                owner, operation, len(errors), details)
+        else:
+            handle_text = (
+                '0x%X' % handle_value if isinstance(handle_value, int) else 'unknown')
+            error_text = (
+                'WinError %s' % winerror
+                if winerror is not None else 'no WinError')
+            commit_text = (
+                ', data_committed=false' if data_committed is False
+                else ', data_committed=true' if data_committed is True
+                else '')
+            message = (
+                '%s %s failed (handle=%s, %s, state=%s, source=%s%s)' % (
+                    owner, operation, handle_text, error_text, close_state,
+                    error_source, commit_text))
+        if winerror is None:
+            super().__init__(message)
+        else:
+            super().__init__(winerror, message)
+        self.winerror = winerror
+
+
+def _safe_last_error() -> int | None:
+    """Read ctypes' saved last error without letting diagnostics mask the close error."""
+    try:
+        return int(ctypes.get_last_error())
+    except Exception:  # noqa: BLE001 - close error must still be reported
+        return None
+
+
+def close_handle_once(handle: int | None, owner: str = 'unknown',
+                      operation: str = 'close',
+                      data_committed: bool | None = None) -> None:
+    """Close one handle exactly once; FALSE is a failure and is never retried.
+
+    Contract:
+    - None means there is no resource to close (no-op).
+    - 0, c_void_p(None), and other null values are invalid handles and raise.
+    - A FALSE CloseHandle reads GetLastError immediately and raises.
+    - A Python exception preserves its chain and does not reuse stale WinError.
+    """
+    if handle is None:
+        return
+    if isinstance(handle, ctypes.c_void_p):
+        handle = handle.value
+    if handle is None or handle == 0:
+        raise NativeHandleCloseError(
+            operation=operation,
+            owner=owner,
+            winerror=None,
+            handle_value=handle,
+            error_source='invalid_handle',
+            data_committed=data_committed,
+        )
+    try:
+        ok = kernel32.CloseHandle(handle)
+    except Exception as exc:  # noqa: BLE001 - preserve the Python exception chain
+        # A Python call failure is not a BOOL FALSE; last-error may be stale.
+        raise NativeHandleCloseError(
+            operation=operation,
+            owner=owner,
+            winerror=None,
+            handle_value=handle,
+            error_source='python_exception',
+            data_committed=data_committed,
+        ) from exc
+    if ok:
+        return
+    # Capture GetLastError immediately; do not call another WinAPI before this.
+    winerror = _safe_last_error()
+    raise NativeHandleCloseError(
+        operation=operation,
+        owner=owner,
+        winerror=winerror,
+        handle_value=handle,
+        error_source='CloseHandle',
+        data_committed=data_committed,
+    )
+
+
 def close_handle(handle: int | None) -> None:
-    if handle:
-        kernel32.CloseHandle(handle)
+    """Compatibility wrapper; now raises NativeHandleCloseError on failure."""
+    close_handle_once(handle, owner='caller', operation='close')
 
 
 def get_file_id(handle: int) -> tuple[int, str]:

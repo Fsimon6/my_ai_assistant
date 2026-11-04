@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
@@ -22,6 +23,7 @@ if str(SCRIPTS) not in sys.path:
 
 from restore_path_security import validate_target_directory  # noqa: E402
 import restore_registry as registry  # noqa: E402
+import restore_win32_native as native  # noqa: E402
 
 
 def _entry(identity, run_id: str):
@@ -426,3 +428,807 @@ def test_registry_lock_release_allows_next(tmp_path):
     second = registry.RegistryLock(root / 'registry.lock')
     second.acquire()
     second.release()
+
+
+def _prepared_store(tmp_path):
+    store = registry.RegistryStore(tmp_path / 'registry-root')
+    store.prepare()
+    return store
+
+
+def _inject_close_failure(monkeypatch, only_owner=None):
+    real_close = registry.close_handle_once
+    calls = []
+
+    def close_then_fail(handle, owner='unknown', operation='close',
+                        data_committed=None):
+        real_close(handle, owner=owner, operation=operation,
+                   data_committed=data_committed)
+        calls.append(owner)
+        if only_owner is None or owner == only_owner:
+            raise native.NativeHandleCloseError(
+                operation='close', owner=owner, winerror=6,
+                handle_value=handle, data_committed=data_committed)
+
+    monkeypatch.setattr(registry, 'close_handle_once', close_then_fail)
+    return calls
+
+
+def test_read_registry_native_close_failure_raises(tmp_path, monkeypatch):
+    store = _prepared_store(tmp_path)
+    try:
+        (store.root / registry.REGISTRY_FILENAME).write_text(
+            json.dumps({'schema_version': 1, 'generation': 0, 'entries': []}),
+            encoding='utf-8')
+        _inject_close_failure(monkeypatch)
+        with pytest.raises(native.NativeHandleCloseError):
+            registry._read_registry_native(store.root_handle.native_handle)
+    finally:
+        store.close()
+
+
+def test_read_expected_identity_close_failure_raises(tmp_path, monkeypatch):
+    store = _prepared_store(tmp_path)
+    try:
+        lock = registry.RegistryLock(store.root / 'registry.lock')
+        (store.root / lock.identity_name).write_text(
+            json.dumps({
+                'schema_version': 1,
+                'volume_serial': 1,
+                'file_id': 'a' * 32,
+            }),
+            encoding='utf-8')
+        _inject_close_failure(monkeypatch)
+        with pytest.raises(native.NativeHandleCloseError):
+            lock._read_expected_identity(store.root_handle.native_handle)
+    finally:
+        store.close()
+
+
+def test_create_expected_identity_close_failure_raises(tmp_path, monkeypatch):
+    store = _prepared_store(tmp_path)
+    try:
+        lock = registry.RegistryLock(store.root / 'registry.lock')
+        _inject_close_failure(monkeypatch)
+        with pytest.raises(native.NativeHandleCloseError):
+            lock._create_expected_identity(
+                store.root_handle.native_handle, (1, 'b' * 32))
+        assert (store.root / lock.identity_name).is_file()
+    finally:
+        store.close()
+
+
+def test_write_registry_native_close_failure_raises(tmp_path, monkeypatch):
+    store = _prepared_store(tmp_path)
+    try:
+        _inject_close_failure(monkeypatch, only_owner='registry-temp')
+        with pytest.raises(native.NativeHandleCloseError) as caught:
+            registry._write_registry_native(
+                store.root_handle.native_handle,
+                {'schema_version': 1, 'generation': 0, 'entries': []})
+        assert caught.value.owner == 'registry-temp'
+        assert caught.value.operation == 'close'
+        assert caught.value.close_state == 'CLOSE_FAILED_UNKNOWN'
+        assert caught.value.data_committed is True
+        assert 'data_committed=true' in str(caught.value)
+        assert (store.root / registry.REGISTRY_FILENAME).is_file()
+    finally:
+        store.close()
+
+
+def test_write_registry_target_close_failure_aborts_replace(tmp_path, monkeypatch):
+    store = _prepared_store(tmp_path)
+    try:
+        registry_path = store.root / registry.REGISTRY_FILENAME
+        registry_path.write_text('old-registry', encoding='utf-8')
+        _inject_close_failure(monkeypatch, only_owner='registry-target')
+        with pytest.raises(native.NativeHandleCloseError) as caught:
+            registry._write_registry_native(
+                store.root_handle.native_handle,
+                {'schema_version': 1, 'generation': 0, 'entries': []})
+        assert caught.value.owner == 'registry-target'
+        assert caught.value.data_committed is False
+        assert 'data_committed=false' in str(caught.value)
+        assert registry_path.read_text(encoding='utf-8') == 'old-registry'
+    finally:
+        store.close()
+
+
+def test_write_registry_collects_both_close_failures(tmp_path, monkeypatch):
+    store = _prepared_store(tmp_path)
+    try:
+        registry_path = store.root / registry.REGISTRY_FILENAME
+        registry_path.write_text('old-registry', encoding='utf-8')
+        _inject_close_failure(monkeypatch)
+        with pytest.raises(native.NativeHandleCloseError) as caught:
+            registry._write_registry_native(
+                store.root_handle.native_handle,
+                {'schema_version': 1, 'generation': 0, 'entries': []})
+        err = caught.value
+        assert err.owner == 'registry-target'
+        assert err.operation == 'close'
+        assert err.close_state == 'CLOSE_FAILED_UNKNOWN'
+        assert err.data_committed is False
+        attached = err._native_close_errors
+        assert len(attached) == 1
+        assert attached[0].owner == 'registry-temp'
+        assert attached[0].operation == 'close'
+        assert attached[0].close_state == 'CLOSE_FAILED_UNKNOWN'
+        assert attached[0].data_committed is False
+        assert registry_path.read_text(encoding='utf-8') == 'old-registry'
+    finally:
+        store.close()
+
+
+def test_read_registry_preserves_primary_over_close_failure(tmp_path, monkeypatch):
+    store = _prepared_store(tmp_path)
+    try:
+        (store.root / registry.REGISTRY_FILENAME).write_text('{}', encoding='utf-8')
+
+        def fail_read(_handle):
+            raise RuntimeError('primary read failure')
+
+        monkeypatch.setattr(registry, 'read_all', fail_read)
+        _inject_close_failure(monkeypatch)
+        with pytest.raises(RuntimeError, match='primary read failure') as caught:
+            registry._read_registry_native(store.root_handle.native_handle)
+        assert caught.value._native_close_errors
+    finally:
+        store.close()
+
+
+def test_read_expected_identity_preserves_primary_over_close_failure(
+        tmp_path, monkeypatch):
+    store = _prepared_store(tmp_path)
+    try:
+        lock = registry.RegistryLock(store.root / 'registry.lock')
+        (store.root / lock.identity_name).write_text(
+            '{}', encoding='utf-8')
+
+        def fail_read(_handle):
+            raise RuntimeError('identity read failure')
+
+        monkeypatch.setattr(registry, 'read_all', fail_read)
+        _inject_close_failure(monkeypatch)
+        with pytest.raises(RuntimeError, match='identity read failure') as caught:
+            lock._read_expected_identity(store.root_handle.native_handle)
+        assert caught.value._native_close_errors
+    finally:
+        store.close()
+
+
+def test_create_expected_identity_preserves_primary_over_close_failure(
+        tmp_path, monkeypatch):
+    store = _prepared_store(tmp_path)
+    try:
+        lock = registry.RegistryLock(store.root / 'registry.lock')
+
+        def fail_write(_handle, _data):
+            raise RuntimeError('identity write failure')
+
+        monkeypatch.setattr(registry, 'write_all', fail_write)
+        _inject_close_failure(monkeypatch)
+        with pytest.raises(RuntimeError, match='identity write failure') as caught:
+            lock._create_expected_identity(
+                store.root_handle.native_handle, (1, 'c' * 32))
+        assert caught.value._native_close_errors
+    finally:
+        store.close()
+
+
+def test_write_registry_rename_failure_preserves_primary(
+        tmp_path, monkeypatch):
+    store = _prepared_store(tmp_path)
+    try:
+        registry_path = store.root / registry.REGISTRY_FILENAME
+        registry_path.write_text('old-registry', encoding='utf-8')
+
+        def fail_rename(*_args, **_kwargs):
+            return -1
+
+        monkeypatch.setattr(registry, 'rename_relative', fail_rename)
+        _inject_close_failure(monkeypatch, only_owner='registry-temp')
+        with pytest.raises(registry.RegistryCorruptError) as caught:
+            registry._write_registry_native(
+                store.root_handle.native_handle,
+                {'schema_version': 1, 'generation': 0, 'entries': []})
+        assert caught.value._native_close_errors
+        assert caught.value._native_close_errors[0].data_committed is False
+        assert registry_path.read_text(encoding='utf-8') == 'old-registry'
+    finally:
+        store.close()
+
+
+def test_raise_close_errors_aggregate_fields():
+    first = native.NativeHandleCloseError(
+        operation='close', owner='first', winerror=6, handle_value=1)
+    second = native.NativeHandleCloseError(
+        operation='close', owner='second', winerror=6, handle_value=2)
+
+    with pytest.raises(native.NativeHandleCloseError) as caught:
+        registry._raise_close_errors([first, second], 'registry-write')
+
+    assert caught.value.owner == 'registry-write'
+    assert caught.value.operation == 'cleanup'
+    assert caught.value.errors == (first, second)
+    assert [exc.owner for exc in caught.value.errors] == ['first', 'second']
+
+
+def test_attach_close_errors_failure_preserves_primary():
+    class _NoAttachError(Exception):
+        def __setattr__(self, _name, _value):
+            raise RuntimeError('setattr unavailable')
+
+    primary = _NoAttachError('primary failure')
+    close_error = native.NativeHandleCloseError(
+        operation='close', owner='test', winerror=6, handle_value=1)
+
+    registry._attach_close_errors(primary, [close_error])
+
+    assert str(primary) == 'primary failure'
+
+
+class _FakeLockKernel:
+    def __init__(self, unlock_error=None):
+        self.unlock_error = unlock_error
+        self.unlock_calls = 0
+
+    def UnlockFileEx(self, *_args):
+        self.unlock_calls += 1
+        if self.unlock_error is not None:
+            raise self.unlock_error
+        return True
+
+
+class _FakeCloseOnce:
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    def __call__(self, handle, owner='unknown', operation='close',
+                 data_committed=None):
+        self.calls.append((handle, owner, operation))
+        if self.error is not None:
+            raise self.error
+
+
+def _held_lock(tmp_path, kernel, close_handle=123):
+    lock = registry.RegistryLock(tmp_path / 'registry.lock')
+    lock._handle = (kernel, close_handle, ctypes.c_int())
+    lock.identity = (1, 'a' * 32)
+    lock._close_state = registry.RegistryLock.OPEN
+    return lock
+
+
+def test_registry_lock_release_success_state(tmp_path, monkeypatch):
+    kernel = _FakeLockKernel()
+    close = _FakeCloseOnce()
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = _held_lock(tmp_path, kernel)
+
+    lock.release()
+
+    assert kernel.unlock_calls == 1
+    assert close.calls == [(123, 'RegistryLock', 'release')]
+    assert lock._handle is None
+    assert lock.identity is None
+    assert lock.close_state == registry.RegistryLock.CLOSED
+    assert lock.closed is True
+    assert lock.is_held is False
+
+    lock.release()
+    lock.abort()
+    assert close.calls == [(123, 'RegistryLock', 'release')]
+
+
+def test_registry_lock_abort_success_does_not_unlock(tmp_path, monkeypatch):
+    kernel = _FakeLockKernel()
+    close = _FakeCloseOnce()
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = _held_lock(tmp_path, kernel)
+
+    lock.abort()
+
+    assert kernel.unlock_calls == 0
+    assert close.calls == [(123, 'RegistryLock', 'abort')]
+    assert lock.close_state == registry.RegistryLock.CLOSED
+    assert lock.closed is True
+
+
+def test_registry_lock_close_failure_never_retried_by_abort(
+        tmp_path, monkeypatch):
+    error = native.NativeHandleCloseError(
+        operation='release', owner='RegistryLock', winerror=6, handle_value=123)
+    close = _FakeCloseOnce(error)
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = _held_lock(tmp_path, _FakeLockKernel())
+
+    with pytest.raises(native.NativeHandleCloseError) as caught:
+        lock.release()
+    assert caught.value is error
+    assert close.calls == [(123, 'RegistryLock', 'release')]
+    assert lock._handle is None
+    assert lock.close_state == registry.RegistryLock.CLOSE_FAILED_UNKNOWN
+    assert lock.close_failed is True
+    assert lock.closed is False
+
+    lock.abort()
+    lock.release()
+    assert close.calls == [(123, 'RegistryLock', 'release')]
+
+
+def test_registry_lock_abort_failure_never_retried(tmp_path, monkeypatch):
+    error = native.NativeHandleCloseError(
+        operation='abort', owner='RegistryLock', winerror=6, handle_value=123)
+    close = _FakeCloseOnce(error)
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = _held_lock(tmp_path, _FakeLockKernel())
+
+    with pytest.raises(native.NativeHandleCloseError):
+        lock.abort()
+    assert close.calls == [(123, 'RegistryLock', 'abort')]
+    assert lock.close_state == registry.RegistryLock.CLOSE_FAILED_UNKNOWN
+
+    lock.abort()
+    lock.release()
+    assert close.calls == [(123, 'RegistryLock', 'abort')]
+
+
+def test_registry_lock_abort_after_release_is_noop(tmp_path, monkeypatch):
+    kernel = _FakeLockKernel()
+    close = _FakeCloseOnce()
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = _held_lock(tmp_path, kernel)
+
+    lock.release()
+    lock.abort()
+
+    assert close.calls == [(123, 'RegistryLock', 'release')]
+    assert lock.close_state == registry.RegistryLock.CLOSED
+
+
+def test_registry_lock_close_keyboard_interrupt_sets_unknown(
+        tmp_path, monkeypatch):
+    error = KeyboardInterrupt('close interrupted')
+    close = _FakeCloseOnce(error)
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = _held_lock(tmp_path, _FakeLockKernel())
+
+    with pytest.raises(KeyboardInterrupt):
+        lock.abort()
+    assert close.calls == [(123, 'RegistryLock', 'abort')]
+    assert lock.close_state == registry.RegistryLock.CLOSE_FAILED_UNKNOWN
+    assert lock.close_failed is True
+
+    lock.abort()
+    lock.release()
+    assert close.calls == [(123, 'RegistryLock', 'abort')]
+
+
+def test_registry_lock_close_system_exit_sets_unknown(
+        tmp_path, monkeypatch):
+    error = SystemExit('close exit')
+    close = _FakeCloseOnce(error)
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = _held_lock(tmp_path, _FakeLockKernel())
+
+    with pytest.raises(SystemExit):
+        lock.release()
+    assert close.calls == [(123, 'RegistryLock', 'release')]
+    assert lock.close_state == registry.RegistryLock.CLOSE_FAILED_UNKNOWN
+    assert lock.close_failed is True
+
+    lock.abort()
+    lock.release()
+    assert close.calls == [(123, 'RegistryLock', 'release')]
+
+
+def test_registry_lock_release_after_abort_is_noop(tmp_path, monkeypatch):
+    kernel = _FakeLockKernel()
+    close = _FakeCloseOnce()
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = _held_lock(tmp_path, kernel)
+
+    lock.abort()
+    lock.release()
+
+    assert close.calls == [(123, 'RegistryLock', 'abort')]
+    assert lock.close_state == registry.RegistryLock.CLOSED
+
+
+def test_registry_lock_unheld_release_and_abort_are_noop(tmp_path, monkeypatch):
+    close = _FakeCloseOnce()
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = registry.RegistryLock(tmp_path / 'registry.lock')
+
+    lock.release()
+    lock.abort()
+
+    assert close.calls == []
+    assert lock.close_state == registry.RegistryLock.UNHELD
+
+
+def test_registry_lock_unlock_failure_still_closes(tmp_path, monkeypatch):
+    kernel = _FakeLockKernel(unlock_error=RuntimeError('unlock failure'))
+    close = _FakeCloseOnce()
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = _held_lock(tmp_path, kernel)
+
+    with pytest.raises(RuntimeError, match='unlock failure'):
+        lock.release()
+
+    assert close.calls == [(123, 'RegistryLock', 'release')]
+    assert lock._handle is None
+    assert lock.close_state == registry.RegistryLock.CLOSED
+    assert lock.closed is True
+
+    lock.abort()
+    assert close.calls == [(123, 'RegistryLock', 'release')]
+
+
+def test_registry_lock_unlock_and_close_failure_preserve_unlock(tmp_path, monkeypatch):
+    unlock_error = RuntimeError('unlock failure')
+    close_error = native.NativeHandleCloseError(
+        operation='release', owner='RegistryLock', winerror=6, handle_value=123)
+    kernel = _FakeLockKernel(unlock_error=unlock_error)
+    close = _FakeCloseOnce(close_error)
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+    lock = _held_lock(tmp_path, kernel)
+
+    with pytest.raises(RuntimeError, match='unlock failure') as caught:
+        lock.release()
+
+    assert caught.value._native_close_errors == (close_error,)
+    assert lock.close_state == registry.RegistryLock.CLOSE_FAILED_UNKNOWN
+    assert lock.close_failed is True
+    lock.abort()
+    assert close.calls == [(123, 'RegistryLock', 'release')]
+
+
+def test_registry_lock_acquire_busy_stays_unheld(tmp_path):
+    holder = registry.RegistryLock(tmp_path / 'registry.lock')
+    holder.acquire()
+    try:
+        second = registry.RegistryLock(tmp_path / 'registry.lock')
+        with pytest.raises(registry.RegistryLockBusy):
+            second.acquire()
+        assert second._handle is None
+        assert second.close_state == registry.RegistryLock.UNHELD
+        second.release()
+        second.abort()
+    finally:
+        holder.release()
+
+
+def test_close_local_preserving_keeps_primary(monkeypatch):
+    primary = RuntimeError('acquire failed')
+    close_error = native.NativeHandleCloseError(
+        operation='close', owner='RegistryLock.acquire',
+        winerror=6, handle_value=123)
+    close = _FakeCloseOnce(close_error)
+    monkeypatch.setattr(registry, 'close_handle_once', close)
+
+    registry._close_local_preserving(123, primary, 'RegistryLock.acquire')
+
+    assert close.calls == [(123, 'RegistryLock.acquire', 'close')]
+    assert primary._native_close_errors == (close_error,)
+
+
+class _FakeStoreHandle:
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = 0
+        self.closed = False
+        self.identity = object()
+        self.native_handle = 123
+
+    def close(self):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        self.closed = True
+
+
+class _FakeStoreLock:
+    def __init__(self, error=None):
+        self.error = error
+        self.release_calls = 0
+        self.acquire_calls = 0
+
+    def set_parent(self, _handle, _identity):
+        pass
+
+    def acquire(self):
+        self.acquire_calls += 1
+
+    def release(self):
+        self.release_calls += 1
+        if self.error is not None:
+            raise self.error
+
+
+def _store_with_handles(tmp_path, roots_error=None, root_error=None,
+                        lock_error=None, owns=True):
+    store = registry.RegistryStore(tmp_path / 'registry-root')
+    store._lock = _FakeStoreLock(lock_error)
+    store._root_handle = _FakeStoreHandle(root_error)
+    store._roots_handle = _FakeStoreHandle(roots_error)
+    store._root_identity = object()
+    store._roots_identity = object()
+    store._prepared = True
+    store._state = registry.RegistryStore.PREPARED
+    store._owns_handles = owns
+    return store
+
+
+def _store_handle_error(owner):
+    return native.NativeHandleCloseError(
+        operation='close', owner=owner, winerror=6, handle_value=123)
+
+
+def test_registry_store_roots_failure_still_closes_root(
+        tmp_path):
+    store = _store_with_handles(
+        tmp_path, roots_error=_store_handle_error('roots'))
+    roots = store.roots_handle
+    root = store.root_handle
+
+    with pytest.raises(registry.RegistryLockError) as caught:
+        store.close()
+
+    assert roots.calls == 1
+    assert root.calls == 1
+    assert root.closed is True
+    assert store.state == registry.RegistryStore.POISONED
+    assert store.poisoned is True
+    assert store.root_handle is None
+    assert store.roots_handle is None
+    assert store._prepared is False
+    assert [name for name, _exc in caught.value.errors] == ['roots']
+
+
+def test_registry_store_root_failure_roots_already_closed(
+        tmp_path):
+    store = _store_with_handles(
+        tmp_path, root_error=_store_handle_error('root'))
+    roots = store.roots_handle
+    root = store.root_handle
+
+    with pytest.raises(registry.RegistryLockError) as caught:
+        store.close()
+
+    assert roots.closed is True
+    assert root.calls == 1
+    assert store.state == registry.RegistryStore.POISONED
+    assert [name for name, _exc in caught.value.errors] == ['root']
+
+
+def test_registry_store_both_handle_failures_are_aggregated(
+        tmp_path):
+    store = _store_with_handles(
+        tmp_path, roots_error=_store_handle_error('roots'),
+        root_error=_store_handle_error('root'))
+    roots = store.roots_handle
+    root = store.root_handle
+
+    with pytest.raises(registry.RegistryLockError) as caught:
+        store.close()
+
+    assert roots.calls == 1
+    assert root.calls == 1
+    assert store.state == registry.RegistryStore.POISONED
+    assert [name for name, _exc in caught.value.errors] == ['roots', 'root']
+    assert caught.value.errors[0][1].owner == 'roots'
+    assert caught.value.errors[1][1].owner == 'root'
+
+
+def test_registry_store_close_success_is_idempotent(tmp_path):
+    store = _store_with_handles(tmp_path)
+    roots = store.roots_handle
+    root = store.root_handle
+
+    store.close()
+    assert store.state == registry.RegistryStore.CLOSED
+    assert store.closed is True
+    assert store._prepared is False
+    assert store._owns_handles is False
+    assert store.root_handle is None
+    assert store.roots_handle is None
+    assert roots.calls == 1
+    assert root.calls == 1
+
+    store.close()
+    assert roots.calls == 1
+    assert root.calls == 1
+    assert store.state == registry.RegistryStore.CLOSED
+
+
+def test_registry_store_poisoned_close_does_not_retry(tmp_path):
+    store = _store_with_handles(
+        tmp_path, roots_error=_store_handle_error('roots'))
+    roots = store.roots_handle
+    root = store.root_handle
+
+    with pytest.raises(registry.RegistryLockError):
+        store.close()
+    assert roots.calls == 1
+    assert root.calls == 1
+    assert store.state == registry.RegistryStore.POISONED
+
+    store.close()
+    assert roots.calls == 1
+    assert root.calls == 1
+    assert store.state == registry.RegistryStore.POISONED
+
+
+def test_registry_store_poisoned_rejects_prepare(tmp_path):
+    store = registry.RegistryStore(tmp_path / 'registry-root')
+    store._state = registry.RegistryStore.POISONED
+
+    with pytest.raises(registry.RegistryLockError, match='POISONED'):
+        store.prepare()
+    assert store.state == registry.RegistryStore.POISONED
+
+
+def test_registry_store_body_exception_wins_over_close_error(
+        tmp_path):
+    store = _store_with_handles(
+        tmp_path, roots_error=_store_handle_error('roots'))
+    store._context_owns = True
+
+    with pytest.raises(RuntimeError, match='body failure') as caught:
+        with store:
+            raise RuntimeError('body failure')
+
+    assert caught.value._native_close_errors
+    assert store.state == registry.RegistryStore.POISONED
+    assert store.root_handle is None
+    assert store.roots_handle is None
+
+
+def test_registry_store_attach_failure_does_not_override_body(
+        tmp_path, monkeypatch):
+    store = _store_with_handles(
+        tmp_path, roots_error=_store_handle_error('roots'))
+    store._context_owns = True
+
+    def fail_attach(*_args, **_kwargs):
+        raise RuntimeError('attach failed')
+
+    monkeypatch.setattr(registry, '_safe_attach_close_errors', fail_attach)
+    with pytest.raises(RuntimeError, match='body failure'):
+        with store:
+            raise RuntimeError('body failure')
+    assert store.state == registry.RegistryStore.POISONED
+
+
+def test_registry_store_lock_and_both_handles_fail(tmp_path):
+    lock_error = RuntimeError('lock release failed')
+    store = _store_with_handles(
+        tmp_path, roots_error=_store_handle_error('roots'),
+        root_error=_store_handle_error('root'), lock_error=lock_error)
+
+    with pytest.raises(registry.RegistryLockError) as caught:
+        store.close()
+
+    assert [name for name, _exc in caught.value.errors] == [
+        'registry_lock', 'roots', 'root']
+    assert caught.value.errors[0][1] is lock_error
+    assert store.state == registry.RegistryStore.POISONED
+    assert store._locked is False
+
+
+def test_registry_store_external_handles_not_closed(tmp_path):
+    store = _store_with_handles(tmp_path, owns=False)
+    roots = store.roots_handle
+    root = store.root_handle
+
+    store.close()
+
+    assert roots.calls == 0
+    assert root.calls == 0
+    assert store.state == registry.RegistryStore.CLOSED
+    assert store.root_handle is None
+    assert store.roots_handle is None
+
+
+def test_registry_store_close_order_roots_then_root(tmp_path):
+    order = []
+
+    class _OrderHandle(_FakeStoreHandle):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def close(self):
+            order.append(self.name)
+            super().close()
+
+    store = _store_with_handles(tmp_path)
+    store._roots_handle = _OrderHandle('roots')
+    store._root_handle = _OrderHandle('root')
+
+    store.close()
+
+    assert order == ['roots', 'root']
+
+
+def test_registry_store_keyboard_interrupt_cleans_both(tmp_path):
+    store = _store_with_handles(
+        tmp_path, roots_error=KeyboardInterrupt('roots interrupted'))
+    roots = store.roots_handle
+    root = store.root_handle
+
+    with pytest.raises(KeyboardInterrupt):
+        store.close()
+    assert roots.calls == 1
+    assert root.calls == 1
+    assert store.state == registry.RegistryStore.POISONED
+
+    store.close()
+    assert roots.calls == 1
+    assert root.calls == 1
+
+
+def test_registry_store_system_exit_cleans_both(tmp_path):
+    store = _store_with_handles(
+        tmp_path, roots_error=SystemExit('roots exit'))
+    roots = store.roots_handle
+    root = store.root_handle
+
+    with pytest.raises(SystemExit):
+        store.close()
+    assert roots.calls == 1
+    assert root.calls == 1
+    assert store.state == registry.RegistryStore.POISONED
+
+    store.close()
+    assert roots.calls == 1
+    assert root.calls == 1
+
+
+def test_registry_store_partial_prepare_failure_poisoned(
+        tmp_path, monkeypatch):
+    store = registry.RegistryStore(tmp_path / 'registry-root')
+    root = _FakeStoreHandle(_store_handle_error('root'))
+    calls = []
+
+    def open_side_effect(path):
+        calls.append(path)
+        if len(calls) == 1:
+            return root
+        raise RuntimeError('roots open failed')
+
+    monkeypatch.setattr(registry, 'open_secure_directory', open_side_effect)
+
+    with pytest.raises(RuntimeError, match='roots open failed') as caught:
+        store.prepare()
+
+    assert root.calls == 1
+    assert store.state == registry.RegistryStore.POISONED
+    assert store._prepared is False
+    assert store.root_handle is None
+    assert caught.value._native_close_errors
+
+
+def test_registry_store_partial_prepare_failure_unprepared(
+        tmp_path, monkeypatch):
+    store = registry.RegistryStore(tmp_path / 'registry-root')
+    root = _FakeStoreHandle()
+    calls = []
+
+    def open_side_effect(path):
+        calls.append(path)
+        if len(calls) == 1:
+            return root
+        raise RuntimeError('roots open failed')
+
+    monkeypatch.setattr(registry, 'open_secure_directory', open_side_effect)
+
+    with pytest.raises(RuntimeError, match='roots open failed'):
+        store.prepare()
+
+    assert root.closed is True
+    assert store.state == registry.RegistryStore.UNPREPARED
+    assert store._prepared is False
+    assert store.root_handle is None

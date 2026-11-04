@@ -351,6 +351,164 @@ def test_acquire_failure_registry_close_failure_still_closes_target(
         holder.release()
 
 
+def test_poisoned_registry_is_reported_on_release(tmp_path):
+    target = tmp_path / 'poisoned-registry-target'
+    target.mkdir()
+    registry_root = _reg(tmp_path)
+    lock = RootLock(target, registry_root)
+    lock.acquire('poisoned-registry')
+
+    # Simulate a prior unrecoverable close failure: handles are already gone,
+    # while the Store correctly remains POISONED.
+    lock.registry._close_handles()
+    lock.registry._state = registry.RegistryStore.POISONED
+
+    with pytest.raises(RootLockReleaseError) as caught:
+        lock.release()
+
+    assert any(name == 'registry' for name, _ in caught.value.errors)
+    assert lock.target.closed
+    assert lock.registry.poisoned is True
+
+    retry = RootLock(target, registry_root)
+    retry.acquire('after-poisoned-release')
+    retry.release()
+
+
+def _with_release_failure(lock, monkeypatch, error):
+    original_release = lock.release
+
+    def release_then_fail():
+        original_release()
+        raise error
+
+    monkeypatch.setattr(lock, 'release', release_then_fail)
+
+
+def test_root_lock_exit_preserves_value_error(tmp_path, monkeypatch):
+    target = tmp_path / 'exit-value-error'
+    target.mkdir()
+    lock = RootLock(target, _reg(tmp_path))
+    lock.acquire('exit-value-error')
+    error = RuntimeError('release failed')
+    _with_release_failure(lock, monkeypatch, error)
+
+    with pytest.raises(ValueError, match='body value error') as caught:
+        with lock:
+            raise ValueError('body value error')
+
+    assert caught.value._root_lock_release_errors == (error,)
+    assert lock.target.closed
+    assert lock.registry.closed
+
+
+def test_root_lock_exit_preserves_keyboard_interrupt(tmp_path, monkeypatch):
+    target = tmp_path / 'exit-keyboard-interrupt'
+    target.mkdir()
+    lock = RootLock(target, _reg(tmp_path))
+    lock.acquire('exit-keyboard-interrupt')
+    _with_release_failure(lock, monkeypatch, RuntimeError('release failed'))
+
+    with pytest.raises(KeyboardInterrupt):
+        with lock:
+            raise KeyboardInterrupt('body interrupt')
+
+    assert lock.target.closed
+    assert lock.registry.closed
+
+
+def test_root_lock_exit_preserves_system_exit(tmp_path, monkeypatch):
+    target = tmp_path / 'exit-system-exit'
+    target.mkdir()
+    lock = RootLock(target, _reg(tmp_path))
+    lock.acquire('exit-system-exit')
+    _with_release_failure(lock, monkeypatch, RuntimeError('release failed'))
+
+    with pytest.raises(SystemExit):
+        with lock:
+            raise SystemExit('body exit')
+
+    assert lock.target.closed
+    assert lock.registry.closed
+
+
+def test_root_lock_exit_attach_failure_preserves_body(tmp_path, monkeypatch):
+    target = tmp_path / 'exit-attach-failure'
+    target.mkdir()
+    lock = RootLock(target, _reg(tmp_path))
+    lock.acquire('exit-attach-failure')
+    _with_release_failure(lock, monkeypatch, RuntimeError('release failed'))
+
+    class _NoAttachError(Exception):
+        def __setattr__(self, _name, _value):
+            raise RuntimeError('setattr unavailable')
+
+    with pytest.raises(_NoAttachError, match='body failure'):
+        with lock:
+            raise _NoAttachError('body failure')
+
+    assert lock.target.closed
+
+
+def test_root_lock_exit_without_body_propagates_release_failure(
+        tmp_path, monkeypatch):
+    target = tmp_path / 'exit-release-failure'
+    target.mkdir()
+    lock = RootLock(target, _reg(tmp_path))
+    lock.acquire('exit-release-failure')
+    _with_release_failure(lock, monkeypatch, RuntimeError('release failed'))
+
+    with pytest.raises(RuntimeError, match='release failed'):
+        with lock:
+            pass
+
+    assert lock.target.closed
+    assert lock.registry.closed
+
+
+def test_acquire_failure_then_release_is_safe(tmp_path):
+    target = tmp_path / 'acquire-failure-release'
+    target.mkdir()
+    registry_root = _reg(tmp_path)
+    holder = RootLock(target, registry_root)
+    holder.acquire('holder')
+    second = RootLock(target, registry_root)
+    try:
+        with pytest.raises(registry.RegistryLockBusy):
+            second.acquire('second')
+        assert second.target.closed
+        assert second.registry.closed
+        assert second.root_lock._handle is None
+        second.release()
+        assert second.target.closed
+    finally:
+        holder.release()
+
+
+def test_registry_poisoned_by_real_close_then_root_release(
+        tmp_path, monkeypatch):
+    target = tmp_path / 'poisoned-real-close'
+    target.mkdir()
+    lock = RootLock(target, _reg(tmp_path))
+    lock.acquire('poisoned-real-close')
+    registry_lock = lock.registry._lock
+    original_release = registry_lock.release
+
+    def fail_release():
+        raise RuntimeError('registry lock close failure')
+
+    monkeypatch.setattr(registry_lock, 'release', fail_release)
+    with pytest.raises(registry.RegistryLockError):
+        lock.registry.close()
+    assert lock.registry.poisoned is True
+
+    monkeypatch.setattr(registry_lock, 'release', original_release)
+    with pytest.raises(RootLockReleaseError) as caught:
+        lock.release()
+    assert any(name == 'registry' for name, _ in caught.value.errors)
+    assert lock.target.closed
+
+
 def test_crash_stale_registry_is_reprobed(tmp_path):
     target = tmp_path / 'target'
     target.mkdir()

@@ -19,6 +19,8 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
+from restore_win32_native import close_handle_once  # noqa: E402
+
 FILE_LIST_DIRECTORY = 0x00000001
 FILE_READ_ATTRIBUTES = 0x00000080
 SYNCHRONIZE = 0x00100000
@@ -284,40 +286,85 @@ def _volume_info(path: Path, final_dos_path: str) -> tuple[str, int, int]:
     return filesystem, drive_type, int(flags.value)
 
 
+def _attach_close_error(primary: BaseException, error: BaseException) -> None:
+    """Attach a secondary close error without replacing the primary exception."""
+    try:
+        existing = tuple(getattr(primary, '_native_close_errors', ()))
+        setattr(primary, '_native_close_errors', existing + (error,))
+    except BaseException:  # noqa: BLE001 - diagnostics must not mask primary
+        pass
+
+
 class DirectoryHandle:
     """Held, validated directory handle and its physical identity."""
+
+    OPEN = 'OPEN'
+    CLOSING = 'CLOSING'
+    CLOSED = 'CLOSED'
+    CLOSE_FAILED_UNKNOWN = 'CLOSE_FAILED_UNKNOWN'
 
     def __init__(self, handle, identity: DirectoryIdentity):
         self._handle = handle
         self.identity = identity
+        self._close_state = self.OPEN
 
     @property
     def closed(self) -> bool:
-        return self._handle is None
+        """True only when CloseHandle returned TRUE."""
+        return self._close_state == self.CLOSED
+
+    @property
+    def close_failed(self) -> bool:
+        return self._close_state == self.CLOSE_FAILED_UNKNOWN
+
+    @property
+    def is_open(self) -> bool:
+        return self._close_state == self.OPEN
+
+    @property
+    def close_state(self) -> str:
+        return self._close_state
 
     @property
     def native_handle(self) -> int | None:
         """Opaque validated directory handle for relative child operations."""
+        if self._close_state != self.OPEN:
+            return None
         return self._handle
 
     def close(self) -> None:
-        if self._handle is None:
+        if self._close_state != self.OPEN:
             return
-        kernel32 = _kernel32()
-        kernel32.CloseHandle(self._handle)
+        handle = self._handle
+        # Drop the raw value before the call: a failed close is never retried.
         self._handle = None
+        self._close_state = self.CLOSING
+        try:
+            close_handle_once(
+                handle, owner='DirectoryHandle', operation='close')
+        except BaseException:
+            self._close_state = self.CLOSE_FAILED_UNKNOWN
+            raise
+        self._close_state = self.CLOSED
 
     def __enter__(self) -> 'DirectoryHandle':
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc is not None:
+            try:
+                self.close()
+            except BaseException as close_exc:
+                _attach_close_error(exc, close_exc)
+            return False
         self.close()
         return False
 
 
 def _validate_ancestors(path: Path) -> None:
     for ancestor in _ancestor_paths(path):
-        kernel32, handle = _open_directory_handle(ancestor)
+        _kernel32_instance, handle = _open_directory_handle(ancestor)
+        primary = None
         try:
             attributes = _file_attributes(ancestor, handle)
             if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
@@ -325,8 +372,17 @@ def _validate_ancestors(path: Path) -> None:
                     '目标路径祖先包含 reparse point：%s' % ancestor)
             if not attributes & FILE_ATTRIBUTE_DIRECTORY:
                 raise NotDirectoryError('目标路径祖先不是目录：%s' % ancestor)
-        finally:
-            kernel32.CloseHandle(handle)
+        except BaseException as exc:  # noqa: BLE001 - close must still run
+            primary = exc
+        try:
+            close_handle_once(
+                handle, owner='path-ancestor', operation='close')
+        except BaseException as close_exc:  # noqa: BLE001
+            if primary is None:
+                raise
+            _attach_close_error(primary, close_exc)
+        if primary is not None:
+            raise primary.with_traceback(primary.__traceback__)
 
 
 def open_secure_directory(path: str | Path) -> DirectoryHandle:
@@ -354,9 +410,13 @@ def open_secure_directory(path: str | Path) -> DirectoryHandle:
             drive_type=drive_type,
         )
         return DirectoryHandle(handle, identity)
-    except Exception:
-        kernel32.CloseHandle(handle)
-        raise
+    except BaseException as primary:  # noqa: BLE001 - close must still run
+        try:
+            close_handle_once(
+                handle, owner='open_secure_directory', operation='close')
+        except BaseException as close_exc:  # noqa: BLE001
+            _attach_close_error(primary, close_exc)
+        raise primary.with_traceback(primary.__traceback__)
 
 
 def validate_target_directory(path: str | Path) -> DirectoryIdentity:

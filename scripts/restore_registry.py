@@ -44,7 +44,8 @@ from restore_win32_native import (
     GENERIC_READ,
     GENERIC_WRITE,
     SYNCHRONIZE,
-    close_handle,
+    NativeHandleCloseError,
+    close_handle_once,
     delete_handle,
     flush_handle,
     get_attributes,
@@ -121,6 +122,11 @@ class RegistryConflictError(RegistryError):
 
 class RegistryLockError(RegistryError):
     """Registry lock could not be safely acquired/released."""
+
+    def __init__(self, message: str,
+                 errors: tuple[tuple[str, BaseException], ...] = ()):
+        self.errors = tuple(errors)
+        super().__init__(message)
 
 
 class RegistryLockBusy(RegistryLockError):
@@ -287,6 +293,68 @@ def _validate_registry(data: Any) -> RegistryData:
     )
 
 
+def _attach_close_errors(primary: BaseException,
+                         errors: list[BaseException]) -> None:
+    """Attach secondary close failures without replacing the primary exception."""
+    if not errors:
+        return
+    try:
+        existing = tuple(getattr(primary, '_native_close_errors', ()))
+        secondary = tuple(exc for exc in errors if exc is not primary)
+        setattr(primary, '_native_close_errors', existing + secondary)
+    except BaseException:  # noqa: BLE001 - diagnostics must not mask primary
+        pass
+
+
+def _safe_attach_close_errors(primary: BaseException,
+                              errors: list[BaseException]) -> None:
+    """Attach diagnostics without allowing the attach path to mask primary."""
+    try:
+        _attach_close_errors(primary, errors)
+    except BaseException:  # noqa: BLE001
+        pass
+
+
+def _collect_close(handle: int, errors: list[BaseException], owner: str,
+                   data_committed: bool | None = None) -> None:
+    try:
+        close_handle_once(handle, owner=owner, operation='close',
+                          data_committed=data_committed)
+    except BaseException as exc:  # noqa: BLE001 - collect and preserve priority
+        errors.append(exc)
+
+
+def _close_local_preserving(handle: int, primary: BaseException,
+                            owner: str) -> None:
+    """Close a partially acquired local handle without masking the primary error."""
+    try:
+        close_handle_once(handle, owner=owner, operation='close')
+    except BaseException as close_exc:  # noqa: BLE001
+        _attach_close_errors(primary, [close_exc])
+
+
+def _raise_close_errors(errors: list[BaseException], owner: str) -> None:
+    interrupt = next(
+        (exc for exc in errors if not isinstance(exc, Exception)), None)
+    if interrupt is not None:
+        raise interrupt.with_traceback(interrupt.__traceback__)
+    if len(errors) == 1:
+        raise errors[0]
+    raise NativeHandleCloseError(
+        operation='cleanup', owner=owner, errors=tuple(errors))
+
+
+def _finish_close(handle: int, primary: BaseException | None,
+                  owner: str) -> None:
+    errors: list[BaseException] = []
+    _collect_close(handle, errors, owner)
+    if primary is not None:
+        _attach_close_errors(primary, errors)
+        raise primary.with_traceback(primary.__traceback__)
+    if errors:
+        _raise_close_errors(errors, owner)
+
+
 def _read_registry_native(root_handle: int) -> RegistryData:
     status, handle = nt_create_file(
         root_handle, REGISTRY_FILENAME, FILE_OPEN,
@@ -300,6 +368,7 @@ def _read_registry_native(root_handle: int) -> RegistryData:
     if status < 0:
         raise RegistryCorruptError(
             '无法读取 registry.json：%s' % status_message(status))
+    primary = None
     try:
         attributes = get_attributes(handle)
         if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
@@ -307,8 +376,9 @@ def _read_registry_native(root_handle: int) -> RegistryData:
         if attributes & FILE_ATTRIBUTE_DIRECTORY:
             raise RegistryCorruptError('registry.json 是目录')
         raw = read_all(handle)
-    finally:
-        close_handle(handle)
+    except BaseException as exc:  # noqa: BLE001 - close must still run
+        primary = exc
+    _finish_close(handle, primary, 'registry-read')
     try:
         data = json.loads(raw.decode('utf-8'))
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -332,6 +402,9 @@ def _write_registry_native(root_handle: int, data: Any) -> None:
         raise RegistryCorruptError(
             '无法创建 Registry 临时文件：%s' % status_message(status))
     renamed = False
+    target_handle = 0
+    close_errors: list[BaseException] = []
+    primary = None
     try:
         attributes = get_attributes(handle)
         if attributes & (FILE_ATTRIBUTE_REPARSE_POINT |
@@ -355,13 +428,21 @@ def _write_registry_native(root_handle: int, data: Any) -> None:
             raise RegistryCorruptError(
                 '无法验证 Registry 目标：%s' % status_message(status_target))
         if status_target >= 0:
+            target_primary = None
             try:
                 target_attrs = get_attributes(target_handle)
                 if target_attrs & (FILE_ATTRIBUTE_REPARSE_POINT |
                                    FILE_ATTRIBUTE_DIRECTORY):
                     raise RegistryCorruptError('Registry 目标是异常对象')
-            finally:
-                close_handle(target_handle)
+            except BaseException as exc:  # noqa: BLE001 - close must still run
+                target_primary = exc
+            _collect_close(
+                target_handle, close_errors, 'registry-target',
+                data_committed=False)
+            if target_primary is not None:
+                raise target_primary
+            if close_errors:
+                _raise_close_errors(close_errors, 'registry-target')
 
         status_rename = rename_relative(
             handle, root_handle, REGISTRY_FILENAME, replace=True)
@@ -371,13 +452,20 @@ def _write_registry_native(root_handle: int, data: Any) -> None:
         renamed = True
         if get_file_id(handle) != temp_identity:
             raise RegistryCorruptError('Registry 替换后 FileId 不一致')
-    finally:
-        if not renamed:
-            try:
-                delete_handle(handle)
-            except Exception:
-                pass
-        close_handle(handle)
+    except BaseException as exc:  # noqa: BLE001 - close must still run
+        primary = exc
+    if not renamed:
+        try:
+            delete_handle(handle)
+        except Exception:
+            pass
+    _collect_close(
+        handle, close_errors, 'registry-temp', data_committed=renamed)
+    if primary is not None:
+        _attach_close_errors(primary, close_errors)
+        raise primary.with_traceback(primary.__traceback__)
+    if close_errors:
+        _raise_close_errors(close_errors, 'registry-write')
 
 
 def _read_registry_unlocked(root: Path) -> RegistryData:
@@ -422,6 +510,12 @@ def _atomic_write_json(path: Path, data: Any) -> None:
 class RegistryLock:
     """Non-blocking machine-user registry file lock; no stale PID logic."""
 
+    UNHELD = 'UNHELD'
+    OPEN = 'OPEN'
+    CLOSING = 'CLOSING'
+    CLOSED = 'CLOSED'
+    CLOSE_FAILED_UNKNOWN = 'CLOSE_FAILED_UNKNOWN'
+
     def __init__(self, path: Path, parent_handle: int | None = None,
                  parent_identity: DirectoryIdentity | None = None):
         self.path = Path(path)
@@ -430,6 +524,23 @@ class RegistryLock:
         self._parent_handle = parent_handle
         self.parent_identity = parent_identity
         self.identity_name = self.path.name + '.identity'
+        self._close_state = self.UNHELD
+
+    @property
+    def close_state(self) -> str:
+        return self._close_state
+
+    @property
+    def is_held(self) -> bool:
+        return self._close_state == self.OPEN
+
+    @property
+    def closed(self) -> bool:
+        return self._close_state == self.CLOSED
+
+    @property
+    def close_failed(self) -> bool:
+        return self._close_state == self.CLOSE_FAILED_UNKNOWN
 
     def _read_expected_identity(self, parent_handle: int) -> tuple[int, str]:
         status, handle = nt_create_file(
@@ -442,14 +553,16 @@ class RegistryLock:
         if status < 0:
             raise RegistryLockError(
                 'Registry 锁身份记录不可读：%s' % status_message(status))
+        primary = None
         try:
             attrs = get_attributes(handle)
             if attrs & (FILE_ATTRIBUTE_REPARSE_POINT |
                         FILE_ATTRIBUTE_DIRECTORY):
                 raise RegistryLockError('Registry 锁身份记录类型异常')
             raw = read_all(handle)
-        finally:
-            close_handle(handle)
+        except BaseException as exc:  # noqa: BLE001 - close must still run
+            primary = exc
+        _finish_close(handle, primary, 'registry-identity-read')
         try:
             record = json.loads(raw.decode('utf-8'))
         except (UnicodeError, json.JSONDecodeError) as exc:
@@ -480,11 +593,13 @@ class RegistryLock:
         if status < 0:
             raise RegistryLockError(
                 '无法创建 Registry 锁身份记录：%s' % status_message(status))
+        primary = None
         try:
             write_all(handle, payload)
             flush_handle(handle)
-        finally:
-            close_handle(handle)
+        except BaseException as exc:  # noqa: BLE001 - close must still run
+            primary = exc
+        _finish_close(handle, primary, 'registry-identity-write')
 
     def set_parent(self, parent_handle: int,
                    parent_identity: DirectoryIdentity | None = None) -> None:
@@ -492,6 +607,9 @@ class RegistryLock:
         self.parent_identity = parent_identity
 
     def acquire(self) -> None:
+        if self._handle is not None:
+            raise RegistryLockError('RegistryLock 已持有，禁止重复 acquire')
+        self._close_state = self.UNHELD
         if self._parent_handle:
             if self.path.name != self.path.name.strip() or any(
                     ch in self.path.name for ch in ('\\', '/')):
@@ -572,26 +690,32 @@ class RegistryLock:
         info = _BY_HANDLE_FILE_INFORMATION()
         if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
             error = ctypes.get_last_error()
-            kernel32.CloseHandle(handle)
-            raise RegistryLockError('无法验证 Registry 锁文件（WinError %s）' % error)
+            exc = RegistryLockError('无法验证 Registry 锁文件（WinError %s）' % error)
+            _close_local_preserving(handle, exc, 'RegistryLock.acquire')
+            raise exc
         if info.dwFileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
-            kernel32.CloseHandle(handle)
-            raise RegistryLockError('Registry 锁文件是 reparse point')
+            exc = RegistryLockError('Registry 锁文件是 reparse point')
+            _close_local_preserving(handle, exc, 'RegistryLock.acquire')
+            raise exc
         if info.dwFileAttributes & _FILE_ATTRIBUTE_DIRECTORY:
-            kernel32.CloseHandle(handle)
-            raise RegistryLockError('Registry 锁路径是目录')
+            exc = RegistryLockError('Registry 锁路径是目录')
+            _close_local_preserving(handle, exc, 'RegistryLock.acquire')
+            raise exc
         file_id_info = _FILE_ID_INFO()
         if not kernel32.GetFileInformationByHandleEx(
                 handle, _FILE_ID_INFO_CLASS, ctypes.byref(file_id_info),
                 ctypes.sizeof(file_id_info)):
             error = ctypes.get_last_error()
-            kernel32.CloseHandle(handle)
-            raise RegistryLockError('无法取得 Registry 锁文件身份（WinError %s）' % error)
+            exc = RegistryLockError(
+                '无法取得 Registry 锁文件身份（WinError %s）' % error)
+            _close_local_preserving(handle, exc, 'RegistryLock.acquire')
+            raise exc
         volume_serial = int(file_id_info.VolumeSerialNumber)
         file_id = bytes(file_id_info.FileId.Identifier).hex()
         if volume_serial <= 0 or not any(file_id_info.FileId.Identifier):
-            kernel32.CloseHandle(handle)
-            raise RegistryLockError('Registry 锁文件身份为空')
+            exc = RegistryLockError('Registry 锁文件身份为空')
+            _close_local_preserving(handle, exc, 'RegistryLock.acquire')
+            raise exc
         actual_identity = (volume_serial, file_id)
         if self._parent_handle:
             try:
@@ -604,9 +728,10 @@ class RegistryLock:
                     if expected_identity != actual_identity:
                         raise RegistryLockError(
                             'Registry 锁文件身份与预期不一致')
-            except Exception:
-                kernel32.CloseHandle(handle)
-                raise
+            except BaseException as primary:  # noqa: BLE001
+                _close_local_preserving(
+                    handle, primary, 'RegistryLock.acquire')
+                raise primary.with_traceback(primary.__traceback__)
         size = 512
         while True:
             final_buffer = ctypes.create_unicode_buffer(size)
@@ -615,9 +740,11 @@ class RegistryLock:
                 _FILE_NAME_NORMALIZED | _VOLUME_NAME_DOS)
             if result == 0:
                 error = ctypes.get_last_error()
-                kernel32.CloseHandle(handle)
-                raise RegistryLockError(
+                exc = RegistryLockError(
                     '无法取得 Registry 锁文件最终路径（WinError %s）' % error)
+                _close_local_preserving(
+                    handle, exc, 'RegistryLock.acquire')
+                raise exc
             if result < size:
                 break
             size = int(result)
@@ -630,8 +757,9 @@ class RegistryLock:
         final_lock = _normalize_lock_path(final_buffer.value)
         expected_lock = _normalize_lock_path(str(self.path.resolve()))
         if final_lock != expected_lock:
-            kernel32.CloseHandle(handle)
-            raise RegistryLockError('Registry 锁文件最终路径与预期不一致')
+            exc = RegistryLockError('Registry 锁文件最终路径与预期不一致')
+            _close_local_preserving(handle, exc, 'RegistryLock.acquire')
+            raise exc
         class _OVERLAPPED(ctypes.Structure):
             _fields_ = [
                 ('Internal', ctypes.c_void_p),
@@ -645,26 +773,46 @@ class RegistryLock:
                 handle, _LOCKFILE_EXCLUSIVE | _LOCKFILE_FAIL_IMMEDIATELY,
                 0, 1, 0, ctypes.byref(overlapped)):
             error = ctypes.get_last_error()
-            kernel32.CloseHandle(handle)
-            if error in (33, 158):
-                raise RegistryLockBusy('Registry 锁被占用')
-            raise RegistryLockError('无法获取 Registry 锁（WinError %s）' % error)
+            exc = (RegistryLockBusy('Registry 锁被占用')
+                   if error in (33, 158)
+                   else RegistryLockError(
+                       '无法获取 Registry 锁（WinError %s）' % error))
+            _close_local_preserving(handle, exc, 'RegistryLock.acquire')
+            raise exc
         self._handle = (kernel32, handle, overlapped)
         self.identity = (volume_serial, file_id)
+        self._close_state = self.OPEN
 
     def _close_handle(self, unlock: bool) -> None:
         if self._handle is None:
             return
         kernel32, handle, overlapped = self._handle
+        # Drop the raw tuple before closing: a failed close is never retried.
+        self._handle = None
+        self.identity = None
+        self._close_state = self.CLOSING
+        primary = None
         try:
             if unlock:
                 kernel32.UnlockFileEx(
                     handle, 0, 1, 0, ctypes.byref(overlapped))
-        finally:
-            # CloseHandle releases the OS lock even if unlock itself fails.
-            kernel32.CloseHandle(handle)
-            self._handle = None
-            self.identity = None
+        except BaseException as exc:  # noqa: BLE001 - close must still run
+            primary = exc
+        try:
+            close_handle_once(
+                handle,
+                owner='RegistryLock',
+                operation='release' if unlock else 'abort',
+            )
+        except BaseException as close_exc:  # noqa: BLE001
+            self._close_state = self.CLOSE_FAILED_UNKNOWN
+            if primary is not None:
+                _attach_close_errors(primary, [close_exc])
+                raise primary.with_traceback(primary.__traceback__)
+            raise
+        self._close_state = self.CLOSED
+        if primary is not None:
+            raise primary.with_traceback(primary.__traceback__)
 
     def release(self) -> None:
         self._close_handle(unlock=True)
@@ -677,16 +825,35 @@ class RegistryLock:
 class RegistryStore:
     """Registry read/write helper. Lock held by context manager."""
 
+    UNPREPARED = 'UNPREPARED'
+    PREPARED = 'PREPARED'
+    CLOSED = 'CLOSED'
+    POISONED = 'POISONED'
+
     def __init__(self, root: str | Path | None = None):
         self.root = Path(os.path.abspath(str(root or _default_registry_root())))
         self._lock = RegistryLock(self.root / REGISTRY_LOCK_FILENAME)
         self._locked = False
         self._prepared = False
         self._owns_handles = False
+        self._context_owns = False
+        self._state = self.UNPREPARED
         self._root_handle: DirectoryHandle | None = None
         self._roots_handle: DirectoryHandle | None = None
         self._root_identity: DirectoryIdentity | None = None
         self._roots_identity: DirectoryIdentity | None = None
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def poisoned(self) -> bool:
+        return self._state == self.POISONED
+
+    @property
+    def closed(self) -> bool:
+        return self._state == self.CLOSED
 
     @property
     def root_handle(self) -> DirectoryHandle | None:
@@ -706,8 +873,13 @@ class RegistryStore:
 
     def prepare(self) -> 'RegistryStore':
         """Create/open and validate root and roots once; idempotent."""
+        if self._state == self.POISONED:
+            raise RegistryLockError('RegistryStore 已 POISONED，禁止重新 prepare')
+        if self._state == self.CLOSED:
+            raise RegistryLockError('RegistryStore 已 CLOSED，禁止重新 prepare')
         if self._prepared:
             return self
+        self._owns_handles = True
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             self._root_handle = open_secure_directory(self.root)
@@ -717,48 +889,78 @@ class RegistryStore:
             self._roots_handle = open_secure_directory(roots)
             self._roots_identity = self._roots_handle.identity
             self._prepared = True
+            self._state = self.PREPARED
             return self
-        except Exception:
-            self._close_handles()
-            raise
+        except BaseException as primary:  # noqa: BLE001 - cleanup must run
+            errors = self._close_handles()
+            self._prepared = False
+            if errors:
+                self._state = self.POISONED
+                self._owns_handles = False
+                _safe_attach_close_errors(
+                    primary, [exc for _name, exc in errors])
+            else:
+                self._state = self.UNPREPARED
+                self._owns_handles = False
+            raise primary.with_traceback(primary.__traceback__)
 
     def __enter__(self) -> 'RegistryStore':
+        if self._state in (self.POISONED, self.CLOSED):
+            raise RegistryLockError(
+                'RegistryStore 状态 %s 不允许进入上下文' % self._state)
         try:
             if not self._prepared:
                 self.prepare()
-                self._owns_handles = True
+                self._context_owns = True
             self._lock.set_parent(
                 self._root_handle.native_handle, self._root_identity)
             self._lock.acquire()
             self._locked = True
             return self
-        except Exception:
-            if self._owns_handles:
-                self._close_handles()
-            raise
+        except BaseException as primary:  # noqa: BLE001 - cleanup must run
+            errors = []
+            if self._context_owns and self._owns_handles:
+                errors = self._close_handles()
+                self._prepared = False
+            self._locked = False
+            if errors:
+                self._state = self.POISONED
+                self._owns_handles = False
+                _safe_attach_close_errors(
+                    primary, [exc for _name, exc in errors])
+            elif self._context_owns and self._state != self.POISONED:
+                self._state = self.UNPREPARED
+                self._owns_handles = False
+            raise primary.with_traceback(primary.__traceback__)
 
-    def _close_handles(self) -> None:
+    def _close_handles(self) -> list[tuple[str, BaseException]]:
         errors: list[tuple[str, BaseException]] = []
+        if not self._owns_handles:
+            self._root_handle = None
+            self._roots_handle = None
+            self._root_identity = None
+            self._roots_identity = None
+            self._prepared = False
+            return errors
         for name, attr in (('roots', '_roots_handle'), ('root', '_root_handle')):
             handle = getattr(self, attr)
             if handle is None:
                 continue
+            # Drop the reference before closing; a failed close is never retried.
+            setattr(self, attr, None)
             try:
                 handle.close()
             except BaseException as exc:  # noqa: BLE001 - collect all close errors
                 errors.append((name, exc))
-            finally:
-                setattr(self, attr, None)
         self._root_identity = None
         self._roots_identity = None
         self._prepared = False
-        if errors:
-            raise RegistryLockError(
-                'Registry 目录句柄关闭失败：' + '; '.join(
-                    '%s=%s: %s' % (name, type(exc).__name__, exc)
-                    for name, exc in errors))
+        self._owns_handles = False
+        return errors
 
     def close(self) -> None:
+        if self._state in (self.CLOSED, self.POISONED):
+            return
         errors: list[tuple[str, BaseException]] = []
         try:
             self._lock.release()
@@ -766,38 +968,67 @@ class RegistryStore:
             errors.append(('registry_lock', exc))
         finally:
             self._locked = False
-        try:
-            self._close_handles()
-        except BaseException as exc:  # noqa: BLE001
-            errors.append(('registry_handles', exc))
-        finally:
-            self._owns_handles = False
+        errors.extend(self._close_handles())
         if errors:
+            self._state = self.POISONED
+            self._prepared = False
+            self._owns_handles = False
+            interrupt = next(
+                (exc for _name, exc in errors
+                 if not isinstance(exc, Exception)), None)
+            if interrupt is not None:
+                _attach_close_errors(
+                    interrupt, [exc for _name, exc in errors
+                                if exc is not interrupt])
+                raise interrupt.with_traceback(interrupt.__traceback__)
             raise RegistryLockError(
                 'Registry 释放失败：' + '; '.join(
                     '%s=%s: %s' % (name, type(exc).__name__, exc)
-                    for name, exc in errors))
+                    for name, exc in errors),
+                errors=tuple(errors))
+        self._state = self.CLOSED
+        self._prepared = False
+        self._owns_handles = False
+        self._context_owns = False
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._context_owns:
+            if exc is not None:
+                try:
+                    self.close()
+                except BaseException as close_exc:  # noqa: BLE001
+                    try:
+                        _safe_attach_close_errors(exc, [close_exc])
+                    except BaseException:  # noqa: BLE001
+                        pass
+                self._context_owns = False
+                return False
+            self.close()
+            self._context_owns = False
+            return False
+
+        # Externally prepared Store: this with-block only owns the lock,
+        # not the root/roots handles.
         errors: list[tuple[str, BaseException]] = []
         try:
             self._lock.release()
-        except BaseException as exc:  # noqa: BLE001
-            errors.append(('registry_lock', exc))
+        except BaseException as release_exc:  # noqa: BLE001
+            errors.append(('registry_lock', release_exc))
         finally:
             self._locked = False
-        if self._owns_handles:
-            try:
-                self._close_handles()
-            except BaseException as exc:  # noqa: BLE001
-                errors.append(('registry_handles', exc))
-            finally:
-                self._owns_handles = False
         if errors:
+            if exc is not None:
+                try:
+                    _safe_attach_close_errors(
+                        exc, [error for _name, error in errors])
+                except BaseException:  # noqa: BLE001
+                    pass
+                return False
             raise RegistryLockError(
-                'Registry 释放失败：' + '; '.join(
-                    '%s=%s: %s' % (name, type(exc).__name__, exc)
-                    for name, exc in errors))
+                'Registry 锁释放失败：' + '; '.join(
+                    '%s=%s: %s' % (name, type(error).__name__, error)
+                    for name, error in errors),
+                errors=tuple(errors))
         return False
 
     def _require_lock(self) -> None:

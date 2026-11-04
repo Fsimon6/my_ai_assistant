@@ -15,7 +15,13 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = REPO_ROOT / 'scripts' / 'restore_path_security.py'
+SCRIPTS = REPO_ROOT / 'scripts'
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import restore_win32_native as native  # noqa: E402
+
+MODULE_PATH = SCRIPTS / 'restore_path_security.py'
 
 
 def _load_module():
@@ -122,6 +128,128 @@ def test_handle_close_is_idempotent(tmp_path):
     handle.close()
     handle.close()
     assert handle.closed is True
+    assert handle.is_open is False
+    assert handle.close_state == path_security.DirectoryHandle.CLOSED
+
+
+class _FakeClose:
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    def __call__(self, handle, owner='unknown', operation='close',
+                 data_committed=None):
+        self.calls.append(handle)
+        if self.error is not None:
+            raise self.error
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows-only module')
+def test_directory_handle_close_success_state(monkeypatch):
+    fake = _FakeClose()
+    monkeypatch.setattr(path_security, 'close_handle_once', fake)
+    handle = path_security.DirectoryHandle(123, object())
+
+    assert handle.is_open is True
+    assert handle.closed is False
+    handle.close()
+    assert fake.calls == [123]
+    assert handle.close_state == path_security.DirectoryHandle.CLOSED
+    assert handle.closed is True
+    assert handle.is_open is False
+    assert handle.native_handle is None
+
+    handle.close()
+    assert fake.calls == [123]
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows-only module')
+def test_directory_handle_close_failure_never_retries(monkeypatch):
+    error = native.NativeHandleCloseError(
+        operation='close', owner='DirectoryHandle', winerror=6, handle_value=123)
+    fake = _FakeClose(error)
+    monkeypatch.setattr(path_security, 'close_handle_once', fake)
+    handle = path_security.DirectoryHandle(123, object())
+
+    with pytest.raises(native.NativeHandleCloseError) as caught:
+        handle.close()
+    assert caught.value is error
+    assert fake.calls == [123]
+    assert handle.close_state == (
+        path_security.DirectoryHandle.CLOSE_FAILED_UNKNOWN)
+    assert handle.closed is False
+    assert handle.is_open is False
+    assert handle.close_failed is True
+    assert handle.native_handle is None
+
+    handle.close()
+    assert fake.calls == [123]
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows-only module')
+def test_directory_handle_context_preserves_body_exception(monkeypatch):
+    error = RuntimeError('close failed')
+    fake = _FakeClose(error)
+    monkeypatch.setattr(path_security, 'close_handle_once', fake)
+    handle = path_security.DirectoryHandle(123, object())
+
+    with pytest.raises(ValueError, match='body failure') as caught:
+        with handle:
+            raise ValueError('body failure')
+
+    assert caught.value._native_close_errors == (error,)
+    assert handle.close_failed is True
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows-only module')
+def test_directory_handle_context_close_failure_is_visible(monkeypatch):
+    error = native.NativeHandleCloseError(
+        operation='close', owner='DirectoryHandle', winerror=6, handle_value=123)
+    fake = _FakeClose(error)
+    monkeypatch.setattr(path_security, 'close_handle_once', fake)
+    handle = path_security.DirectoryHandle(123, object())
+
+    with pytest.raises(native.NativeHandleCloseError):
+        with handle:
+            pass
+    assert fake.calls == [123]
+    assert handle.close_failed is True
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows-only module')
+def test_directory_handle_keyboard_interrupt_sets_unknown(monkeypatch):
+    error = KeyboardInterrupt('close interrupted')
+    fake = _FakeClose(error)
+    monkeypatch.setattr(path_security, 'close_handle_once', fake)
+    handle = path_security.DirectoryHandle(123, object())
+
+    with pytest.raises(KeyboardInterrupt):
+        handle.close()
+    assert fake.calls == [123]
+    assert handle.close_state == (
+        path_security.DirectoryHandle.CLOSE_FAILED_UNKNOWN)
+    assert handle.close_failed is True
+
+    handle.close()
+    assert fake.calls == [123]
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows-only module')
+def test_directory_handle_system_exit_sets_unknown(monkeypatch):
+    error = SystemExit('close exit')
+    fake = _FakeClose(error)
+    monkeypatch.setattr(path_security, 'close_handle_once', fake)
+    handle = path_security.DirectoryHandle(123, object())
+
+    with pytest.raises(SystemExit):
+        handle.close()
+    assert fake.calls == [123]
+    assert handle.close_state == (
+        path_security.DirectoryHandle.CLOSE_FAILED_UNKNOWN)
+    assert handle.close_failed is True
+
+    handle.close()
+    assert fake.calls == [123]
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows-only module')
@@ -189,16 +317,15 @@ def test_remote_filesystem_is_rejected_by_mock(tmp_path, monkeypatch):
 def test_file_id_failure_is_fail_closed_and_handle_is_closed(tmp_path, monkeypatch):
     closed = []
 
-    class _FakeKernel:
-        @staticmethod
-        def CloseHandle(handle):
-            closed.append(handle)
-            return True
+    def fake_close(handle, owner='unknown', operation='close',
+                   data_committed=None):
+        closed.append(handle)
 
+    monkeypatch.setattr(path_security, 'close_handle_once', fake_close)
     monkeypatch.setattr(path_security, '_validate_ancestors', lambda _path: None)
     monkeypatch.setattr(
         path_security, '_open_directory_handle',
-        lambda _path: (_FakeKernel(), 12345))
+        lambda _path: (None, 12345))
     monkeypatch.setattr(
         path_security, '_file_attributes',
         lambda _path, _handle: path_security.FILE_ATTRIBUTE_DIRECTORY)

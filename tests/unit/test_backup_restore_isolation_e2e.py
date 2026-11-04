@@ -62,6 +62,7 @@ restore_db = _load_script(RESTORE_SCRIPT, '_restore_db_for_e2e')
 # restore_db inserts scripts/ into sys.path during import.
 import restore_registry as registry_module  # noqa: E402
 from restore_path_security import open_secure_directory  # noqa: E402
+from restore_root_lock import RootLockReleaseError  # noqa: E402
 import restore_win32_native as native  # noqa: E402
 
 
@@ -2086,6 +2087,30 @@ def test_p1_1_main_preflight_failure_skips_cleanup(
     assert code == restore_db.EXIT_INVALID_BACKUP
     assert opened == []
     assert release_calls == []
+
+
+def test_p1_1_main_root_lock_release_error_returns_9(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    opened = _track_opened_handles(monkeypatch)
+    original_release = restore_db.RootLock.release
+
+    def release_then_fail(lock):
+        original_release(lock)
+        raise RootLockReleaseError(
+            'root release failure',
+            [('registry', RuntimeError('registry close failed'))])
+
+    monkeypatch.setattr(
+        restore_db.RootLock, 'release', release_then_fail)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert code == restore_db.EXIT_RELEASE_FAILURE
+    assert opened and opened[0].closed
+    assert 'root release failure' in err
+    assert 'registry close failed' in err
+    assert '恢复完成' not in out
 
 
 def test_p1_1_main_success_both_cleanup_failures_return_9(

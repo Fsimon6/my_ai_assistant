@@ -33,6 +33,7 @@ from restore_registry import (
     RegistryStore,
     RegistryLock,
     RegistryLockBusy,
+    RegistryLockError,
     make_entry,
 )
 
@@ -132,6 +133,13 @@ class RootLock:
             self.registry.close()
         except BaseException as exc:  # noqa: BLE001 - cleanup must continue
             errors.append(('registry', exc))
+            return
+        if self.registry.poisoned:
+            errors.append((
+                'registry',
+                RegistryLockError(
+                    'RegistryStore 已 POISONED，无法确认资源已释放'),
+            ))
 
     def _cleanup_target(self, errors: list[tuple[str, BaseException]]) -> None:
         try:
@@ -275,6 +283,19 @@ class RootLock:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc is not None:
+            try:
+                self.release()
+            except BaseException as release_exc:  # noqa: BLE001
+                try:
+                    existing = tuple(getattr(
+                        exc, '_root_lock_release_errors', ()))
+                    setattr(
+                        exc, '_root_lock_release_errors',
+                        existing + (release_exc,))
+                except BaseException:  # noqa: BLE001
+                    pass
+            return False
         self.release()
         return False
 
