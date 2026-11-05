@@ -1917,6 +1917,48 @@ def _inject_root_lock_cleanup_interrupt(monkeypatch, error):
     return captured
 
 
+def _inject_registry_store_poisoned_after_real_close(monkeypatch):
+    """Exercise Store POISONED after a real handle close, via a test OSError.
+
+    The real DirectoryHandle.close() succeeds first. The OSError is raised
+    by this test wrapper only; it does not represent a native CloseHandle
+    FALSE result or a real native close failure.
+
+    The roots/root DirectoryHandle objects are retained so the caller can
+    assert their actual close state after Store.close() clears its refs.
+    """
+    captured = []
+    failures = []
+    handles = {}
+    original_from_handle = restore_db.RootLock.from_target_handle
+
+    def from_target_handle(target_handle, registry_root=None):
+        lock = original_from_handle(
+            target_handle, registry_root=registry_root)
+        roots_handle = lock.registry._roots_handle
+        root_handle = lock.registry._root_handle
+        assert roots_handle is not None
+        assert root_handle is not None
+        handles['roots'] = roots_handle
+        handles['root'] = root_handle
+        original_close = roots_handle.close
+
+        def close_then_fail():
+            original_close()
+            failure = OSError(
+                'test-only post-close RegistryStore roots failure')
+            failures.append(failure)
+            raise failure
+
+        monkeypatch.setattr(roots_handle, 'close', close_then_fail)
+        captured.append(lock)
+        return lock
+
+    monkeypatch.setattr(
+        restore_db.RootLock, 'from_target_handle', from_target_handle)
+    return captured, failures, handles
+
+
 def _assert_root_lock_released(target, registry_root, release=None):
     """Prove the OS RootLock is free by acquiring it with a fresh RootLock."""
     probe = restore_db.RootLock(target, registry_root=registry_root)
@@ -2135,6 +2177,41 @@ def test_p1_1_main_root_lock_release_error_returns_9(
     assert 'root release failure' in err
     assert 'registry close failed' in err
     assert '恢复完成' not in out
+
+
+def test_p1_2_main_real_store_poisoned_returns_9(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    """Store.close reaches POISONED after a test-only post-close OSError.
+
+    The real roots handle is closed successfully first. The injected OSError
+    is not a native CloseHandle FALSE result.
+    """
+    backup_set, target = full_backup_and_target
+    captured, failures, handles = (
+        _inject_registry_store_poisoned_after_real_close(monkeypatch))
+
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert code == restore_db.EXIT_RELEASE_FAILURE
+    assert failures
+    assert isinstance(failures[0], OSError)
+    assert type(failures[0]) is OSError
+    assert 'post-close' in str(failures[0])
+    assert captured
+    lock = captured[0]
+    assert lock.registry.poisoned is True
+    assert lock.registry.closed is False
+    assert lock.root_lock._handle is None
+    assert lock._held is False
+    assert lock.target.closed
+    assert handles['roots'].closed is True
+    assert handles['root'].closed is True
+    assert 'lock_release' in err
+    assert 'Registry' in err
+    assert '恢复完成' not in out
+    _assert_root_lock_released(target, tmp_path / 'restore-registry')
 
 
 def test_p1_2_main_success_internal_cleanup_interrupt_propagates(
