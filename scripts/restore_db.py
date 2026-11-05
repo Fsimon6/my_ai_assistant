@@ -1192,7 +1192,9 @@ def _cleanup_staging(staging: Path, root: Path,
         shutil.rmtree(staging)
         return True
     except Exception as exc:  # noqa: BLE001 - 清理失败不能覆盖主恢复结论
-        print('警告：拒绝/失败清理 staging，请手工检查：%s（%s）' % (staging, exc))
+        _exc_type, exc_text = _safe_exception_text(exc)
+        print('警告：拒绝/失败清理 staging，请手工检查：%s（%s）' % (
+            staging, exc_text))
         return False
 
 
@@ -1523,7 +1525,8 @@ def _execute(state: dict[str, Any], root: Path, validated: dict[str, tuple[dict,
 
 def _handle_failure(state: dict[str, Any], root: Path,
                     exc: Exception) -> int:
-    error = '%s: %s' % (type(exc).__name__, exc)
+    exc_type, exc_text = _safe_exception_text(exc)
+    error = '%s: %s' % (exc_type, exc_text)
     if state.get('targets_touched'):
         try:
             targets = {
@@ -1535,8 +1538,9 @@ def _handle_failure(state: dict[str, Any], root: Path,
             _rollback(state, root, targets, Path(state['rollback']),
                       Path(state['pre_restore']))
         except Exception as rollback_exc:  # noqa: BLE001
+            rollback_type, rollback_text = _safe_exception_text(rollback_exc)
             state['error'] = '%s；回滚失败：%s: %s' % (
-                error, type(rollback_exc).__name__, rollback_exc)
+                error, rollback_type, rollback_text)
             try:
                 _set_state(state, 'FAILED_RECOVERY_REQUIRED', state['error'])
             except Exception:
@@ -1624,13 +1628,16 @@ def _safe_exception_text(exc: BaseException) -> tuple[str, str]:
 
 def _root_lock_attached_errors(
         primary: BaseException,
-        report: _CleanupReport) -> list[tuple[str, BaseException]]:
+        report: _CleanupReport | None = None
+        ) -> list[tuple[str, BaseException]]:
     """Collect attached RootLock diagnostics without trusting their shape."""
     errors: list[tuple[str, BaseException]] = []
     seen: set[int] = set()
-    for exc in (report.lock_error, report.target_error, report.helper_error):
-        if isinstance(exc, BaseException):
-            seen.add(id(exc))
+    if report is not None:
+        for exc in (
+                report.lock_error, report.target_error, report.helper_error):
+            if isinstance(exc, BaseException):
+                seen.add(id(exc))
     seen.add(id(primary))
 
     try:
@@ -1666,7 +1673,8 @@ def _root_lock_attached_errors(
 
 
 def _report_root_lock_attached_errors(
-        primary: BaseException, report: _CleanupReport) -> None:
+        primary: BaseException,
+        report: _CleanupReport | None = None) -> None:
     errors = _root_lock_attached_errors(primary, report)
     if not errors:
         return
@@ -1677,7 +1685,8 @@ def _report_root_lock_attached_errors(
 
 
 def _safe_report_root_lock_attached_errors(
-        primary: BaseException, report: _CleanupReport) -> bool:
+        primary: BaseException,
+        report: _CleanupReport | None = None) -> bool:
     """Reporting attached diagnostics must never mask the primary error."""
     try:
         _report_root_lock_attached_errors(primary, report)
@@ -1742,7 +1751,9 @@ def _restore_locked(root: Path, src: Path, backup_dir: Path,
     try:
         resources.target_handle = open_secure_directory(root)
     except (PathSecurityError, OSError) as exc:
-        print('恢复目标安全验证失败：%s' % exc)
+        _safe_report_root_lock_attached_errors(exc)
+        _exc_type, exc_text = _safe_exception_text(exc)
+        print('恢复目标安全验证失败：%s' % exc_text)
         return EXIT_PATH_MAPPING
 
     registry_root = os.environ.get(RESTORE_REGISTRY_ROOT_ENV)
@@ -1754,20 +1765,28 @@ def _restore_locked(root: Path, src: Path, backup_dir: Path,
         resources.lock.acquire(run_id)
     except (RegistryConflictError, RegistryLockBusy,
             RegistryLockError, RootLockError, PathSecurityError) as exc:
-        print('无法获取恢复锁：%s' % exc)
+        _safe_report_root_lock_attached_errors(exc)
+        _exc_type, exc_text = _safe_exception_text(exc)
+        print('无法获取恢复锁：%s' % exc_text)
         print('同一或重叠目标已有恢复进程，本次未修改任何目标数据。')
         return EXIT_LOCKED
     except Exception as exc:  # noqa: BLE001 - 锁初始化失败必须 fail-closed
-        print('恢复锁初始化失败：%s' % exc)
+        _safe_report_root_lock_attached_errors(exc)
+        _exc_type, exc_text = _safe_exception_text(exc)
+        print('恢复锁初始化失败：%s' % exc_text)
         return EXIT_LOCKED
 
     try:
         _validate_target_types(root)
     except RestoreTransactionError as exc:
-        print('恢复前检查失败：%s' % exc)
+        _safe_report_root_lock_attached_errors(exc)
+        _exc_type, exc_text = _safe_exception_text(exc)
+        print('恢复前检查失败：%s' % exc_text)
         return EXIT_TRANSACTION
     except Exception as exc:  # noqa: BLE001
-        print('恢复前检查失败：%s' % exc)
+        _safe_report_root_lock_attached_errors(exc)
+        _exc_type, exc_text = _safe_exception_text(exc)
+        print('恢复前检查失败：%s' % exc_text)
         return EXIT_TRANSACTION
 
     incomplete = _scan_incomplete_runs(root, backup_dir)
@@ -1784,8 +1803,10 @@ def _restore_locked(root: Path, src: Path, backup_dir: Path,
         _execute(state, root, validated, backup_dir)
         _cleanup_staging(Path(state['staging']), root, state)
     except Exception as exc:  # noqa: BLE001
+        _safe_report_root_lock_attached_errors(exc)
         if not isinstance(state, dict):
-            print('恢复失败：%s' % exc)
+            _exc_type, exc_text = _safe_exception_text(exc)
+            print('恢复失败：%s' % exc_text)
             return EXIT_TRANSACTION
         return _handle_failure(state, root, exc)
 
@@ -1821,7 +1842,8 @@ def main() -> int:
         validated = validate_backup_set(src, manifest)
         _reject_non_default_source_layout(manifest)
     except BackupValidationError as exc:
-        print('预检失败：%s' % exc)
+        _exc_type, exc_text = _safe_exception_text(exc)
+        print('预检失败：%s' % exc_text)
         return exc.code
 
     _db_item, db_file = validated['sqlite_database']

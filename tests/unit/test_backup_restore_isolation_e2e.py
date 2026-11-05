@@ -1959,6 +1959,27 @@ def _inject_registry_store_poisoned_after_real_close(monkeypatch):
     return captured, failures, handles
 
 
+def _inject_root_lock_acquire_error(monkeypatch, error):
+    """Make the real RootLock creation succeed, then fail acquire()."""
+    captured = []
+    original_from_handle = restore_db.RootLock.from_target_handle
+
+    def from_target_handle(target_handle, registry_root=None):
+        lock = original_from_handle(
+            target_handle, registry_root=registry_root)
+
+        def fail_acquire(_run_id):
+            raise error
+
+        monkeypatch.setattr(lock, 'acquire', fail_acquire)
+        captured.append(lock)
+        return lock
+
+    monkeypatch.setattr(
+        restore_db.RootLock, 'from_target_handle', from_target_handle)
+    return captured
+
+
 def _assert_root_lock_released(target, registry_root, release=None):
     """Prove the OS RootLock is free by acquiring it with a fresh RootLock."""
     probe = restore_db.RootLock(target, registry_root=registry_root)
@@ -2305,6 +2326,250 @@ def test_p1_2_main_attached_diagnostic_format_failure_preserves_primary(
                      tmp_path / 'pre_restore')
 
     assert caught.value is primary
+
+
+def test_p1_2_main_exit_code_conversion_reports_attached_errors(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    primary = registry_module.RegistryLockBusy('busy with diagnostics')
+    cleanup_error = RuntimeError('converted cleanup diagnostic')
+    primary._root_lock_cleanup_errors = (('registry', cleanup_error),)
+    primary._root_lock_release_errors = (cleanup_error,)
+    captured = _inject_root_lock_acquire_error(monkeypatch, primary)
+
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert code == restore_db.EXIT_LOCKED
+    assert captured
+    assert captured[0].target.closed
+    assert 'root_lock_cleanup[registry]' in err
+    assert 'converted cleanup diagnostic' in err
+    assert err.count('converted cleanup diagnostic') == 1
+    assert 'root_lock_release' not in err
+    assert '无法获取恢复锁' in out
+
+
+def test_p1_2_main_target_open_conversion_consumes_attached_errors(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    primary = OSError('target open failure')
+    primary._root_lock_cleanup_errors = (
+        ('registry', RuntimeError('target attached cleanup')),)
+
+    def fail_open(_root):
+        raise primary
+
+    monkeypatch.setattr(restore_db, 'open_secure_directory', fail_open)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert code == restore_db.EXIT_PATH_MAPPING
+    assert 'target attached cleanup' in err
+    assert 'root_lock_cleanup[registry]' in err
+    assert '恢复目标安全验证失败' in out
+
+
+def test_p1_2_main_generic_acquire_conversion_consumes_attached_errors(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    primary = RuntimeError('generic acquire failure')
+    primary._root_lock_cleanup_errors = (
+        ('registry', RuntimeError('generic acquire attached cleanup')),)
+    _inject_root_lock_acquire_error(monkeypatch, primary)
+
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert code == restore_db.EXIT_LOCKED
+    assert 'generic acquire attached cleanup' in err
+    assert '恢复锁初始化失败' in out
+
+
+def test_p1_2_main_validate_conversion_consumes_attached_errors(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    primary = restore_db.RestoreTransactionError('target type failure')
+    primary._root_lock_cleanup_errors = (
+        ('registry', RuntimeError('validate attached cleanup')),)
+
+    def fail_validate(_root):
+        raise primary
+
+    monkeypatch.setattr(restore_db, '_validate_target_types', fail_validate)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert code == restore_db.EXIT_TRANSACTION
+    assert 'validate attached cleanup' in err
+    assert 'root_lock_cleanup[registry]' in err
+    assert '恢复前检查失败' in out
+
+
+def test_p1_2_main_validate_generic_conversion_consumes_attached_errors(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    primary = RuntimeError('generic validate failure')
+    primary._root_lock_cleanup_errors = (
+        ('registry', RuntimeError('generic validate attached cleanup')),)
+
+    def fail_validate(_root):
+        raise primary
+
+    monkeypatch.setattr(restore_db, '_validate_target_types', fail_validate)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert code == restore_db.EXIT_TRANSACTION
+    assert 'generic validate attached cleanup' in err
+    assert '恢复前检查失败' in out
+
+
+def test_p1_2_main_data_conversion_and_release_diagnostics_both_survive(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    primary = RuntimeError('data failure with attached diagnostics')
+    primary._root_lock_cleanup_errors = (
+        ('registry', RuntimeError('data attached cleanup')),)
+    release_error = RuntimeError('post-release cleanup failure')
+
+    def raise_primary(*_args, **_kwargs):
+        raise primary
+
+    original_release = restore_db.RootLock.release
+
+    def release_then_fail(lock):
+        original_release(lock)
+        raise RootLockReleaseError(
+            'release failure after data error',
+            [('registry', release_error)])
+
+    monkeypatch.setattr(restore_db, '_execute', raise_primary)
+    monkeypatch.setattr(
+        restore_db.RootLock, 'release', release_then_fail)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert code == restore_db.EXIT_TRANSACTION
+    assert 'data attached cleanup' in err
+    assert 'post-release cleanup failure' in err
+    assert '原始 Restore 退出码 %d 保持不变' % code in err
+    assert '恢复失败' in out
+
+
+def test_p1_2_main_broken_exception_str_preserves_exit_code(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+
+    class _BrokenException(Exception):
+        def __str__(self):
+            raise RuntimeError('exception stringification failed')
+
+    primary = _BrokenException('ignored')
+    primary._root_lock_cleanup_errors = (
+        ('registry', RuntimeError('broken string cleanup')),)
+
+    def raise_primary(*_args, **_kwargs):
+        raise primary
+
+    monkeypatch.setattr(restore_db, '_execute', raise_primary)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert code == restore_db.EXIT_TRANSACTION
+    assert 'broken string cleanup' in err
+    assert '<unprintable exception>' in out
+
+
+def test_p1_2_main_primary_exception_reports_attached_errors(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    primary = _FatalRestore('primary with converted diagnostics')
+    primary._root_lock_cleanup_errors = (
+        ('registry', RuntimeError('primary attached cleanup')),)
+
+    def raise_primary(*_args, **_kwargs):
+        raise primary
+
+    monkeypatch.setattr(restore_db, '_execute', raise_primary)
+    with pytest.raises(_FatalRestore) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert caught.value is primary
+    assert 'root_lock_cleanup[registry]' in err
+    assert 'primary attached cleanup' in err
+    assert '恢复完成' not in out
+
+
+def test_p1_2_main_exit_code_conversion_attribute_read_failure(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+
+    class _BadAttributeError(registry_module.RegistryLockBusy):
+        def __getattribute__(self, name):
+            if name in (
+                    '_root_lock_cleanup_errors',
+                    '_root_lock_release_errors'):
+                raise RuntimeError('diagnostic attribute read failed')
+            return super().__getattribute__(name)
+
+    primary = _BadAttributeError('busy with unreadable diagnostics')
+    captured = _inject_root_lock_acquire_error(monkeypatch, primary)
+
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert code == restore_db.EXIT_LOCKED
+    assert captured
+    assert '无法获取恢复锁' in out
+    assert 'RootLock 清理诊断' not in err
+
+
+def test_p1_2_main_exit_code_conversion_format_failure(
+        full_backup_and_target, monkeypatch, tmp_path):
+    backup_set, target = full_backup_and_target
+    primary = registry_module.RegistryLockBusy('busy with format failure')
+    primary._root_lock_cleanup_errors = (
+        ('registry', RuntimeError('format failure cleanup')),)
+    _inject_root_lock_acquire_error(monkeypatch, primary)
+
+    def fail_report(_primary, _report=None):
+        raise RuntimeError('diagnostic reporting unavailable')
+
+    monkeypatch.setattr(
+        restore_db, '_report_root_lock_attached_errors', fail_report)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+
+    assert code == restore_db.EXIT_LOCKED
+
+
+def test_p1_2_main_exit_code_conversion_stderr_failure(
+        full_backup_and_target, monkeypatch, tmp_path):
+    backup_set, target = full_backup_and_target
+    primary = registry_module.RegistryLockBusy('busy with stderr failure')
+    primary._root_lock_cleanup_errors = (
+        ('registry', RuntimeError('stderr failure cleanup')),)
+    _inject_root_lock_acquire_error(monkeypatch, primary)
+
+    def fail_stderr(_message):
+        raise RuntimeError('diagnostic stderr unavailable')
+
+    monkeypatch.setattr(restore_db, '_safe_stderr', fail_stderr)
+    code = _run_restore(monkeypatch, backup_set, target,
+                        tmp_path / 'pre_restore')
+
+    assert code == restore_db.EXIT_LOCKED
 
 
 def test_p1_2_main_success_internal_cleanup_interrupt_propagates(
