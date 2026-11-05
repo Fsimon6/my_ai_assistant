@@ -1622,6 +1622,70 @@ def _safe_exception_text(exc: BaseException) -> tuple[str, str]:
     return type_name, text
 
 
+def _root_lock_attached_errors(
+        primary: BaseException,
+        report: _CleanupReport) -> list[tuple[str, BaseException]]:
+    """Collect attached RootLock diagnostics without trusting their shape."""
+    errors: list[tuple[str, BaseException]] = []
+    seen: set[int] = set()
+    for exc in (report.lock_error, report.target_error, report.helper_error):
+        if isinstance(exc, BaseException):
+            seen.add(id(exc))
+    seen.add(id(primary))
+
+    try:
+        cleanup_errors = getattr(
+            primary, '_root_lock_cleanup_errors', ())
+        for item in cleanup_errors:
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+            name, exc = item
+            if not isinstance(exc, BaseException) or id(exc) in seen:
+                continue
+            try:
+                name_text = str(name)
+            except BaseException:  # noqa: BLE001 - fall back to a safe label
+                name_text = '<unknown>'
+            seen.add(id(exc))
+            errors.append(('root_lock_cleanup[%s]' % name_text, exc))
+    except BaseException:  # noqa: BLE001 - malformed diagnostics are optional
+        pass
+
+    try:
+        release_errors = getattr(primary, '_root_lock_release_errors', ())
+        if isinstance(release_errors, BaseException):
+            release_errors = (release_errors,)
+        for exc in release_errors:
+            if not isinstance(exc, BaseException) or id(exc) in seen:
+                continue
+            seen.add(id(exc))
+            errors.append(('root_lock_release', exc))
+    except BaseException:  # noqa: BLE001 - malformed diagnostics are optional
+        pass
+    return errors
+
+
+def _report_root_lock_attached_errors(
+        primary: BaseException, report: _CleanupReport) -> None:
+    errors = _root_lock_attached_errors(primary, report)
+    if not errors:
+        return
+    _safe_stderr('警告：主异常上的 RootLock 清理诊断：')
+    for name, exc in errors:
+        type_name, text = _safe_exception_text(exc)
+        _safe_stderr('  - %s: %s: %s' % (name, type_name, text))
+
+
+def _safe_report_root_lock_attached_errors(
+        primary: BaseException, report: _CleanupReport) -> bool:
+    """Reporting attached diagnostics must never mask the primary error."""
+    try:
+        _report_root_lock_attached_errors(primary, report)
+    except BaseException:  # noqa: BLE001 - diagnostics are best effort
+        return False
+    return True
+
+
 def _safe_stderr(message: str) -> bool:
     """Best-effort diagnostic output that must not replace a primary error."""
     try:
@@ -1794,6 +1858,9 @@ def main() -> int:
     if primary_exc is not None:
         if cleanup_report.has_errors():
             _safe_report_cleanup_errors(cleanup_report)
+        _safe_report_root_lock_attached_errors(
+            primary_exc, cleanup_report)
+        if cleanup_report.has_errors():
             _safe_stderr(
                 '原始 Restore 异常保留并原样传播；清理错误未改变主异常。')
         raise primary_exc.with_traceback(primary_tb)

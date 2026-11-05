@@ -2214,6 +2214,99 @@ def test_p1_2_main_real_store_poisoned_returns_9(
     _assert_root_lock_released(target, tmp_path / 'restore-registry')
 
 
+def test_p1_2_main_reports_attached_root_lock_cleanup_errors(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    primary = KeyboardInterrupt('primary with cleanup diagnostics')
+    cleanup_error = RuntimeError('attached registry cleanup failed')
+    primary._root_lock_cleanup_errors = (('registry', cleanup_error),)
+
+    def raise_primary(*_args, **_kwargs):
+        raise primary
+
+    monkeypatch.setattr(restore_db, '_execute', raise_primary)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert caught.value is primary
+    assert 'RootLock 清理诊断' in err
+    assert 'root_lock_cleanup[registry]' in err
+    assert 'RuntimeError' in err
+    assert 'attached registry cleanup failed' in err
+    assert '恢复完成' not in out
+
+
+def test_p1_2_main_reports_attached_root_lock_release_errors(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    primary = KeyboardInterrupt('primary with release diagnostics')
+    release_error = RuntimeError('attached release cleanup failed')
+    primary._root_lock_release_errors = (release_error,)
+
+    def raise_primary(*_args, **_kwargs):
+        raise primary
+
+    monkeypatch.setattr(restore_db, '_execute', raise_primary)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert caught.value is primary
+    assert 'root_lock_release' in err
+    assert 'RuntimeError' in err
+    assert 'attached release cleanup failed' in err
+    assert '恢复完成' not in out
+
+
+def test_p1_2_main_deduplicates_root_lock_attached_errors(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    primary = KeyboardInterrupt('primary with duplicate diagnostics')
+    cleanup_error = RuntimeError('duplicate attached cleanup failure')
+    primary._root_lock_cleanup_errors = (('registry', cleanup_error),)
+    primary._root_lock_release_errors = (cleanup_error,)
+
+    def raise_primary(*_args, **_kwargs):
+        raise primary
+
+    monkeypatch.setattr(restore_db, '_execute', raise_primary)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+
+    assert caught.value is primary
+    assert err.count('duplicate attached cleanup failure') == 1
+    assert 'root_lock_cleanup[registry]' in err
+    assert 'root_lock_release' not in err
+    assert '恢复完成' not in out
+
+
+def test_p1_2_main_attached_diagnostic_format_failure_preserves_primary(
+        full_backup_and_target, monkeypatch, tmp_path):
+    backup_set, target = full_backup_and_target
+    primary = KeyboardInterrupt('primary survives diagnostic formatting')
+    primary._root_lock_cleanup_errors = (
+        ('registry', RuntimeError('attached cleanup')),)
+
+    def raise_primary(*_args, **_kwargs):
+        raise primary
+
+    def fail_format(_exc):
+        raise RuntimeError('diagnostic formatting unavailable')
+
+    monkeypatch.setattr(restore_db, '_execute', raise_primary)
+    monkeypatch.setattr(restore_db, '_safe_exception_text', fail_format)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+
+    assert caught.value is primary
+
+
 def test_p1_2_main_success_internal_cleanup_interrupt_propagates(
         full_backup_and_target, monkeypatch, tmp_path, capsys):
     backup_set, target = full_backup_and_target
