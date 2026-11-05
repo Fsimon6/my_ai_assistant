@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     # LLM 生成参数（F1）：原先业务代码用 os.getenv 读取 → 写在 .env 里**不生效**；
     # 现统一到配置入口。默认值与原 os.getenv 兜底值一致（0.7 / 2000）。
     LLM_TEMPERATURE: float = 0.7
-    LLM_MAX_TOKENS: int = 2000
+    LLM_MAX_TOKENS: int = 3000
 
     # LLM 请求超时（**秒**）：唯一来源（B2-A）。优先级 进程环境变量 > `.env` > 默认 30。
     # 合法范围 1..600；非法值在进程启动（Settings 构造）时即报错，不静默回退。
