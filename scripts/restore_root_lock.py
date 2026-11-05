@@ -62,6 +62,29 @@ def _identity_key(identity: DirectoryIdentity) -> str:
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 
+def _first_cleanup_interrupt(
+        errors: list[tuple[str, BaseException]]) -> BaseException | None:
+    """Return the first non-Exception cleanup failure, if any."""
+    for _name, exc in errors:
+        if not isinstance(exc, Exception):
+            return exc
+    return None
+
+
+def _attach_cleanup_errors(primary: BaseException,
+                           errors: list[tuple[str, BaseException]]) -> None:
+    """Attach secondary cleanup failures without replacing the primary."""
+    secondary = tuple(
+        (name, exc) for name, exc in errors if exc is not primary)
+    if not secondary:
+        return
+    try:
+        existing = tuple(getattr(primary, '_root_lock_cleanup_errors', ()))
+        setattr(primary, '_root_lock_cleanup_errors', existing + secondary)
+    except BaseException:  # noqa: BLE001 - diagnostics must not mask primary
+        pass
+
+
 def _root_lock_path(registry_root: Path, identity: DirectoryIdentity) -> Path:
     return registry_root / ROOTS_DIRNAME / (_identity_key(identity) + '.lock')
 
@@ -153,6 +176,10 @@ class RootLock:
         self._cleanup_registry(errors)
         self._cleanup_target(errors)
         if errors:
+            interrupt = _first_cleanup_interrupt(errors)
+            if interrupt is not None or not isinstance(primary, Exception):
+                _attach_cleanup_errors(primary, errors)
+                raise primary.with_traceback(primary.__traceback__)
             raise RootLockReleaseError(
                 'RootLock 失败清理未完成', errors) from primary
         raise primary
@@ -272,10 +299,17 @@ class RootLock:
             self._cleanup_registry(errors)
             self._cleanup_target(errors)
         if errors:
-            error = RootLockReleaseError('RootLock 释放未完成', errors)
+            interrupt = _first_cleanup_interrupt(errors)
             if primary is not None:
+                if interrupt is not None or not isinstance(primary, Exception):
+                    _attach_cleanup_errors(primary, errors)
+                    raise primary.with_traceback(primary.__traceback__)
+                error = RootLockReleaseError('RootLock 释放未完成', errors)
                 raise error from primary
-            raise error
+            if interrupt is not None:
+                _attach_cleanup_errors(interrupt, errors)
+                raise interrupt.with_traceback(interrupt.__traceback__)
+            raise RootLockReleaseError('RootLock 释放未完成', errors)
         if primary is not None:
             raise primary
 

@@ -1893,6 +1893,30 @@ def _inject_release_failure(monkeypatch, error=None):
     return calls
 
 
+def _inject_root_lock_cleanup_interrupt(monkeypatch, error):
+    """Make the real RootLock cleanup release raise after closing the OS lock."""
+    captured = []
+    original_from_handle = restore_db.RootLock.from_target_handle
+
+    def from_target_handle(target_handle, registry_root=None):
+        lock = original_from_handle(
+            target_handle, registry_root=registry_root)
+        original_release = lock.root_lock.release
+
+        def release_then_interrupt():
+            original_release()
+            raise error
+
+        monkeypatch.setattr(
+            lock.root_lock, 'release', release_then_interrupt)
+        captured.append(lock)
+        return lock
+
+    monkeypatch.setattr(
+        restore_db.RootLock, 'from_target_handle', from_target_handle)
+    return captured
+
+
 def _assert_root_lock_released(target, registry_root, release=None):
     """Prove the OS RootLock is free by acquiring it with a fresh RootLock."""
     probe = restore_db.RootLock(target, registry_root=registry_root)
@@ -2110,6 +2134,65 @@ def test_p1_1_main_root_lock_release_error_returns_9(
     assert opened and opened[0].closed
     assert 'root release failure' in err
     assert 'registry close failed' in err
+    assert '恢复完成' not in out
+
+
+def test_p1_2_main_success_internal_cleanup_interrupt_propagates(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    interrupt = KeyboardInterrupt('internal RootLock cleanup interrupted')
+    captured = _inject_root_lock_cleanup_interrupt(monkeypatch, interrupt)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert caught.value is interrupt
+    assert captured
+    assert captured[0].target.closed
+    assert captured[0].registry.closed
+    assert '恢复完成' not in out
+
+
+def test_p1_2_main_failure_internal_cleanup_interrupt_propagates(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    interrupt = KeyboardInterrupt('internal cleanup interrupted after failure')
+    captured = _inject_root_lock_cleanup_interrupt(monkeypatch, interrupt)
+
+    def fail_switch(*_args, **_kwargs):
+        raise RuntimeError('data failure before internal cleanup interrupt')
+
+    monkeypatch.setattr(restore_db, '_switch_sqlite', fail_switch)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert caught.value is interrupt
+    assert captured and captured[0].target.closed
+    assert 'data failure before internal cleanup interrupt' in out
+    assert 'lock_release' in err
+
+
+def test_p1_2_main_primary_exception_wins_over_internal_cleanup_interrupt(
+        full_backup_and_target, monkeypatch, tmp_path, capsys):
+    backup_set, target = full_backup_and_target
+    interrupt = KeyboardInterrupt('cleanup interrupt after primary')
+    captured = _inject_root_lock_cleanup_interrupt(monkeypatch, interrupt)
+    fatal = _FatalRestore('primary restore failure with cleanup interrupt')
+
+    def boom(*_args, **_kwargs):
+        raise fatal
+
+    monkeypatch.setattr(restore_db, '_execute', boom)
+    with pytest.raises(_FatalRestore) as caught:
+        _run_restore(monkeypatch, backup_set, target,
+                     tmp_path / 'pre_restore')
+    out, err = capsys.readouterr()
+    assert caught.value is fatal
+    assert captured and captured[0].target.closed
+    assert 'lock_release' in err
+    assert '原始 Restore 异常保留并原样传播' in err
     assert '恢复完成' not in out
 
 
