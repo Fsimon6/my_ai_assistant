@@ -812,6 +812,54 @@ def test_acquire_failure_then_release_is_safe(tmp_path):
         holder.release()
 
 
+def test_acquire_failure_repeated_release_does_not_reclose(
+        tmp_path, monkeypatch):
+    target = tmp_path / 'acquire-repeated-release-target'
+    target.mkdir()
+    registry_root = _reg(tmp_path)
+    holder = RootLock(target, registry_root)
+    holder.acquire('holder')
+    second = RootLock(target, registry_root)
+    owned_handles = _resource_handle_snapshot(second)
+    calls = _track_cleanup_calls(second, monkeypatch, owned_handles)
+    try:
+        with pytest.raises(registry.RegistryLockBusy) as caught:
+            second.acquire('second')
+        primary = caught.value
+        assert isinstance(primary, registry.RegistryLockBusy)
+        assert not hasattr(primary, '_root_lock_cleanup_errors')
+        assert second.target.closed
+        assert second.registry.closed
+        assert second.root_lock._handle is None
+        assert second._held is False
+        assert len(owned_handles) == 3
+        assert calls['root_lock_release'] == 1
+        closed_handles = [handle for _owner, handle in calls['native']]
+        assert set(closed_handles) == set(owned_handles)
+        assert len(closed_handles) == len(owned_handles)
+        assert all(
+            closed_handles.count(handle) == 1 for handle in owned_handles)
+        assert all(
+            owner == 'DirectoryHandle'
+            for owner, _handle in calls['native'])
+        opened_after_failure = tuple(calls['native'])
+
+        second.release()
+        second.release()
+
+        assert tuple(calls['native']) == opened_after_failure
+        assert second.target.closed
+        assert second.registry.closed
+        assert second.root_lock._handle is None
+        assert second._held is False
+    finally:
+        holder.release()
+
+    probe = RootLock(target, registry_root)
+    probe.acquire('after-failed-acquire-release')
+    probe.release()
+
+
 def test_registry_poisoned_by_real_close_then_root_release(
         tmp_path, monkeypatch):
     target = tmp_path / 'poisoned-real-close'
