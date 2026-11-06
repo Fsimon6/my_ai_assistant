@@ -418,6 +418,7 @@ async def health_check():
     return {
         'status': 'healthy',
         'platform': sys.platform,
+        'environment': EFFECTIVE_ENV,
         'service': Config.APP_NAME,
         'versions': Config.APP_VERSION,
         'timestamp': datetime.now().isoformat(),

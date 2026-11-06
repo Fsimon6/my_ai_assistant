@@ -251,6 +251,7 @@ def test_testing_runtime_uses_isolated_settings(tmp_path):
     assert data['config'] == 'TestingConfig'
     assert data['health_status'] == 200
     assert data['health_body']['status'] == 'healthy'
+    assert data['health_body']['environment'] == 'testing'
     assert data['jwt_sub'] == 'isolation-probe'
 
     assert Path(data['db_engine']) == Path(data['db_expected'])

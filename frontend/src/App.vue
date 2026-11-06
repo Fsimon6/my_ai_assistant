@@ -1,4 +1,5 @@
 <template>
+  <div v-if="isL1Testing" class="l1-testing-banner" role="status">{{ l1BannerText }}</div>
   <MainLayout v-if="showLayout">
     <router-view />
   </MainLayout>
@@ -9,6 +10,7 @@
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import MainLayout from '@/layouts/MainLayout.vue'
+import { isL1Testing, l1BannerText } from '@/utils/environment'
 
 const route = useRoute()
 // 仅当路由 meta.showLayout === true 时渲染主布局（含全局导航栏）
@@ -16,6 +18,18 @@ const showLayout = computed(() => route.meta.showLayout === true)
 </script>
 
 <style>
+.l1-testing-banner {
+  position: sticky;
+  top: 0;
+  z-index: 10000;
+  padding: 8px 14px;
+  background: #b00020;
+  color: #fff;
+  font-weight: 700;
+  text-align: center;
+  letter-spacing: 0.4px;
+}
+
 * {
   margin: 0;
   padding: 0;

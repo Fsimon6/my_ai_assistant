@@ -169,6 +169,10 @@ def _run(code: str, env_overrides: Optional[dict] = None):
     if str(env.get('ENVIRONMENT', '')).strip().lower() == 'testing':
         for key, value in TESTING_PATHS.items():
             env.setdefault(key, value)
+        # Testing is fail-closed for LLM connectivity: use an explicitly
+        # local no-network probe unless the test supplies its own fake URL.
+        env.setdefault('LLM_PROVIDER', 'local')
+        env.setdefault('LLM_BASE_URL', 'http://127.0.0.1:1/v1')
     env['PYTHONPATH'] = str(REPO_ROOT)
     env['PYTHONIOENCODING'] = 'utf-8'
     env['PYTHONUTF8'] = '1'

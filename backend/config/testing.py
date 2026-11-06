@@ -10,6 +10,7 @@
 import os
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 from sqlalchemy.engine import make_url
 
@@ -93,6 +94,41 @@ def _sqlite_path(url: str) -> Path:
         # 与 backend.database.base 对相对 SQLite 路径的解析规则保持一致。
         path = _PROJECT_ROOT / path
     return path.resolve()
+
+
+_LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '::1'}
+_L1_FAKE_PORT = 9110
+
+
+def validate_testing_llm(provider: str, base_url: str) -> None:
+    """Fail closed when a testing process could reach a real Provider.
+
+    L1 uses an OpenAI-compatible fake on loopback port 9110.  The local
+    provider is also allowed on the explicit pytest no-network port 1.
+    Real provider names, non-loopback hosts and other ports are rejected.
+    """
+    provider = (provider or '').strip().lower()
+    base_url = (base_url or '').strip()
+    if provider not in {'openai', 'local'}:
+        raise ValueError('测试环境 LLM_PROVIDER 必须是 openai(local fake) 或 local')
+    if not base_url:
+        raise ValueError('测试环境必须设置 LLM_BASE_URL')
+    try:
+        parsed = urlparse(base_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError('测试环境 LLM_BASE_URL 无法解析') from exc
+    if parsed.scheme not in {'http', 'https'}:
+        raise ValueError('测试环境 LLM_BASE_URL 必须使用 http/https')
+    if parsed.username or parsed.password:
+        raise ValueError('测试环境 LLM_BASE_URL 不允许包含凭据')
+    if (parsed.hostname or '').strip().lower() not in _LOOPBACK_HOSTS:
+        raise ValueError('测试环境 LLM_BASE_URL 必须指向本机回环地址')
+    if provider == 'openai':
+        if port != _L1_FAKE_PORT:
+            raise ValueError(f'测试环境 OpenAI Fake Provider 必须使用端口 {_L1_FAKE_PORT}')
+    elif port not in {1, _L1_FAKE_PORT}:
+        raise ValueError(f'测试环境 local Provider 只允许端口 1 或 {_L1_FAKE_PORT}')
 
 
 class TestingConfig:
@@ -196,6 +232,8 @@ class TestingConfig:
                 '测试环境必须设置 EXCEL_DATA_ROOT，禁止回退到项目 data/excel'
             )
         _require_path('EXCEL_DATA_ROOT', excel_root, root)
+
+        validate_testing_llm(settings.LLM_PROVIDER, settings.LLM_BASE_URL or '')
 
         print('  测试环境配置验证通过')
 

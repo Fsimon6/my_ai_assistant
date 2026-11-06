@@ -1,5 +1,6 @@
 import { ref, onUnmounted } from "vue"
 import { request } from '@/utils/requests.ts'
+import { buildApiUrl } from '@/utils/apiBase'
 
 export interface StreamingMessage {
   type: 'chunk' | 'complete' | 'error'
@@ -43,9 +44,7 @@ export function useStreamingChat(options: StreamingOptions) {
       // URL 拼接复刻 axios 的 combineURLs：相对路径优先走同源（Vite 代理 /api）。
       const baseURL = (request.defaults.baseURL || '').replace(/\/+$/, '')
       const relPath = options.url || `/api/v1/characters/${options.characterId}/speak/stream`
-      const url = /^https?:\/\//i.test(relPath)
-        ? relPath
-        : (baseURL ? `${baseURL}/${relPath.replace(/^\/+/, '')}` : relPath)
+      const url = buildApiUrl(baseURL, relPath)
       const token = localStorage.getItem('access_token')
 
       const resp = await fetch(url, {

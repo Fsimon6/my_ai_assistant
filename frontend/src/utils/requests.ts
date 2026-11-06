@@ -2,11 +2,13 @@ import axios from "axios"
 import type {AxiosResponse, AxiosInstance, InternalAxiosRequestConfig} from "axios"
 import {ElMessage} from "element-plus";
 import router from "@/router";
+import {resolveApiBaseUrl} from "@/utils/apiBase";
 
 // 创建axios实例
+// 未显式配置 VITE_API_BASE_URL 时使用当前页面 origin，由 Vite/nginx 代理 /api；
+// 不再回退到硬编码的正式开发端口 8021。
 const request: AxiosInstance = axios.create({
-  // 生产构建中 import.meta.env.DEV 为 false，回退为空（同源相对 /api）；仅开发回退到 127.0.0.1:8021（本副本开发端口）
-  baseURL: import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8021' : ''),
+  baseURL: resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL),
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json'

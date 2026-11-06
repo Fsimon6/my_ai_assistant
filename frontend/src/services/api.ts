@@ -1,14 +1,14 @@
 import type { AxiosResponse, AxiosInstance } from 'axios'
 import axios from 'axios'
 import type { UploadFile } from "element-plus"
+import { resolveApiBaseUrl } from '@/utils/apiBase'
 
 // 创建axios实例
-// 统一使用 VITE_API_BASE_URL：开发=http://127.0.0.1:8021（本副本 Windows 开发端口），生产=空（同源 /api，由 nginx 反代）。
-// 避免硬编码开发地址进入生产 bundle。
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/+$/, '')
-// 生产构建中 DEV 为 false，空 baseURL 时回退为同源相对 /api/v1；仅开发回退到 127.0.0.1:8021
+// 统一使用显式 VITE_API_BASE_URL；为空时使用同源 /api/v1，由 Vite/nginx
+// 代理到当前环境后端。禁止开发回退到硬编码正式 8021。
+const API_BASE_URL = resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL)
 const api: AxiosInstance = axios.create({
-  baseURL: API_BASE_URL ? `${API_BASE_URL}/api/v1` : (import.meta.env.DEV ? 'http://127.0.0.1:8021/api/v1' : '/api/v1'),
+  baseURL: API_BASE_URL ? `${API_BASE_URL}/api/v1` : '/api/v1',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json'

@@ -6,9 +6,13 @@ import vueJsx from '@vitejs/plugin-vue-jsx'
 // 本地开发默认仍指向 127.0.0.1:8021；Docker 开发由 Compose 注入
 // backend-dev:8000，避免容器内 127.0.0.1 指向前端容器自身。
 const devProxyTarget = process.env.DEV_PROXY_TARGET || 'http://127.0.0.1:8021'
+const appEnv = (process.env.VITE_APP_ENV || 'development').trim().toLowerCase()
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  define: {
+    'import.meta.env.VITE_APP_ENV': JSON.stringify(appEnv),
+  },
   plugins: [
     vue() as any,
     vueJsx() as any,
