@@ -1,6 +1,28 @@
 # Shared, testable formal start control flow.
 # Production passes the real launchers and health probe; tests pass isolated fakes.
 
+function Get-LauncherResult([object]$value) {
+    $process = $null
+    $launchError = $null
+    if ($null -eq $value) {
+        return [pscustomobject]@{ Process = $null; Error = 'launcher returned no result' }
+    }
+    if ($value -is [System.Diagnostics.Process]) {
+        $process = $value
+    } else {
+        $names = @($value.PSObject.Properties.Name)
+        if ($names -contains 'Process') {
+            $process = $value.Process
+            if ($names -contains 'Error' -and -not [string]::IsNullOrWhiteSpace([string]$value.Error)) {
+                $launchError = [string]$value.Error
+            }
+        } else {
+            throw 'launcher returned an unsupported result object'
+        }
+    }
+    return [pscustomobject]@{ Process = $process; Error = $launchError }
+}
+
 function Invoke-FormalStart {
     param(
         [Parameter(Mandatory = $true)][int]$BackendPort,
@@ -13,28 +35,34 @@ function Invoke-FormalStart {
 
     $started = @()
     try {
-        $backendProcess = & $BackendLauncher
-        if ($null -eq $backendProcess) { throw 'backend launcher returned no process' }
-        # Stage 1: add a raw pending record before reading any identity field.
-        $backendRecord = [pscustomobject]@{
-            Process = $backendProcess; Id = $null; Name = $null
-            StartTime = $null; CommandLine = $null; Identity = 'PENDING'
+        $backendLaunch = Get-LauncherResult (& $BackendLauncher)
+        if ($null -ne $backendLaunch.Process) {
+            # Stage 1: register the Process before handling a launcher error.
+            $backendRecord = [pscustomobject]@{
+                Process = $backendLaunch.Process; Id = $null; Name = $null
+                StartTime = $null; CommandLine = $null; Identity = 'PENDING'
+            }
+            $started += $backendRecord
+            # Stage 2: enrich identity; failures keep the pending record.
+            Update-OwnedRecord $backendRecord
         }
-        $started += $backendRecord
-        # Stage 2: enrich identity; failures keep the pending record.
-        Update-OwnedRecord $backendRecord
+        if ($null -ne $backendLaunch.Error) { throw $backendLaunch.Error }
+        if ($null -eq $backendLaunch.Process) { throw 'backend launcher returned no process' }
 
-        $frontendProcess = & $FrontendLauncher
-        if ($null -eq $frontendProcess) { throw 'frontend launcher returned no process' }
-        $frontendRecord = [pscustomobject]@{
-            Process = $frontendProcess; Id = $null; Name = $null
-            StartTime = $null; CommandLine = $null; Identity = 'PENDING'
+        $frontendLaunch = Get-LauncherResult (& $FrontendLauncher)
+        if ($null -ne $frontendLaunch.Process) {
+            $frontendRecord = [pscustomobject]@{
+                Process = $frontendLaunch.Process; Id = $null; Name = $null
+                StartTime = $null; CommandLine = $null; Identity = 'PENDING'
+            }
+            $started += $frontendRecord
+            Update-OwnedRecord $frontendRecord
         }
-        $started += $frontendRecord
-        Update-OwnedRecord $frontendRecord
+        if ($null -ne $frontendLaunch.Error) { throw $frontendLaunch.Error }
+        if ($null -eq $frontendLaunch.Process) { throw 'frontend launcher returned no process' }
 
-        $backendAlive = $null -ne (Get-Process -Id $backendProcess.Id -ErrorAction SilentlyContinue)
-        $frontendAlive = $null -ne (Get-Process -Id $frontendProcess.Id -ErrorAction SilentlyContinue)
+        $backendAlive = $null -ne (Get-Process -Id $backendLaunch.Process.Id -ErrorAction SilentlyContinue)
+        $frontendAlive = $null -ne (Get-Process -Id $frontendLaunch.Process.Id -ErrorAction SilentlyContinue)
         $backendHealthy = [bool](& $HealthCheck "http://127.0.0.1:$BackendPort/health")
         $frontendHealthy = [bool](& $HealthCheck "http://127.0.0.1:$FrontendPort/login")
 

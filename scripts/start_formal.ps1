@@ -45,14 +45,16 @@ try {
         -BackendPort $BackendPort `
         -FrontendPort $FrontendPort `
         -BackendLauncher {
-            Start-Process -FilePath $python -ArgumentList @(
+            $process = Start-Process -FilePath $python -ArgumentList @(
                 '-m', 'uvicorn', 'backend.main:app', '--host', '127.0.0.1', '--port', "$BackendPort"
             ) -WorkingDirectory $root -RedirectStandardOutput (Join-Path $logs 'formal_backend.log') -RedirectStandardError (Join-Path $logs 'formal_backend_err.log') -PassThru
+            return [pscustomobject]@{ Process = $process; Error = $null }
         } `
         -FrontendLauncher {
-            Start-Process -FilePath $node -ArgumentList @(
+            $process = Start-Process -FilePath $node -ArgumentList @(
                 $vite, '--host', '127.0.0.1', '--port', "$FrontendPort", '--strictPort'
             ) -WorkingDirectory (Join-Path $root 'frontend') -RedirectStandardOutput (Join-Path $logs 'formal_frontend.log') -RedirectStandardError (Join-Path $logs 'formal_frontend_err.log') -PassThru
+            return [pscustomobject]@{ Process = $process; Error = $null }
         } `
         -HealthCheck {
             param($url)
