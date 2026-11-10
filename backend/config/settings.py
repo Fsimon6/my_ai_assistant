@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "gpt-3.5-turbo"
 
     # LLM 生成参数（F1）：原先业务代码用 os.getenv 读取 → 写在 .env 里**不生效**；
-    # 现统一到配置入口。默认值与原 os.getenv 兜底值一致（0.7 / 2000）。
+    # 现统一到配置入口。默认值与原 os.getenv 兜底值一致（0.7 / 3000）。
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 3000
 

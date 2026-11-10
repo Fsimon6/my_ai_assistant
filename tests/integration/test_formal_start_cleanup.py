@@ -408,3 +408,313 @@ def test_real_subprocess_timeout_cleans_journaled_fake(tmp_path: Path) -> None:
 
     assert pid is not None
     assert not _process_alive(pid)
+
+
+# ---------------------------------------------------------------------------
+# F2-B: process created by a launcher before the launcher returns/throws.
+# These tests use real, test-owned PowerShell children and identity-check all
+# cleanup. They do not modify or exercise the formal 8021/5181 services.
+# ---------------------------------------------------------------------------
+
+_F2B_PROBE = r"""
+$ErrorActionPreference = 'Stop'
+$repo = '__REPO__'
+. (Join-Path $repo 'scripts/formal_start_lib.ps1')
+. (Join-Path $repo 'scripts/formal_start_core.ps1')
+$side = '__SIDE__'
+$resultPath = '__RESULT__'
+$Scenario = '__SCENARIO__'
+$script:identities = New-Object System.Collections.ArrayList
+$script:testMarker = 'f2b-' + [guid]::NewGuid().ToString('N')
+
+function Write-F2BSide {
+    [ordered]@{ identities = @($script:identities) } |
+        ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath $side -Encoding UTF8
+}
+
+function New-F2BFake([string]$name) {
+    $marker = 'f2b-' + [guid]::NewGuid().ToString('N')
+    $command = "Start-Sleep -Seconds 120; # $marker"
+    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+        '-NoProfile', '-Command', $command
+    ) -WindowStyle Hidden -PassThru
+
+    $identity = [ordered]@{
+        scenario     = $name
+        pid          = [int]$p.Id
+        name         = [string]$p.ProcessName
+        start_time   = $p.StartTime.ToUniversalTime().ToString('o')
+        command_line = $null
+        marker       = $marker
+    }
+    [void]$script:identities.Add($identity)
+    Write-F2BSide
+
+    try {
+        $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction SilentlyContinue
+        if ($null -ne $cim) { $identity.command_line = [string]$cim.CommandLine }
+    } catch { }
+    Write-F2BSide
+    return $p
+}
+
+function Write-F2BResult($product, $errorText) {
+    $started = @()
+    $cleanup = @()
+    if ($null -ne $product) {
+        $started = @($product.Started)
+        $cleanup = @($product.Cleanup)
+    }
+    $knownStatuses = @(
+        'CLEANED', 'ALREADY_EXITED', 'SKIPPED_IDENTITY_MISMATCH',
+        'SKIPPED_IDENTITY_UNVERIFIABLE', 'CLEANUP_FAILED',
+        'CLEANUP_TIMEOUT', 'CLEANUP_UNCONFIRMED'
+    )
+    [ordered]@{
+        scenario             = $Scenario
+        product_exit         = $(if ($null -ne $product) { [int]$product.ExitCode } else { $null })
+        started_ids          = @($started | ForEach-Object { [int]$_.Id })
+        cleanup              = @($cleanup | ForEach-Object {
+            $raw = @($_.Status | ForEach-Object { [string]$_ })
+            $last = if ($raw.Count -gt 0) { $raw[-1] } else { 'UNKNOWN' }
+            $status = if ($knownStatuses -contains $last) { $last } else { 'UNKNOWN' }
+            [ordered]@{ id = [int]$_.Id; status = $status }
+        })
+        error                = $(if ($null -ne $product) { [string]$product.Error } else { [string]$errorText })
+        identities           = @($script:identities)
+        fake_alive_after_core = @(
+            $script:identities |
+                Where-Object { $null -ne (Get-Process -Id $_.pid -ErrorAction SilentlyContinue) } |
+                ForEach-Object { [int]$_.pid }
+        )
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $resultPath -Encoding UTF8
+}
+
+try {
+    if ($Scenario -eq 'backend') {
+        $invocation = @(Invoke-FormalStart -BackendPort 18021 -FrontendPort 15181 `
+            -BackendLauncher {
+                $null = New-F2BFake 'backend'
+                throw 'f2b-backend-created-before-return'
+            } `
+            -FrontendLauncher { throw 'f2b-frontend-not-reached' } `
+            -HealthCheck { param($url) $false })
+    }
+    else {
+        $invocation = @(Invoke-FormalStart -BackendPort 18021 -FrontendPort 15181 `
+            -BackendLauncher {
+                $p = New-F2BFake 'backend'
+                [pscustomobject]@{ Process = $p; Error = $null }
+            } `
+            -FrontendLauncher {
+                $null = New-F2BFake 'frontend'
+                throw 'f2b-frontend-created-before-return'
+            } `
+            -HealthCheck { param($url) $false })
+    }
+
+    $product = $invocation | Where-Object {
+        $null -ne $_.PSObject.Properties['ExitCode']
+    } | Select-Object -Last 1
+    Write-F2BResult $product $null
+}
+catch {
+    Write-F2BResult $null $_.Exception.Message
+}
+"""
+
+_F2B_IDENTITY = r"""
+$ErrorActionPreference = 'Stop'
+$identityPath = '__IDENTITY__'
+$kill = __KILL__
+try {
+    $i = Get-Content -LiteralPath $identityPath -Raw | ConvertFrom-Json
+    $processId = [int]$i.pid
+    $reg = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
+
+    if ($null -eq $reg -or $null -eq $cim) {
+        [ordered]@{ status = 'ALREADY_EXITED'; pid = $processId } |
+            ConvertTo-Json -Compress
+        exit 0
+    }
+
+    try {
+        $sameName = $reg.ProcessName -eq [string]$i.name
+        $sameStart = $reg.StartTime.ToUniversalTime().ToString('o') -eq [string]$i.start_time
+        $sameCommand = $cim.CommandLine -eq [string]$i.command_line
+    }
+    catch {
+        [ordered]@{ status = 'NOT_VERIFIED'; pid = $processId; error = $_.Exception.Message } |
+            ConvertTo-Json -Compress
+        exit 0
+    }
+
+    if (-not ($sameName -and $sameStart -and $sameCommand)) {
+        [ordered]@{ status = 'IDENTITY_MISMATCH'; pid = $processId } |
+            ConvertTo-Json -Compress
+        exit 0
+    }
+
+    if (-not $kill) {
+        [ordered]@{ status = 'PRESENT_MATCH'; pid = $processId } |
+            ConvertTo-Json -Compress
+        exit 0
+    }
+
+    try {
+        Stop-Process -Id $processId -Force -ErrorAction Stop
+        for ($n = 0; $n -lt 50; $n++) {
+            if ($null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+                [ordered]@{ status = 'CLEANED'; pid = $processId } |
+                    ConvertTo-Json -Compress
+                exit 0
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        [ordered]@{ status = 'CLEANUP_FAILED'; pid = $processId } |
+            ConvertTo-Json -Compress
+    }
+    catch {
+        [ordered]@{ status = 'CLEANUP_FAILED'; pid = $processId; error = $_.Exception.Message } |
+            ConvertTo-Json -Compress
+    }
+}
+catch {
+    [ordered]@{ status = 'NOT_VERIFIED'; error = $_.Exception.Message } |
+        ConvertTo-Json -Compress
+}
+"""
+
+
+def _ps_quote(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _run_f2b_case(tmp_path: Path, scenario: str) -> tuple[dict, list[dict]]:
+    side = tmp_path / f"f2b-{scenario}-identities.json"
+    result_path = tmp_path / f"f2b-{scenario}-result.json"
+    script = (
+        _F2B_PROBE.replace("__REPO__", _ps_quote(str(ROOT)))
+        .replace("__SIDE__", _ps_quote(str(side)))
+        .replace("__RESULT__", _ps_quote(str(result_path)))
+        .replace("__SCENARIO__", scenario)
+    )
+    proc = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=90,
+        check=False,
+    )
+    assert result_path.is_file(), (
+        f"F2-B probe did not write {result_path}; "
+        f"stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    identities = json.loads(side.read_text(encoding="utf-8-sig"))["identities"]
+    return result, identities
+
+
+def _f2b_identity_status(
+    tmp_path: Path, identity: dict, *, kill: bool
+) -> dict:
+    identity_path = tmp_path / f"f2b-identity-{identity['pid']}.json"
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    script = (
+        _F2B_IDENTITY.replace("__IDENTITY__", _ps_quote(str(identity_path)))
+        .replace("__KILL__", "$true" if kill else "$false")
+    )
+    proc = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        f"identity helper exit={proc.returncode}; "
+        f"stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+    )
+    return json.loads(proc.stdout)
+
+
+def _cleanup_f2b(tmp_path: Path, identities: list[dict]) -> list[dict]:
+    results = []
+    for identity in identities:
+        results.append(_f2b_identity_status(tmp_path, identity, kill=True))
+    return results
+
+
+def test_f2b_backend_created_then_launcher_throws(tmp_path: Path) -> None:
+    cleanup: list[dict] = []
+    try:
+        result, identities = _run_f2b_case(tmp_path, "backend")
+        assert result["scenario"] == "backend"
+        assert result["product_exit"] == 1
+        assert result["started_ids"] == []
+        assert result["cleanup"] == []
+        assert "f2b-backend-created-before-return" in result["error"]
+        assert len(identities) == 1
+
+        backend = identities[0]
+        assert backend["scenario"] == "backend"
+        assert backend["command_line"]
+        assert int(backend["pid"]) in result["fake_alive_after_core"]
+
+        status = _f2b_identity_status(tmp_path, backend, kill=False)
+        assert status["status"] == "PRESENT_MATCH", status
+    finally:
+        cleanup = _cleanup_f2b(tmp_path, locals().get("identities", []))
+
+    assert cleanup, "test-owned backend fake was not recorded"
+    assert cleanup[0]["status"] in {"CLEANED", "ALREADY_EXITED"}, cleanup
+
+
+def test_f2b_frontend_created_then_launcher_throws(tmp_path: Path) -> None:
+    cleanup: list[dict] = []
+    try:
+        result, identities = _run_f2b_case(tmp_path, "frontend")
+        assert result["scenario"] == "frontend"
+        assert result["product_exit"] == 1
+        assert "f2b-frontend-created-before-return" in result["error"]
+        assert len(identities) == 2
+
+        backend = next(item for item in identities if item["scenario"] == "backend")
+        frontend = next(item for item in identities if item["scenario"] == "frontend")
+
+        assert result["started_ids"] == [int(backend["pid"])]
+        assert result["cleanup"] == [
+            {"id": int(backend["pid"]), "status": "CLEANED"}
+        ]
+        assert int(frontend["pid"]) in result["fake_alive_after_core"]
+        assert int(frontend["pid"]) not in result["started_ids"]
+
+        backend_status = _f2b_identity_status(tmp_path, backend, kill=False)
+        frontend_status = _f2b_identity_status(tmp_path, frontend, kill=False)
+        assert backend_status["status"] == "ALREADY_EXITED", backend_status
+        assert frontend_status["status"] == "PRESENT_MATCH", frontend_status
+    finally:
+        cleanup = _cleanup_f2b(tmp_path, locals().get("identities", []))
+
+    assert len(cleanup) == 2, "test-owned fakes were not recorded"
+    assert all(item["status"] in {"CLEANED", "ALREADY_EXITED"} for item in cleanup), cleanup
