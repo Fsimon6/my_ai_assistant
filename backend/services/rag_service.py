@@ -796,15 +796,25 @@ class RagService:
         model: Optional[str] = None,
         api_key: Optional[str] = None,
         document_id: Optional[str] = None,
+        sources_out: Optional[List[Dict[str, Any]]] = None,
+        error_out: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[str]:
         """RAG查询（集成缓存优化）
 
         user_id: 用于缓存键隔离 + 向量检索按用户过滤，避免跨用户数据泄露。
         model/api_key: 角色级配置（两者都填才生效），用于覆盖全局默认模型。
         document_id: 可选，限定只在该文档内检索（按文档查询/预览场景）。
+        sources_out: 可选，调用方提供的请求级容器；检索后写入真实来源。
+        error_out: 可选，调用方提供的请求级容器；异常时写入错误信息。
         """
-        # 按文档检索不走全局缓存，避免不同文档的查询结果被同一 cache key 污染
-        use_cache = document_id is None
+        if sources_out is not None:
+            sources_out.clear()
+        if error_out is not None:
+            error_out.clear()
+
+        # 按文档检索不走全局缓存，避免不同文档的查询结果被同一 cache key 污染。
+        # 需要 sources 的调用绕过缓存，避免缓存命中时返回空来源或上一轮来源。
+        use_cache = document_id is None and sources_out is None
         cache_key = CacheKey.rag_query(query, context_count, user_id) if use_cache else None
         if use_cache:
             cached_result = await self.cache.get(cache_key)
@@ -830,6 +840,10 @@ class RagService:
                 filter_dict=filter_dict
             )
 
+            # 请求级来源：只来自本次检索结果，不使用缓存/全局状态。
+            if sources_out is not None:
+                sources_out.extend(self._extract_sources(search_results))
+
             # 2. 构建上下文
             context = self._build_context(search_results)
 
@@ -852,7 +866,65 @@ class RagService:
 
         except Exception as e:
             logger.error(f'RAG查询失败：{e}')
+            if sources_out is not None:
+                sources_out.clear()
+            if error_out is not None:
+                error_out['error'] = str(e)
             yield f'抱歉，查询过程中出现错误：{str(e)}'
+
+    @staticmethod
+    def _extract_sources(
+        search_results: List[Dict[str, Any]],
+        snippet_chars: int = 240,
+    ) -> List[Dict[str, Any]]:
+        """从本次检索结果提取可展示来源；按 document_id + chunk_index 去重。
+
+        只使用真实 metadata/content/score；缺少 document_id 的结果不能作为来源。
+        """
+        sources: List[Dict[str, Any]] = []
+        seen = set()
+        for result in search_results or []:
+            metadata = result.get('metadata') or {}
+            document_id = metadata.get('document_id')
+            if not document_id:
+                continue
+            chunk_index = metadata.get('chunk_index')
+            if chunk_index is not None:
+                try:
+                    chunk_index = int(chunk_index)
+                except (TypeError, ValueError):
+                    chunk_index = None
+
+            content = result.get('content') or ''
+            # 有有效 chunk_index 时按 (document_id, chunk_index) 去重；
+            # 缺失/无效时退化为 (document_id, 完整 content)，避免把同文档不同片段误删。
+            if chunk_index is not None:
+                key = (str(document_id), 'chunk', chunk_index)
+            else:
+                key = (str(document_id), 'content', content)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            snippet = content.strip()
+            if len(snippet) > snippet_chars:
+                snippet = snippet[:snippet_chars]
+
+            score = result.get('score')
+            if score is not None:
+                try:
+                    score = float(score)
+                except (TypeError, ValueError):
+                    score = None
+
+            sources.append({
+                'document_id': str(document_id),
+                'filename': metadata.get('filename') or metadata.get('source') or None,
+                'chunk_index': chunk_index,
+                'score': score,
+                'snippet': snippet,
+            })
+        return sources
 
     @staticmethod
     def _build_context(search_results: List[Dict[str, Any]]) -> str:
@@ -909,12 +981,20 @@ class RagService:
         model: Optional[str] = None,
         api_key: Optional[str] = None,
         document_id: Optional[str] = None,
+        sources_out: Optional[List[Dict[str, Any]]] = None,
+        error_out: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[str]:
         """带历史记录的查询（按归属用户过滤向量检索）
 
         model/api_key: 角色级配置（两者都填才生效），用于覆盖全局默认模型。
         document_id: 可选，限定只在该文档内检索。
+        sources_out/error_out: 请求级输出容器，禁止跨请求共享。
         """
+        if sources_out is not None:
+            sources_out.clear()
+        if error_out is not None:
+            error_out.clear()
+
         try:
             # 1. 检索相关文档（按归属用户 + 可选 document_id 过滤）
             # Chroma where 仅支持单操作符；多条件用 $and 包裹
@@ -932,6 +1012,10 @@ class RagService:
                 filter_dict=filter_dict
             )
 
+            # 请求级来源：只来自本次检索结果，不使用缓存/全局状态。
+            if sources_out is not None:
+                sources_out.extend(self._extract_sources(search_results))
+
             # 2. 构建上下文
             context = self._build_context(search_results)
 
@@ -945,6 +1029,10 @@ class RagService:
 
         except Exception as e:
             logger.error(f'带历史查询失败：{e}')
+            if sources_out is not None:
+                sources_out.clear()
+            if error_out is not None:
+                error_out['error'] = str(e)
             yield f'抱歉，查询过程中出现错误：{str(e)}'
 
     @staticmethod

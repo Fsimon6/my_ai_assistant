@@ -1,11 +1,13 @@
 import { ref, onUnmounted } from "vue"
 import { request } from '@/utils/requests.ts'
 import { buildApiUrl } from '@/utils/apiBase'
+import type { RagSource } from '@/types/rag'
 
 export interface StreamingMessage {
   type: 'chunk' | 'complete' | 'error'
   content: string
   fullResponse?: string
+  sources?: RagSource[]
   timestamp?: string
   total_length?: number
   error?: string
@@ -18,7 +20,7 @@ export interface StreamingOptions {
   /** 自定义请求体构造器；不传则使用 { message } */
   buildBody?: (message: string) => any
   onChunk?: (chunk: string, accumulated: string) => void
-  onComplete?: (fullResponse: string) => void
+  onComplete?: (fullResponse: string, sources: RagSource[]) => void
   onError?: (error: Error) => void
 }
 
@@ -84,7 +86,10 @@ export function useStreamingChat(options: StreamingOptions) {
             break
           case 'complete':
             completed = true
-            options.onComplete?.(data.fullResponse ?? accumulatedText.value)
+            options.onComplete?.(
+              data.fullResponse ?? accumulatedText.value,
+              Array.isArray(data.sources) ? data.sources : []
+            )
             break
           case 'error':
             errored = true
@@ -135,7 +140,7 @@ export function useStreamingChat(options: StreamingOptions) {
         if (error.value) {
           options.onError?.(new Error(error.value))
         } else {
-          options.onComplete?.(accumulatedText.value)
+          options.onComplete?.(accumulatedText.value, [])
         }
       }
     } catch (err: any) {

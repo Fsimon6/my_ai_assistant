@@ -78,6 +78,15 @@ export interface SearchResponse {
   searchTime: number
 }
 
+// RAG 回答引用来源（仅来自当前请求真实检索结果）
+export interface RagSource {
+  document_id: string
+  filename?: string | null
+  chunk_index?: number | null
+  score?: number | null
+  snippet?: string
+}
+
 // 知识库统计
 export interface KnowledgeStats {
   totalDocuments: number

@@ -252,7 +252,20 @@ async def speak_to_character_stream(
     async def generate():
         full_response = ''
         lock = None
+        conv_id = None
+        user_message_id = None
+        assistant_saved = False
         effective_model = settings.LLM_MODEL  # 默认全局模型；保证异常分支始终有定义，避免 UnboundLocalError
+
+        def _mark_failed() -> None:
+            if conv_id is None or user_message_id is None or assistant_saved:
+                return
+            try:
+                conversation_service.mark_message_failed(
+                    user_message_id, conv_id, current_user.id)
+            except Exception as me:
+                logger.warning('标记聊天失败消息异常（忽略）：%s', me)
+
         try:
             # 角色设定（已在接口层做归属查询与 404，此处直接使用）
             system_prompt = character.system_prompt
@@ -294,7 +307,7 @@ async def speak_to_character_stream(
                 lock = conv_locks.setdefault(conv_id, asyncio.Lock())
                 await lock.acquire()
                 # 先落库用户消息（来源标记 = 普通聊天）
-                conversation_service.append_message(
+                user_message_id = conversation_service.append_message(
                     conv_id, 'user', request.message, effective_model,
                     meta_info={'source': SOURCE_CHAT},
                 )
@@ -324,6 +337,7 @@ async def speak_to_character_stream(
                     conv_id, 'assistant', full_response, effective_model,
                     meta_info={'source': SOURCE_CHAT},
                 )
+                assistant_saved = True
 
             yield json.dumps({
                 "type": "complete",
@@ -333,20 +347,18 @@ async def speak_to_character_stream(
             }) + "\n"
         except Exception as e:
             logger.error(f"流式对话LLM调用失败：{e}")
-            # Streaming 中断/异常时补一条明确的失败助手消息，保持 user/assistant 历史对称
-            if conv_id is not None:
-                try:
-                    conversation_service.append_message(
-                        conv_id, 'assistant', '（内容生成失败，请重试）', effective_model,
-                        meta_info={'source': SOURCE_CHAT},
-                    )
-                except Exception:
-                    pass
+            # 失败请求不写 assistant 占位；只标记当前 user 消息，避免污染后续上下文。
+            _mark_failed()
             yield json.dumps({
                 "type": "error",
                 "error": str(e),
                 "timestamp": datetime.now().isoformat(),
             }) + "\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            # 客户端断开/取消/生成器关闭：标记失败后原样抛出；不吞取消信号，
+            # 也不把 KeyboardInterrupt/SystemExit 当作普通请求失败。
+            _mark_failed()
+            raise
         finally:
             if lock is not None:
                 try:

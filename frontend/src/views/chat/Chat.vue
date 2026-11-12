@@ -461,6 +461,27 @@
                     </div>
                   </div>
 
+                  <!-- RAG 参考来源：仅展示当前请求真实检索结果 -->
+                  <div
+                    v-if="message.isRAG && message.sources && message.sources.length"
+                    class="rag-sources"
+                  >
+                    <div class="rag-sources-title">参考来源</div>
+                    <div
+                      v-for="(source, sourceIndex) in message.sources"
+                      :key="`${source.document_id}-${source.chunk_index}-${sourceIndex}`"
+                      class="rag-source-item"
+                    >
+                      <div class="rag-source-head">
+                        <span class="rag-source-file">{{ ragSourceLabel(source) }}</span>
+                        <span v-if="source.chunk_index !== null && source.chunk_index !== undefined" class="rag-source-chunk">
+                          片段 {{ source.chunk_index }}
+                        </span>
+                      </div>
+                      <div v-if="source.snippet" class="rag-source-snippet">{{ source.snippet }}</div>
+                    </div>
+                  </div>
+
                 <!-- 消息操作 -->
                 <div class="message-actions">
                   <el-button
@@ -607,9 +628,11 @@ import type {
 } from "@/services/api"
 import FileUploader from '@/components/chat/FileUploader.vue'
 import type { Character, SpeakResponse } from "@/types/character"
+import type { RagSource } from '@/types/rag'
 import { useStreamingChat } from '@/composables/useStreamingChat'
 // 第 3 项「结果与可解释性」：历史消息的结构化结果恢复（复用本文件既有的 4 个 builder）
 import { restoreExcelHistory } from './excelHistory'
+import { normalizeRagSources, ragSourceLabel } from './ragSources'
 // 第 3 项 P2：卡片文案纯函数（G1 行区间 / G2 可数值化个数 / G5 条件放宽说明 / R1 本页行号 / R4 第 2 步来源）
 import {
   groupRelaxedLabel,
@@ -926,14 +949,14 @@ const sendRAGMessage = async (message: string) => {
         messages.value[aiMessageIndex].content = accumulated
         scrollToBottom()
       },
-      onComplete: (fullResponse: string) => {
+      onComplete: (fullResponse: string, sources: RagSource[] = []) => {
         messages.value[aiMessageIndex] = {
           role: 'assistant',
           content: fullResponse,
           timestamp: new Date().toISOString(),
           isStreaming: false,
           isRAG: true,
-          sources: [],
+          sources: normalizeRagSources(sources),
           fromKnowledgeBase: true
         }
         isLoading.value = false
@@ -2371,5 +2394,57 @@ watch(messages, () => {
       color: var(--text-primary, #303133);
     }
   }
+}
+
+.rag-sources {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--el-color-primary-light-5, #a0cfff);
+  background: var(--el-color-primary-light-9, #ecf5ff);
+  border-radius: 6px;
+}
+
+.rag-sources-title {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary, #303133);
+}
+
+.rag-source-item {
+  padding: 6px 0;
+  border-top: 1px dashed var(--el-color-primary-light-7, #c6e2ff);
+
+  &:first-of-type {
+    border-top: 0;
+    padding-top: 0;
+  }
+}
+
+.rag-source-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.rag-source-file {
+  font-weight: 600;
+  color: var(--el-color-primary-dark-2, #337ecc);
+  word-break: break-all;
+}
+
+.rag-source-chunk {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.rag-source-snippet {
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>

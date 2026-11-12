@@ -2,6 +2,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form, R
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
+import asyncio
 import json
 import os
 import logging
@@ -180,6 +181,8 @@ async def query_document(
         if req.stream:
             async def generate():
                 full_response = ''
+                sources = []
+                error = {}
                 async for chunk in rag_service.rag_query(
                     query=req.query,
                     context_count=req.context_count,
@@ -187,7 +190,9 @@ async def query_document(
                     user_id=current_user.id,
                     model=char_model,
                     api_key=char_api_key,
-                    document_id=req.document_id
+                    document_id=req.document_id,
+                    sources_out=sources,
+                    error_out=error,
                 ):
                     full_response += chunk
                     yield json.dumps({
@@ -200,6 +205,7 @@ async def query_document(
                 yield json.dumps({
                     'type': 'complete',
                     'content': full_response,
+                    'sources': sources,
                     'timestamp': datetime.now().isoformat()
                 }) + '\n'
 
@@ -213,6 +219,8 @@ async def query_document(
             )
         else:
             response_text = ''
+            sources = []
+            error = {}
             async for chunk in rag_service.rag_query(
                 query=req.query,
                 context_count=req.context_count,
@@ -220,13 +228,16 @@ async def query_document(
                 user_id=current_user.id,
                 model=char_model,
                 api_key=char_api_key,
-                document_id=req.document_id
+                document_id=req.document_id,
+                sources_out=sources,
+                error_out=error,
             ):
                 response_text += chunk
 
             return {
                 'success': True,
                 'response': response_text,
+                'sources': sources,
                 'query': req.query,
                 'timestamp': datetime.now().isoformat()
             }
@@ -284,43 +295,62 @@ async def query_with_history(
             char_api_key = character.api_key
 
         # ===== 对话历史持久化（与 main.py:/speak/stream 同一策略）=====
-        # 背景：本端点是「启用知识库」后的聊天入口，此前完全没有落库逻辑，
-        # 导致开启知识库后聊天记录无法保存。此处只复用 conversation_service：
-        #   * 流式开始前写入 user 消息；
-        #   * 流式完整结束后写入一次 assistant 消息（不按 chunk 写库）；
-        #   * 异常时补写失败占位，保持 user/assistant 对称。
         # character_id 缺失时 conv_id 为 None → 全部跳过，保持旧行为（向后兼容）。
-        # 不改变任何请求/响应契约；持久化失败只记日志，绝不影响查询响应。
+        # 失败时只标记当前 user 消息 failed，不写 assistant 失败占位。
         conv_id = _resolve_rag_conversation_id(req.character_id, current_user.id)
         effective_model = char_model if (char_model and char_api_key) else settings.LLM_MODEL
 
-        def _persist_message(role: str, content: str) -> None:
-            """写入一条对话记录（来源标记 = 知识库）；
-            任何失败只记日志，绝不冒泡影响本次查询。"""
-            if conv_id is None or not content:
-                return
+        # 有 character_id 时以服务端历史为权威，排除 failed 与 Excel 工具轮次；
+        # 无 character_id 时保持旧行为，使用调用方传入 history。
+        history_for_rag = req.history
+        if conv_id is not None:
             try:
-                conversation_service.append_message(
+                history_for_rag = conversation_service.get_history(
+                    conv_id, exclude_sources=[SOURCE_EXCEL])
+            except Exception as he:
+                logger.warning('读取 RAG 服务端历史失败，使用空历史：%s', he)
+                history_for_rag = []
+
+        def _persist_message(role: str, content: str) -> Optional[int]:
+            """写入一条对话记录；返回消息 id，失败只记日志。"""
+            if conv_id is None or not content:
+                return None
+            try:
+                return conversation_service.append_message(
                     conv_id, role, content, effective_model,
                     meta_info={'source': SOURCE_RAG},
                 )
             except Exception as pe:
                 logger.warning('保存 RAG 对话记录失败（忽略）：%s', pe)
+                return None
+
+        def _mark_failed(message_id: Optional[int], assistant_saved: bool = False) -> None:
+            if conv_id is None or message_id is None or assistant_saved:
+                return
+            try:
+                conversation_service.mark_message_failed(
+                    message_id, conv_id, current_user.id)
+            except Exception as me:
+                logger.warning('标记 RAG 失败消息异常（忽略）：%s', me)
 
         if req.stream:
             async def generate():
                 full_response = ''
-                # 流式开始前先落库用户消息
-                _persist_message('user', req.query)
+                sources = []
+                error = {}
+                assistant_saved = False
+                user_message_id = _persist_message('user', req.query)
                 try:
                     async for chunk in rag_service.query_with_history(
                         query=req.query,
-                        history=req.history,
+                        history=history_for_rag,
                         context_count=req.context_count,
                         user_id=current_user.id,
                         model=char_model,
                         api_key=char_api_key,
-                        document_id=req.document_id
+                        document_id=req.document_id,
+                        sources_out=sources,
+                        error_out=error,
                     ):
                         full_response += chunk
                         yield json.dumps({
@@ -329,19 +359,29 @@ async def query_with_history(
                             'timestamp': datetime.now().isoformat()
                         }) + '\n'
 
+                    if error:
+                        _mark_failed(user_message_id, assistant_saved)
+                        yield json.dumps({
+                            'type': 'error',
+                            'error': error.get('error') or 'RAG 查询失败',
+                            'timestamp': datetime.now().isoformat()
+                        }) + '\n'
+                        return
+
                     # 流式完整结束后写一次 AI 回复（不按 chunk 写库）
                     _persist_message('assistant', full_response)
+                    assistant_saved = True
 
                     # 与普通 Chat 流式协议保持一致：末尾补 complete 帧（携带完整内容）
                     yield json.dumps({
                         'type': 'complete',
                         'content': full_response,
+                        'sources': sources,
                         'timestamp': datetime.now().isoformat()
                     }) + '\n'
-                except Exception as se:
-                    logger.error(f'RAG 流式查询失败：{se}')
-                    # 与 /speak/stream 一致：异常时补一条失败助手消息，保持历史对称
-                    _persist_message('assistant', '（内容生成失败，请重试）')
+                except (asyncio.CancelledError, GeneratorExit):
+                    # 只处理取消/生成器关闭；不把 KeyboardInterrupt/SystemExit 当作请求失败。
+                    _mark_failed(user_message_id, assistant_saved)
                     raise
 
             return StreamingResponse(
@@ -354,27 +394,41 @@ async def query_with_history(
             )
         else:
             response_text = ''
-            _persist_message('user', req.query)
+            sources = []
+            error = {}
+            user_message_id = _persist_message('user', req.query)
             try:
                 async for chunk in rag_service.query_with_history(
                     query=req.query,
-                    history=req.history,
+                    history=history_for_rag,
                     context_count=req.context_count,
                     user_id=current_user.id,
                     model=char_model,
                     api_key=char_api_key,
-                    document_id=req.document_id
+                    document_id=req.document_id,
+                    sources_out=sources,
+                    error_out=error,
                 ):
                     response_text += chunk
+                if error:
+                    _mark_failed(user_message_id)
+                    return {
+                        'success': False,
+                        'response': response_text,
+                        'sources': [],
+                        'error': error.get('error') or 'RAG 查询失败',
+                        'query': req.query,
+                        'timestamp': datetime.now().isoformat()
+                    }
                 _persist_message('assistant', response_text)
-            except Exception:
-                # 异常同样补失败占位（与外层 500 处理各司其职：这里只补历史对称）
-                _persist_message('assistant', '（内容生成失败，请重试）')
+            except (asyncio.CancelledError, GeneratorExit):
+                _mark_failed(user_message_id)
                 raise
 
             return {
                 'success': True,
                 'response': response_text,
+                'sources': sources,
                 'query': req.query,
                 'timestamp': datetime.now().isoformat()
             }

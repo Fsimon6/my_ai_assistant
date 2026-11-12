@@ -31,6 +31,10 @@ from backend.models.character import Conversation, Text
 # 消息来源标记：写入 texts.meta_info['source']，用于按能力隔离 LLM 上下文
 SOURCE_CHAT = 'chat'      # 普通角色聊天
 SOURCE_RAG = 'rag'        # 知识库检索问答
+
+# 旧版本在 Provider 异常时写入的 assistant 占位文本（124dece / 17f8829）。
+# 仅做精确文本过滤；不改数据库，不按“失败/重试”等宽泛关键词误伤正常回答。
+LEGACY_FAILED_ASSISTANT_CONTENT = '（内容生成失败，请重试）'
 SOURCE_EXCEL = 'excel'    # Excel 表格查询（独立工具能力）
 
 
@@ -94,6 +98,13 @@ class ConversationService:
                 meta = t.meta_info if isinstance(t.meta_info, dict) else None
                 if excluded and (meta or {}).get('source') in excluded:
                     continue
+                # 失败请求不进入历史/模型上下文；旧消息没有 status 时保持原行为。
+                if (meta or {}).get('status') == 'failed':
+                    continue
+                # 兼容旧版本写入的 assistant 失败占位：精确文本过滤，保留数据库原记录。
+                if (t.role == 'assistant'
+                        and (t.content or '').strip() == LEGACY_FAILED_ASSISTANT_CONTENT):
+                    continue
                 messages.append({
                     'role': t.role,
                     'content': t.content,
@@ -111,10 +122,10 @@ class ConversationService:
             content: str,
             model: Optional[str] = None,
             meta_info: Optional[Dict] = None,
-    ) -> None:
-        """写入一条消息（user 在流式前；assistant 在流式完整结束后写一次）
+    ) -> Optional[int]:
+        """写入一条消息，返回消息 id（供失败时精确标记当前消息）。
 
-        meta_info: 消息元数据（本阶段为 {'source': SOURCE_CHAT|SOURCE_RAG|SOURCE_EXCEL}）。
+        meta_info: 消息元数据（本阶段为 {'source': ...}）。
             默认 None → 与旧行为完全一致（列写 NULL，不参与任何来源过滤）。
         """
         db = SessionLocal()
@@ -128,6 +139,42 @@ class ConversationService:
             )
             db.add(text)
             db.commit()
+            return text.id
+        finally:
+            db.close()
+
+    def mark_message_failed(
+            self,
+            message_id: int,
+            conversation_id: int,
+            user_id: int,
+    ) -> bool:
+        """把当前请求的 user 消息标记为 failed；保留已有 meta_info 字段。
+
+        只允许修改属于指定 conversation + user 的消息；找不到返回 False。
+        """
+        db = SessionLocal()
+        try:
+            conversation = db.query(Conversation).filter(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id,
+            ).first()
+            if conversation is None:
+                return False
+            text = db.query(Text).filter(
+                Text.id == message_id,
+                Text.conversation_id == conversation_id,
+            ).first()
+            if text is None:
+                return False
+            meta = dict(text.meta_info) if isinstance(text.meta_info, dict) else {}
+            meta['status'] = 'failed'
+            text.meta_info = meta
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 
