@@ -1,4 +1,4 @@
-import { ref, onUnmounted } from "vue"
+import { ref, onUnmounted, getCurrentInstance } from "vue"
 import { request } from '@/utils/requests.ts'
 import { buildApiUrl } from '@/utils/apiBase'
 import type { RagSource } from '@/types/rag'
@@ -13,6 +13,9 @@ export interface StreamingMessage {
   error?: string
 }
 
+export type StreamTerminal = 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'unknown'
+export type StreamInterruptedReason = 'eof' | 'network' | 'protocol'
+
 export interface StreamingOptions {
   characterId?: string
   /** 自定义流式端点相对路径（如 RAG：/api/v1/rag/query）；不传则使用普通 Chat 端点 */
@@ -22,6 +25,10 @@ export interface StreamingOptions {
   onChunk?: (chunk: string, accumulated: string) => void
   onComplete?: (fullResponse: string, sources: RagSource[]) => void
   onError?: (error: Error) => void
+  /** 用户主动取消；组件卸载不会触发该回调 */
+  onCancelled?: (partialText: string) => void
+  /** EOF、网络读取异常或协议错误；部分文本仅供当前 UI 展示 */
+  onInterrupted?: (partialText: string, reason: StreamInterruptedReason) => void
 }
 
 export function useStreamingChat(options: StreamingOptions) {
@@ -30,20 +37,111 @@ export function useStreamingChat(options: StreamingOptions) {
   const error = ref<string | null>(null)
   const abortController = ref<AbortController | null>(null)
 
+  let requestGeneration = 0
+  let activeGeneration = 0
+  let terminal: StreamTerminal | null = null
+  let cancelReason: 'user' | 'unmount' | null = null
+
+  const isCurrent = (generation: number) => (
+    generation === requestGeneration && generation === activeGeneration
+  )
+
+  const safeCallback = (fn: (() => void) | undefined) => {
+    if (!fn) return
+    try {
+      fn()
+    } catch (callbackError) {
+      // 业务回调异常必须与 SSE 数据解析异常隔离：记录，但不改变终态。
+      console.error('流式终态回调执行失败：', callbackError)
+    }
+  }
+
+  const settle = (status: StreamTerminal, generation: number): boolean => {
+    if (!isCurrent(generation) || terminal !== null) return false
+    terminal = status
+    return true
+  }
+
+  const finishInterrupted = (
+    generation: number,
+    reason: StreamInterruptedReason,
+    message: string,
+  ) => {
+    if (!settle('interrupted', generation)) return
+    error.value = message
+    safeCallback(() => options.onInterrupted?.(accumulatedText.value, reason))
+  }
+
+  const finishProtocolError = (generation: number) => {
+    if (!settle('unknown', generation)) return
+    error.value = '流式响应协议错误'
+    safeCallback(() => options.onInterrupted?.(accumulatedText.value, 'protocol'))
+  }
+
   const sendMessage = async (message: string): Promise<void> => {
     if (isStreaming.value) {
       throw new Error('已有请求在进行中')
     }
 
+    const generation = ++requestGeneration
+    activeGeneration = generation
+    terminal = null
+    cancelReason = null
+
     isStreaming.value = true
     error.value = null
     accumulatedText.value = ''
-    abortController.value = new AbortController()
+    const controller = new AbortController()
+    abortController.value = controller
+
+    const handleData = (data: StreamingMessage) => {
+      if (terminal !== null) return
+
+      switch (data.type) {
+        case 'chunk':
+          if (typeof data.content !== 'string') {
+            finishProtocolError(generation)
+            return
+          }
+          accumulatedText.value += data.content
+          safeCallback(() => options.onChunk?.(data.content, accumulatedText.value))
+          break
+        case 'complete':
+          if (!settle('completed', generation)) return
+          safeCallback(() => options.onComplete?.(
+            typeof data.fullResponse === 'string' ? data.fullResponse : accumulatedText.value,
+            Array.isArray(data.sources) ? data.sources : []
+          ))
+          break
+        case 'error':
+          if (!settle('failed', generation)) return
+          error.value = typeof data.error === 'string' && data.error ? data.error : '流式响应错误'
+          safeCallback(() => options.onError?.(new Error(error.value || '未知错误')))
+          break
+        default:
+          // 未知帧不改变终态；若之后没有合法 complete/error，EOF 会按 INTERRUPTED 处理。
+          break
+      }
+    }
+
+    const handleLine = (line: string) => {
+      if (!isCurrent(generation) || terminal !== null) return
+
+      let data: StreamingMessage
+      try {
+        data = JSON.parse(line)
+      } catch {
+        finishProtocolError(generation)
+        return
+      }
+      if (!data || typeof data !== 'object' || typeof data.type !== 'string') {
+        finishProtocolError(generation)
+        return
+      }
+      handleData(data)
+    }
 
     try {
-      // 浏览器 XHR 不支持 responseType:'stream'（axios 会把整段 ndjson 缓冲成字符串），
-      // 因此这里改用原生 fetch + ReadableStream 实现真正的逐 token 流式读取。
-      // URL 拼接复刻 axios 的 combineURLs：相对路径优先走同源（Vite 代理 /api）。
       const baseURL = (request.defaults.baseURL || '').replace(/\/+$/, '')
       const relPath = options.url || `/api/v1/characters/${options.characterId}/speak/stream`
       const url = buildApiUrl(baseURL, relPath)
@@ -57,7 +155,7 @@ export function useStreamingChat(options: StreamingOptions) {
           ...(token ? { Authorization: `Bearer ${token}` } : {})
         },
         body: JSON.stringify(options.buildBody ? options.buildBody(message) : { message }),
-        signal: abortController.value?.signal
+        signal: controller.signal
       })
 
       if (!resp.ok) {
@@ -67,106 +165,123 @@ export function useStreamingChat(options: StreamingOptions) {
           const j = JSON.parse(t)
           msg = j.message || j.detail || msg
         } catch {
-          /* ignore parse error */
+          /* ignore body parse error */
         }
-        throw new Error(msg)
+        if (settle('failed', generation)) {
+          error.value = msg
+          safeCallback(() => options.onError?.(new Error(msg)))
+        }
+        return
       }
 
       const decoder = new TextDecoder('utf-8')
       let buffer = ''
-      let completed = false
-      let errored = false
+      let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+      let readerFinished = false
 
-      const handleLine = (line: string) => {
-        const data: StreamingMessage = JSON.parse(line)
-        switch (data.type) {
-          case 'chunk':
-            accumulatedText.value += data.content
-            options.onChunk?.(data.content, accumulatedText.value)
-            break
-          case 'complete':
-            completed = true
-            options.onComplete?.(
-              data.fullResponse ?? accumulatedText.value,
-              Array.isArray(data.sources) ? data.sources : []
-            )
-            break
-          case 'error':
-            errored = true
-            error.value = data.error || '流式响应错误'
-            options.onError?.(new Error(data.error || '未知错误'))
-            break
-        }
-      }
-
-      if (resp.body && typeof (resp.body as ReadableStream<Uint8Array>).getReader === 'function') {
-        const reader = (resp.body as ReadableStream<Uint8Array>).getReader()
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buffer += decoder.decode(value, { stream: true })
-          const lines = buffer.split('\n')
-          buffer = lines.pop() ?? ''
-          for (const line of lines) {
-            if (!line.trim()) continue
-            try {
+      try {
+        if (resp.body && typeof (resp.body as ReadableStream<Uint8Array>).getReader === 'function') {
+          reader = (resp.body as ReadableStream<Uint8Array>).getReader()
+          while (terminal === null && isCurrent(generation)) {
+            const { done, value } = await reader.read()
+            if (done) {
+              readerFinished = true
+              break
+            }
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop() ?? ''
+            for (const line of lines) {
+              if (!line.trim()) continue
               handleLine(line)
-            } catch (parseError) {
-              console.error('解析流数据失败：', parseError, line)
+              if (terminal !== null) break
             }
           }
-        }
-        if (buffer.trim()) {
-          try {
+          if (terminal === null && buffer.trim()) {
+            // 合法 complete 即使没有 final newline 也必须成功；被截断的 JSON 进入 UNKNOWN。
             handleLine(buffer.trim())
-          } catch (parseError) {
-            console.error('解析流数据失败：', parseError, buffer)
+          }
+        } else {
+          // 兜底：部分环境把响应缓冲为字符串
+          const text = await resp.text()
+          for (const line of text.split('\n')) {
+            if (!line.trim()) continue
+            handleLine(line)
+            if (terminal !== null) break
           }
         }
-      } else {
-        // 兜底：部分环境把响应缓冲为字符串
-        const text = await resp.text()
-        for (const line of text.split('\n')) {
-          if (!line.trim()) continue
+      } finally {
+        if (reader) {
+          // 自然 EOF 不额外 cancel；只有提前终止（complete/error/protocol/abort/网络失败）才取消读取。
+          if (!readerFinished) {
+            try {
+              // 不使用无界 await：取消失败不能阻塞终态清理。
+              const cancelPromise = reader.cancel()
+              if (cancelPromise && typeof cancelPromise.catch === 'function') {
+                cancelPromise.catch(cancelError => {
+                  console.error('取消流 reader 失败：', cancelError)
+                })
+              }
+            } catch (cancelError) {
+              console.error('取消流 reader 失败：', cancelError)
+            }
+          }
           try {
-            handleLine(line)
-          } catch (parseError) {
-            console.error('解析流数据失败：', parseError, line)
+            reader.releaseLock()
+          } catch (releaseError) {
+            console.error('释放流 reader 失败：', releaseError)
           }
         }
       }
 
-      if (!completed && !errored) {
-        if (error.value) {
-          options.onError?.(new Error(error.value))
-        } else {
-          options.onComplete?.(accumulatedText.value, [])
-        }
+      if (terminal === null) {
+        finishInterrupted(generation, 'eof', '连接已结束，但未收到 complete 终态')
       }
     } catch (err: any) {
-      if (err.name === 'AbortError') {
-        error.value = '请求被取消'
+      if (err?.name === 'AbortError' || controller.signal.aborted) {
+        if (terminal === null) {
+          if (settle('cancelled', generation) && cancelReason === 'user') {
+            error.value = '请求被取消'
+            safeCallback(() => options.onCancelled?.(accumulatedText.value))
+          }
+        }
       } else {
-        error.value = err.message || '流式请求失败'
-        options.onError?.(err)
+        error.value = err?.message || '流式请求失败'
+        finishInterrupted(generation, 'network', error.value)
       }
     } finally {
-      isStreaming.value = false
+      if (isCurrent(generation)) {
+        isStreaming.value = false
+        if (abortController.value === controller) {
+          abortController.value = null
+        }
+      }
+    }
+  }
+
+  const cancel = (reason: 'user' | 'unmount' = 'user') => {
+    const controller = abortController.value
+    if (!controller) return
+    if (terminal === null && settle('cancelled', activeGeneration)) {
+      cancelReason = reason
+      if (reason === 'user') {
+        error.value = '请求被取消'
+        safeCallback(() => options.onCancelled?.(accumulatedText.value))
+      }
+    }
+    // 允许取消后立刻启动新请求；旧请求 finally 通过 generation guard 不会清理新请求。
+    isStreaming.value = false
+    controller.abort()
+    if (abortController.value === controller) {
       abortController.value = null
     }
   }
 
-  const cancel = () => {
-    if (abortController.value) {
-      abortController.value.abort()
-      abortController.value = null
-      isStreaming.value = false
-    }
+  if (getCurrentInstance()) {
+    onUnmounted(() => {
+      cancel('unmount')
+    })
   }
-
-  onUnmounted(() => {
-    cancel()
-  })
 
   return {
     sendMessage,
@@ -176,4 +291,3 @@ export function useStreamingChat(options: StreamingOptions) {
     error
   }
 }
-

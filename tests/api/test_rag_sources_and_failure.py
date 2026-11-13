@@ -116,6 +116,22 @@ def test_rag_query_stream_complete_includes_sources(api, monkeypatch):
     assert complete[0]['sources'] == _sources()
 
 
+def test_rag_query_stream_error_does_not_send_complete(api, monkeypatch):
+    headers = api.user('rag_query_stream_error_user')
+    monkeypatch.setattr(rag_api, 'get_rag_service', lambda: FakeRagService(fail=True))
+
+    resp = api.client.post(
+        '/api/v1/rag/query',
+        headers=headers,
+        json={'query': '会失败的问题', 'stream': True, 'context_count': 3},
+    )
+    assert resp.status_code == 200, resp.text
+    frames = _parse_ndjson(resp.text)
+    assert any(f['type'] == 'chunk' and f['content'] == 'partial answer' for f in frames)
+    assert any(f['type'] == 'error' and 'provider down' in f['error'] for f in frames)
+    assert not any(f['type'] == 'complete' for f in frames)
+
+
 def test_rag_json_includes_sources(api, monkeypatch):
     headers = api.user('rag_sources_json_user')
     monkeypatch.setattr(rag_api, 'get_rag_service', lambda: FakeRagService())

@@ -162,6 +162,10 @@
                   <div v-else class="markdown-content" v-html="renderMarkdown(message.content)">
                   </div>
 
+                  <div v-if="streamTerminalHint(message)" class="stream-terminal-hint">
+                    {{ streamTerminalHint(message) }}
+                  </div>
+
                   <!-- 表格查询结果（Phase 1C）：数据来自后端 representation.json，前端只负责展示 -->
                   <div v-if="message.excelTable" class="excel-answer">
                     <div class="excel-answer-meta">
@@ -633,6 +637,7 @@ import { useStreamingChat } from '@/composables/useStreamingChat'
 // 第 3 项「结果与可解释性」：历史消息的结构化结果恢复（复用本文件既有的 4 个 builder）
 import { restoreExcelHistory } from './excelHistory'
 import { normalizeRagSources, ragSourceLabel } from './ragSources'
+import { buildRagHistory } from './ragHistory'
 // 第 3 项 P2：卡片文案纯函数（G1 行区间 / G2 可数值化个数 / G5 条件放宽说明 / R1 本页行号 / R4 第 2 步来源）
 import {
   groupRelaxedLabel,
@@ -666,6 +671,7 @@ if (messages.value[0]?.role === 'assistant') {
 }
 const inputMessage = ref('')
 const isLoading = ref(false)
+const activeStreamCancel = ref<((reason?: 'user' | 'unmount') => void) | null>(null)
 const showFileUpload = ref(false)
 const enableRAG = ref(false)
 // Phase 1C：自然语言表格查询开关（与知识库 RAG 相互独立，可同时存在）
@@ -730,6 +736,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  activeStreamCancel.value?.('unmount')
+  activeStreamCancel.value = null
   window.removeEventListener('resize', scrollToBottom)
 })
 
@@ -739,6 +747,19 @@ const createWelcomeMessage = () => ({
   content: `你好！我是${character.value?.name || 'AI助手'}，很高兴为您服务！`,
   timestamp: new Date().toISOString()
 })
+
+const streamTerminalHint = (message: any) => {
+  switch (message?.streamStatus) {
+    case 'interrupted':
+      return '当前页面未收到完成确认。'
+    case 'cancelled':
+      return '本次回答已取消。'
+    case 'unknown':
+      return '连接异常，回答未完成。'
+    default:
+      return ''
+  }
+}
 
 // 加载对话历史（Stage 21：进入聊天页或切换角色后从后端恢复历史）
 const loadHistory = async () => {
@@ -832,9 +853,11 @@ const sendNormalMessage = async (message: string) => {
   const userMessage = {
     role: 'user',
     content: message,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    turnStatus: 'streaming'
   }
   messages.value.push(userMessage)
+  const userMessageIndex = messages.value.length - 1
 
   // 添加AI回复占位符
   const aiMessageIndex = messages.value.length
@@ -842,6 +865,8 @@ const sendNormalMessage = async (message: string) => {
     role: 'assistant',
     content: '',
     isStreaming: true,
+    streamStatus: 'streaming',
+    turnStatus: 'streaming',
     timestamp: new Date().toISOString()
   })
 
@@ -855,31 +880,69 @@ const sendNormalMessage = async (message: string) => {
 
     if (useStream) {
       // 流式调用
-      const { sendMessage: sendStreaming } = useStreamingChat({
+      const { sendMessage: sendStreaming, cancel } = useStreamingChat({
         characterId: characterId.value,
         onChunk: (_chunk, accumulated) => {
           messages.value[aiMessageIndex].content = accumulated
           scrollToBottom()
         },
         onComplete: (fullResponse) => {
+          messages.value[userMessageIndex].turnStatus = 'completed'
           messages.value[aiMessageIndex] = {
             role: 'assistant',
             content: fullResponse,
             timestamp: new Date().toISOString(),
-            isStreaming: false
+            isStreaming: false,
+            streamStatus: 'completed',
+            turnStatus: 'completed'
           }
           isLoading.value = false
           scrollToBottom()
         },
         onError: (error) => {
           console.error('流式响应错误:', error)
+          messages.value[userMessageIndex].turnStatus = 'failed'
           messages.value.splice(aiMessageIndex, 1)
           ElMessage.error('请求失败: ' + error.message)
           isLoading.value = false
+        },
+        onInterrupted: (partialText, reason) => {
+          const status = reason === 'protocol' ? 'unknown' : 'interrupted'
+          messages.value[userMessageIndex].turnStatus = status
+          messages.value[aiMessageIndex] = {
+            role: 'assistant',
+            content: partialText,
+            timestamp: new Date().toISOString(),
+            isStreaming: false,
+            streamStatus: status,
+            turnStatus: status
+          }
+          isLoading.value = false
+          scrollToBottom()
+        },
+        onCancelled: (partialText) => {
+          messages.value[userMessageIndex].turnStatus = 'cancelled'
+          messages.value[aiMessageIndex] = {
+            role: 'assistant',
+            content: partialText,
+            timestamp: new Date().toISOString(),
+            isStreaming: false,
+            streamStatus: 'cancelled',
+            turnStatus: 'cancelled'
+          }
+          isLoading.value = false
+          scrollToBottom()
         }
       })
 
-      await sendStreaming(message)
+      activeStreamCancel.value = cancel
+      try {
+        await sendStreaming(message)
+      } finally {
+        if (activeStreamCancel.value === cancel) {
+          activeStreamCancel.value = null
+        }
+      }
     } else {
       // 普通API调用
       const response = await characterStore.speakToCharacter(
@@ -887,19 +950,25 @@ const sendNormalMessage = async (message: string) => {
         message
       )
 
+      messages.value[userMessageIndex].turnStatus = 'completed'
       messages.value[aiMessageIndex] = {
         role: 'assistant',
         content: response.response,
         timestamp: response.timestamp,
-        isStreaming: false
+        isStreaming: false,
+        streamStatus: 'completed',
+        turnStatus: 'completed'
       }
       isLoading.value = false
       scrollToBottom()
     }
   } catch (error) {
     console.error('发送消息失败:', error)
+    messages.value[userMessageIndex].turnStatus = 'failed'
     messages.value.splice(aiMessageIndex, 1)
     ElMessage.error('发送消息失败，请重试')
+    isLoading.value = false
+  } finally {
     isLoading.value = false
   }
 }
@@ -910,7 +979,8 @@ const sendRAGMessage = async (message: string) => {
     role: 'user',
     content: message,
     timestamp: new Date().toISOString(),
-    isRAG: true
+    isRAG: true,
+    turnStatus: 'streaming'
   }
   messages.value.push(userMessage)
   const userMsgIndex = messages.value.length - 1
@@ -922,6 +992,8 @@ const sendRAGMessage = async (message: string) => {
     content: '',
     isStreaming: true,
     isRAG: true,
+    streamStatus: 'streaming',
+    turnStatus: 'streaming',
     timestamp: new Date().toISOString(),
     sources: []   // 初始化来源数组
   })
@@ -933,16 +1005,12 @@ const sendRAGMessage = async (message: string) => {
   // 构建多轮历史（不含当前用户消息与占位），注入 query-with-history 维持会话连贯。
   // P-2 能力边界：表格查询（工具产物）轮次**不进入**知识库问答的上下文，
   // 与后端 main.py 排除 SOURCE_EXCEL/SOURCE_RAG 的规则对称。
-  const history = messages.value
-    .slice(0, userMsgIndex)
-    .filter((m: any) => (m.role === 'user' || m.role === 'assistant')
-      && m.content && !m.isStreaming && !m.isExcelQuery)
-    .map((m: any) => ({ role: m.role, content: m.content }))
+  const history = buildRagHistory(messages.value, userMsgIndex)
 
   try {
     // RAG 流式调用：复用与普通 Chat 相同的 NDJSON 解析器，逐 chunk 渲染；
     // 走 query-with-history 以携带对话历史 + 知识库检索，并保持真正 Streaming。
-    const { sendMessage: sendRAGStream } = useStreamingChat({
+    const { sendMessage: sendRAGStream, cancel } = useStreamingChat({
       url: '/api/v1/rag/query-with-history',
       buildBody: (msg: string) => ({ query: msg, history, stream: true, context_count: 3, character_id: characterId.value }),
       onChunk: (_chunk: string, accumulated: string) => {
@@ -950,12 +1018,15 @@ const sendRAGMessage = async (message: string) => {
         scrollToBottom()
       },
       onComplete: (fullResponse: string, sources: RagSource[] = []) => {
+        messages.value[userMsgIndex].turnStatus = 'completed'
         messages.value[aiMessageIndex] = {
           role: 'assistant',
           content: fullResponse,
           timestamp: new Date().toISOString(),
           isStreaming: false,
           isRAG: true,
+          streamStatus: 'completed',
+          turnStatus: 'completed',
           sources: normalizeRagSources(sources),
           fromKnowledgeBase: true
         }
@@ -964,31 +1035,77 @@ const sendRAGMessage = async (message: string) => {
       },
       onError: (error: Error) => {
         console.error('RAG流式响应错误:', error)
+        messages.value[userMsgIndex].turnStatus = 'failed'
         messages.value[aiMessageIndex] = {
           role: 'assistant',
           content: '知识库查询失败，请检查网络连接或知识库状态。',
           timestamp: new Date().toISOString(),
           isStreaming: false,
           isRAG: true,
-          error: true
+          streamStatus: 'failed',
+          turnStatus: 'failed',
+          error: true,
+          sources: []
+        }
+        isLoading.value = false
+        scrollToBottom()
+      },
+      onInterrupted: (partialText: string, reason) => {
+        const status = reason === 'protocol' ? 'unknown' : 'interrupted'
+        messages.value[userMsgIndex].turnStatus = status
+        messages.value[aiMessageIndex] = {
+          role: 'assistant',
+          content: partialText,
+          timestamp: new Date().toISOString(),
+          isStreaming: false,
+          isRAG: true,
+          streamStatus: status,
+          turnStatus: status,
+          sources: []
+        }
+        isLoading.value = false
+        scrollToBottom()
+      },
+      onCancelled: (partialText: string) => {
+        messages.value[userMsgIndex].turnStatus = 'cancelled'
+        messages.value[aiMessageIndex] = {
+          role: 'assistant',
+          content: partialText,
+          timestamp: new Date().toISOString(),
+          isStreaming: false,
+          isRAG: true,
+          streamStatus: 'cancelled',
+          turnStatus: 'cancelled',
+          sources: []
         }
         isLoading.value = false
         scrollToBottom()
       }
     })
 
-    await sendRAGStream(message)
+    activeStreamCancel.value = cancel
+    try {
+      await sendRAGStream(message)
+    } finally {
+      if (activeStreamCancel.value === cancel) {
+        activeStreamCancel.value = null
+      }
+    }
 
   } catch (error) {
     console.error('RAG查询失败：', error)
 
+    messages.value[userMsgIndex].turnStatus = 'failed'
     messages.value[aiMessageIndex] = {
       role: 'assistant',
       content: '知识库查询失败，请检查网络连接或知识库状态。',
       timestamp: new Date().toISOString(),
       isStreaming: false,
       isRAG: true,
-      error: true
+      streamStatus: 'failed',
+      turnStatus: 'failed',
+      error: true,
+      sources: []
     }
   } finally {
     isLoading.value = false
@@ -1476,6 +1593,8 @@ const regenerateMessage = async (index: number) => {
     role: 'assistant',
     content: '',
     isStreaming: true,
+    streamStatus: 'streaming',
+    turnStatus: 'streaming',
     timestamp: new Date().toISOString()
   })
   const aiMessageIndex = messages.value.length - 1
@@ -1485,34 +1604,76 @@ const regenerateMessage = async (index: number) => {
 
   try {
     // 复用普通对话流式链路（真实 LLM + 逐 chunk）；服务侧自动加载多轮历史
-    const { sendMessage: sendStreaming } = useStreamingChat({
+    const { sendMessage: sendStreaming, cancel } = useStreamingChat({
       characterId: characterId.value,
       onChunk: (_chunk: string, accumulated: string) => {
         messages.value[aiMessageIndex].content = accumulated
         scrollToBottom()
       },
       onComplete: (fullResponse: string) => {
+        messages.value[userMessageIndex].turnStatus = 'completed'
         messages.value[aiMessageIndex] = {
           role: 'assistant',
           content: fullResponse,
           timestamp: new Date().toISOString(),
-          isStreaming: false
+          isStreaming: false,
+          streamStatus: 'completed',
+          turnStatus: 'completed'
         }
         isLoading.value = false
         scrollToBottom()
       },
       onError: (error: Error) => {
         console.error('重新生成流式响应错误:', error)
+        messages.value[userMessageIndex].turnStatus = 'failed'
         messages.value.splice(aiMessageIndex, 1)
         ElMessage.error('重新生成失败：' + error.message)
         isLoading.value = false
+      },
+      onInterrupted: (partialText: string, reason) => {
+        const status = reason === 'protocol' ? 'unknown' : 'interrupted'
+        messages.value[userMessageIndex].turnStatus = status
+        messages.value[aiMessageIndex] = {
+          role: 'assistant',
+          content: partialText,
+          timestamp: new Date().toISOString(),
+          isStreaming: false,
+          streamStatus: status,
+          turnStatus: status
+        }
+        isLoading.value = false
+        scrollToBottom()
+      },
+      onCancelled: (partialText: string) => {
+        messages.value[userMessageIndex].turnStatus = 'cancelled'
+        messages.value[aiMessageIndex] = {
+          role: 'assistant',
+          content: partialText,
+          timestamp: new Date().toISOString(),
+          isStreaming: false,
+          streamStatus: 'cancelled',
+          turnStatus: 'cancelled'
+        }
+        isLoading.value = false
+        scrollToBottom()
       }
     })
-    await sendStreaming(userMessage)
+
+    activeStreamCancel.value = cancel
+    try {
+      await sendStreaming(userMessage)
+    } finally {
+      if (activeStreamCancel.value === cancel) {
+        activeStreamCancel.value = null
+      }
+    }
   } catch (error: any) {
     console.error('重新生成失败：', error)
+    messages.value[userMessageIndex].turnStatus = 'failed'
     messages.value.splice(aiMessageIndex, 1)
     ElMessage.error('重新生成失败')
+    isLoading.value = false
+  } finally {
     isLoading.value = false
   }
 }
@@ -2402,6 +2563,12 @@ watch(messages, () => {
   border-left: 3px solid var(--el-color-primary-light-5, #a0cfff);
   background: var(--el-color-primary-light-9, #ecf5ff);
   border-radius: 6px;
+}
+
+.stream-terminal-hint {
+  margin-top: 8px;
+  color: var(--el-color-warning-dark-2, #b88230);
+  font-size: 12px;
 }
 
 .rag-sources-title {

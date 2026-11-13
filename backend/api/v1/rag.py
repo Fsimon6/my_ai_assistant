@@ -201,6 +201,15 @@ async def query_document(
                         'timestamp': datetime.now().isoformat()
                     }) + '\n'
 
+                # 错误时只发送兼容现有协议的 error 帧，不再发送 complete。
+                if error:
+                    yield json.dumps({
+                        'type': 'error',
+                        'error': error.get('error') or 'RAG 查询失败',
+                        'timestamp': datetime.now().isoformat()
+                    }) + '\n'
+                    return
+
                 # 与普通 Chat 流式协议保持一致：末尾补 complete 帧
                 yield json.dumps({
                     'type': 'complete',
