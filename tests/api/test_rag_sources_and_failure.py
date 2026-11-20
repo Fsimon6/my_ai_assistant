@@ -62,8 +62,38 @@ class FakeRagService:
         yield 'answer from rag'
 
 
+class EmptyRagService:
+    """成功完成但没有任何文本的 RAG fake，用于空 assistant 持久化测试。"""
+
+    def __init__(self):
+        self.calls = []
+
+    async def query_with_history(
+        self, query, history, context_count=3, stream=False,
+        user_id=None, model=None, api_key=None, document_id=None,
+        sources_out=None, error_out=None,
+    ):
+        self.calls.append({'query': query, 'history': history})
+        if False:  # pragma: no cover - 保持 async generator 语义
+            yield ''
+
+
 def _parse_ndjson(text):
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _fail_append_for(monkeypatch, role_to_fail):
+    """让指定 role 的 append_message 抛出，其他 role 使用真实实现。"""
+    original = rag_api.conversation_service.append_message
+
+    def fail_append(conversation_id, role, content, model=None, meta_info=None):
+        if role == role_to_fail:
+            raise RuntimeError('persistence failed for %s' % role)
+        return original(
+            conversation_id, role, content, model=model, meta_info=meta_info)
+
+    monkeypatch.setattr(
+        rag_api.conversation_service, 'append_message', fail_append)
 
 
 def _rows(api):
@@ -99,6 +129,213 @@ def test_rag_stream_complete_includes_sources(api, monkeypatch):
     assert complete[0]['content'] == 'answer from rag'
     # 来源必须是当前请求传入的独立容器，而不是全局状态。
     assert fake.calls[0]['sources_out'] is not None
+
+
+def test_rag_stream_persists_user_and_assistant(api, monkeypatch):
+    headers = api.user('rag_persist_success_user')
+    character_id = api.create_character(headers)
+    monkeypatch.setattr(rag_api, 'get_rag_service', lambda: FakeRagService())
+
+    resp = api.client.post(
+        '/api/v1/rag/query-with-history',
+        headers=headers,
+        json={
+            'query': '正常问题',
+            'history': [],
+            'stream': True,
+            'character_id': character_id,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    frames = _parse_ndjson(resp.text)
+    assert any(f['type'] == 'complete' for f in frames)
+
+    rows = _rows(api)
+    assert [row.role for row in rows] == ['user', 'assistant']
+    assert rows[0].content == '正常问题'
+    assert rows[1].content == 'answer from rag'
+    assert rows[0].meta_info == {'source': 'rag'}
+    assert rows[1].meta_info == {'source': 'rag'}
+
+
+def test_rag_stream_user_persist_failure_stops_before_rag(api, monkeypatch):
+    headers = api.user('rag_user_persist_failure_user')
+    character_id = api.create_character(headers)
+    fake = FakeRagService()
+    monkeypatch.setattr(rag_api, 'get_rag_service', lambda: fake)
+    _fail_append_for(monkeypatch, 'user')
+
+    resp = api.client.post(
+        '/api/v1/rag/query-with-history',
+        headers=headers,
+        json={
+            'query': '用户消息保存失败',
+            'history': [],
+            'stream': True,
+            'character_id': character_id,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    frames = _parse_ndjson(resp.text)
+    assert any(f['type'] == 'error' and '保存用户消息失败' in f['error'] for f in frames)
+    assert not any(f['type'] == 'chunk' for f in frames)
+    assert not any(f['type'] == 'complete' for f in frames)
+    assert fake.calls == []
+    assert _rows(api) == []
+
+
+def test_rag_stream_assistant_persist_failure_marks_user_failed(api, monkeypatch):
+    headers = api.user('rag_assistant_persist_failure_user')
+    character_id = api.create_character(headers)
+    monkeypatch.setattr(rag_api, 'get_rag_service', lambda: FakeRagService())
+    _fail_append_for(monkeypatch, 'assistant')
+
+    resp = api.client.post(
+        '/api/v1/rag/query-with-history',
+        headers=headers,
+        json={
+            'query': '助手消息保存失败',
+            'history': [],
+            'stream': True,
+            'character_id': character_id,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    frames = _parse_ndjson(resp.text)
+    assert any(f['type'] == 'chunk' for f in frames)
+    assert any(f['type'] == 'error' and '保存助手消息失败' in f['error'] for f in frames)
+    assert not any(f['type'] == 'complete' for f in frames)
+
+    rows = _rows(api)
+    assert [row.role for row in rows] == ['user']
+    assert rows[0].meta_info == {'source': 'rag', 'status': 'failed'}
+
+
+def test_rag_stream_empty_user_content_fails_before_rag(api, monkeypatch):
+    headers = api.user('rag_empty_user_content_user')
+    character_id = api.create_character(headers)
+    fake = FakeRagService()
+    monkeypatch.setattr(rag_api, 'get_rag_service', lambda: fake)
+
+    resp = api.client.post(
+        '/api/v1/rag/query-with-history',
+        headers=headers,
+        json={
+            'query': '',
+            'history': [],
+            'stream': True,
+            'character_id': character_id,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    frames = _parse_ndjson(resp.text)
+    assert any(f['type'] == 'error' and '保存用户消息失败' in f['error'] for f in frames)
+    assert not any(f['type'] == 'complete' for f in frames)
+    assert fake.calls == []
+    assert _rows(api) == []
+
+
+def test_rag_stream_empty_assistant_content_does_not_complete(api, monkeypatch):
+    headers = api.user('rag_empty_assistant_content_user')
+    character_id = api.create_character(headers)
+    monkeypatch.setattr(rag_api, 'get_rag_service', lambda: EmptyRagService())
+
+    resp = api.client.post(
+        '/api/v1/rag/query-with-history',
+        headers=headers,
+        json={
+            'query': '空回答问题',
+            'history': [],
+            'stream': True,
+            'character_id': character_id,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    frames = _parse_ndjson(resp.text)
+    assert any(f['type'] == 'error' and '保存助手消息失败' in f['error'] for f in frames)
+    assert not any(f['type'] == 'complete' for f in frames)
+
+    rows = _rows(api)
+    assert [row.role for row in rows] == ['user']
+    assert rows[0].meta_info == {'source': 'rag', 'status': 'failed'}
+
+
+def test_rag_stream_without_conversation_is_not_required(api, monkeypatch):
+    headers = api.user('rag_no_conversation_user')
+    fake = FakeRagService()
+    monkeypatch.setattr(rag_api, 'get_rag_service', lambda: fake)
+
+    resp = api.client.post(
+        '/api/v1/rag/query-with-history',
+        headers=headers,
+        json={
+            'query': '无会话问题',
+            'history': [],
+            'stream': True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    frames = _parse_ndjson(resp.text)
+    assert any(f['type'] == 'complete' for f in frames)
+    assert not any(f['type'] == 'error' for f in frames)
+    assert _rows(api) == []
+
+
+def test_rag_nonstream_user_persist_failure_stops_before_rag(api, monkeypatch):
+    headers = api.user('rag_nonstream_user_persist_failure_user')
+    character_id = api.create_character(headers)
+    fake = FakeRagService()
+    monkeypatch.setattr(rag_api, 'get_rag_service', lambda: fake)
+    _fail_append_for(monkeypatch, 'user')
+
+    resp = api.client.post(
+        '/api/v1/rag/query-with-history',
+        headers=headers,
+        json={
+            'query': '非流式用户保存失败',
+            'history': [],
+            'stream': False,
+            'character_id': character_id,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body['success'] is False
+    assert '保存用户消息失败' in body['error']
+    assert body['response'] == ''
+    assert body['sources'] == []
+    assert fake.calls == []
+    assert _rows(api) == []
+
+
+def test_rag_nonstream_assistant_persist_failure_returns_failure(api, monkeypatch):
+    headers = api.user('rag_nonstream_assistant_persist_failure_user')
+    character_id = api.create_character(headers)
+    fake = FakeRagService()
+    monkeypatch.setattr(rag_api, 'get_rag_service', lambda: fake)
+    _fail_append_for(monkeypatch, 'assistant')
+
+    resp = api.client.post(
+        '/api/v1/rag/query-with-history',
+        headers=headers,
+        json={
+            'query': '非流式助手保存失败',
+            'history': [],
+            'stream': False,
+            'character_id': character_id,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body['success'] is False
+    assert '保存助手消息失败' in body['error']
+    assert body['response'] == 'answer from rag'
+    assert body['sources'] == []
+    assert len(fake.calls) == 1
+
+    rows = _rows(api)
+    assert [row.role for row in rows] == ['user']
+    assert rows[0].meta_info == {'source': 'rag', 'status': 'failed'}
 
 
 def test_rag_query_stream_complete_includes_sources(api, monkeypatch):

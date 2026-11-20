@@ -2,6 +2,8 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form, R
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from enum import Enum
 import asyncio
 import json
 import os
@@ -27,6 +29,29 @@ from backend.models.user import User
 
 router = APIRouter(prefix='/api/v1/rag', tags=['RAG'])
 logger = logging.getLogger(__name__)
+
+
+class PersistStatus(str, Enum):
+    """对话消息持久化结果的显式状态。"""
+    NOT_REQUIRED = 'not_required'
+    SAVED = 'saved'
+    FAILED = 'failed'
+
+
+@dataclass(frozen=True)
+class PersistResult:
+    """持久化结果；message_id 仅在 SAVED 时存在。"""
+    status: PersistStatus
+    message_id: Optional[int] = None
+
+
+def _error_event(message: str) -> str:
+    """生成与现有前端协议兼容的 SSE error 帧。"""
+    return json.dumps({
+        'type': 'error',
+        'error': message,
+        'timestamp': datetime.now().isoformat(),
+    }) + '\n'
 
 
 class QueryRequest(BaseModel):
@@ -320,18 +345,26 @@ async def query_with_history(
                 logger.warning('读取 RAG 服务端历史失败，使用空历史：%s', he)
                 history_for_rag = []
 
-        def _persist_message(role: str, content: str) -> Optional[int]:
-            """写入一条对话记录；返回消息 id，失败只记日志。"""
-            if conv_id is None or not content:
-                return None
+        def _persist_message(role: str, content: str) -> PersistResult:
+            """写入一条对话记录，并区分无需持久化、成功和失败。"""
+            if conv_id is None:
+                return PersistResult(PersistStatus.NOT_REQUIRED)
+            if not content:
+                # 有 conversation 时，空内容不能伪装成“已保存”。
+                logger.warning('RAG %s 消息内容为空，跳过持久化', role)
+                return PersistResult(PersistStatus.FAILED)
             try:
-                return conversation_service.append_message(
+                message_id = conversation_service.append_message(
                     conv_id, role, content, effective_model,
                     meta_info={'source': SOURCE_RAG},
                 )
+                if message_id is None:
+                    logger.warning('保存 RAG 对话记录失败：%s 消息未返回 ID', role)
+                    return PersistResult(PersistStatus.FAILED)
+                return PersistResult(PersistStatus.SAVED, message_id)
             except Exception as pe:
-                logger.warning('保存 RAG 对话记录失败（忽略）：%s', pe)
-                return None
+                logger.warning('保存 RAG 对话记录失败：%s', pe)
+                return PersistResult(PersistStatus.FAILED)
 
         def _mark_failed(message_id: Optional[int], assistant_saved: bool = False) -> None:
             if conv_id is None or message_id is None or assistant_saved:
@@ -348,7 +381,11 @@ async def query_with_history(
                 sources = []
                 error = {}
                 assistant_saved = False
-                user_message_id = _persist_message('user', req.query)
+                user_result = _persist_message('user', req.query)
+                if user_result.status is PersistStatus.FAILED:
+                    yield _error_event('保存用户消息失败')
+                    return
+                user_message_id = user_result.message_id
                 try:
                     async for chunk in rag_service.query_with_history(
                         query=req.query,
@@ -377,9 +414,14 @@ async def query_with_history(
                         }) + '\n'
                         return
 
-                    # 流式完整结束后写一次 AI 回复（不按 chunk 写库）
-                    _persist_message('assistant', full_response)
-                    assistant_saved = True
+                    # 流式完整结束后写一次 AI 回复（不按 chunk 写库）。
+                    # 只有真实 SAVED 才能设置 assistant_saved 并发送 complete。
+                    assistant_result = _persist_message('assistant', full_response)
+                    if assistant_result.status is PersistStatus.FAILED:
+                        _mark_failed(user_message_id, assistant_saved)
+                        yield _error_event('保存助手消息失败')
+                        return
+                    assistant_saved = assistant_result.status is PersistStatus.SAVED
 
                     # 与普通 Chat 流式协议保持一致：末尾补 complete 帧（携带完整内容）
                     yield json.dumps({
@@ -405,7 +447,17 @@ async def query_with_history(
             response_text = ''
             sources = []
             error = {}
-            user_message_id = _persist_message('user', req.query)
+            user_result = _persist_message('user', req.query)
+            if user_result.status is PersistStatus.FAILED:
+                return {
+                    'success': False,
+                    'response': response_text,
+                    'sources': [],
+                    'error': '保存用户消息失败',
+                    'query': req.query,
+                    'timestamp': datetime.now().isoformat()
+                }
+            user_message_id = user_result.message_id
             try:
                 async for chunk in rag_service.query_with_history(
                     query=req.query,
@@ -429,7 +481,17 @@ async def query_with_history(
                         'query': req.query,
                         'timestamp': datetime.now().isoformat()
                     }
-                _persist_message('assistant', response_text)
+                assistant_result = _persist_message('assistant', response_text)
+                if assistant_result.status is PersistStatus.FAILED:
+                    _mark_failed(user_message_id)
+                    return {
+                        'success': False,
+                        'response': response_text,
+                        'sources': [],
+                        'error': '保存助手消息失败',
+                        'query': req.query,
+                        'timestamp': datetime.now().isoformat()
+                    }
             except (asyncio.CancelledError, GeneratorExit):
                 _mark_failed(user_message_id)
                 raise
