@@ -2,12 +2,16 @@
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+# D1/D1.5：本文件保留项目元数据与构建职责；后端运行/开发安装的
+# 直接依赖权威分别为 backend/requirements.txt / requirements-dev.txt。
+# 完整锁定文件由后续 D2 建立。
+
 [project]
 name = "my-ai-assistant"
 version = "1.0.0"
 description = "基于大模型的本地知识库智能问答助手"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10.11,<3.11"
 license = {text = "MIT"}
 authors = [
     {name = "FSimon", email = "2376709678@qq.com"}
@@ -19,52 +23,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
 ]
 
-dependencies = [
-    "fastapi>=0.104.0",
-    "uvicorn[standard]>=0.24.0",
-    "sqlalchemy>=2.0.0",
-    "alembic>=1.12.0",
-    "python-jose[cryptography]>=3.3.0",
-    "passlib[bcrypt]>=1.7.4",
-    "python-multipart>=0.0.6",
-    "pymupdf>=1.23.0",
-    "python-docx>=1.1.0",
-    "pandas>=2.0.0",
-    "sentence-transformers>=2.2.0",
-    "chromadb>=0.4.0",
-    "qianfan>=1.0.0",
-    "langchain>=0.0.300",
-    "jinja2>=3.1.0",
-    "python-dotenv>=1.0.0",
-    "redis>=5.0.0",
-]
-
-[project.optional-dependencies]
-dev = [
-    "black>=23.0.0",
-    "isort>=5.12.0",
-    "flake8>=6.0.0",
-    "mypy>=1.0.0",
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "pytest-cov>=4.0.0",
-    "pytest-mock>=3.11.0",
-    "httpx>=0.25.0",
-    "pre-commit>=3.0.0",
-    "watchfiles>=0.21.0",
-]
-prod = [
-    "gunicorn>=21.0.0",
-    "psycopg2-binary>=2.9.0",
-    "celery>=5.0.0",
-    "flower>=2.0.0",
-]
+# 运行与开发直接依赖不在本文件声明：
+# backend/requirements.txt / backend/requirements-dev.txt
 
 [project.urls]
 Homepage = "https://github.com/FSimon/my_ai_assistant"

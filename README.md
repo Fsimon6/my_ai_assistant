@@ -78,9 +78,11 @@ my_ai_assistant/
 
 ### 0. 环境要求
 
-- Python >= 3.9（推荐 3.11）
+- Python 3.10.11（短期基线与验收版本；项目声明允许 3.10.x，3.11/3.12 不属于当前基线）
 - Node.js `^20.19.0 || >=22.12.0`
 - 可选：Docker / Docker Compose（容器化部署）
+
+> 当前 Docker 后端镜像仍使用 Python 3.11，尚未在本轮依赖基线统一中同步；本地短期基线以 Python 3.10.11 为准。
 
 ### 1. 安装依赖
 
@@ -95,6 +97,31 @@ pip install -r backend/requirements-dev.txt   # 可选：测试与代码检查
 # 前端
 cd frontend && npm install && cd ..
 ```
+
+### 依赖职责
+
+- `backend/requirements.txt`：后端运行依赖的唯一直接依赖权威来源。
+- `backend/requirements-dev.txt`：开发与测试依赖的唯一直接依赖权威来源。
+- `pyproject.toml`：项目元数据、Python 版本、构建配置和工具配置；不再声明应用运行或开发依赖列表。
+
+安装运行环境：
+
+```bash
+pip install -r backend/requirements.txt
+```
+
+安装开发/测试环境：
+
+```bash
+pip install -r backend/requirements.txt
+pip install -r backend/requirements-dev.txt
+```
+
+`pip install .` 和 `pip install -e .` 即使保留项目构建能力，也不负责安装完整后端运行依赖；不能把项目打包安装成功等同于后端运行环境安装完成。
+
+`requires-python = ">=3.10.11,<3.11"` 表示允许 Python 3.10.11 及后续满足该约束的 Python 3.10 补丁版本，并不是精确限制只能使用 3.10.11。当前短期验收基线仍是 Python 3.10.11；解释器入口统一属于后续 D3。
+
+当前尚未完成 Python 依赖锁定，D2 尚未执行；`requirements.txt` / `requirements-dev.txt` 不是锁文件，安装结果不能声称完全可复现。
 
 ### 2. 配置环境变量
 

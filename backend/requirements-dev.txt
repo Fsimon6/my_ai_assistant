@@ -7,22 +7,24 @@ pytest
 pytest-asyncio
 pytest-cov
 pytest-mock
-httpx
 # 测试代码（tests/fixtures/test_users.py 等）直接 import jwt
 PyJWT
 # fastapi 0.104.1 的 starlette TestClient 使用 httpx.Client(app=...)，
 # httpx>=0.28 移除了 app= 参数，故锁定 <0.28 以兼容现有测试
 httpx<0.28
 
-# --- 代码质量 ---
+# --- 代码质量 / 开发工具 ---
 black
 isort
 flake8
 mypy
+# 由原 pyproject dev extras 迁入
+pre-commit>=3.0.0
+watchfiles>=0.21.0
 
 # ============================================================
 # 说明：
 # - pandas / numpy / matplotlib 等数据分析工具已从原 dev 移除：
-#   numpy 因 embeddings 启动链需要，已移入 requirements.txt（也可由 sentence-transformers 带入）；
+#   numpy 不是当前项目显式直接依赖，仅可能由可选本地 embeddings 或第三方传递依赖带入；
 #   pandas / matplotlib 仅被未接入的 backend/document_loaders/ 使用，非运行/测试必需。
 # ============================================================
