@@ -1259,7 +1259,11 @@ def test_b1_state_symlink_is_rejected(tmp_path):
     try:
         link.symlink_to(external)
     except OSError as exc:
-        pytest.skip('Windows symlink privilege unavailable: %s' % exc)
+        if getattr(exc, 'winerror', None) != 1314:
+            raise
+        pytest.skip(
+            'Windows symlink privilege unavailable (WinError 1314): %s' % exc
+        )
     problems = restore_db._scan_incomplete_runs(target, pre_root)
     assert any('符号链接' in problem for problem in problems)
 
@@ -1326,7 +1330,11 @@ def test_b1_cleanup_symlink_staging_is_rejected(tmp_path):
     try:
         link.symlink_to(outside, target_is_directory=True)
     except OSError as exc:
-        pytest.skip('Windows symlink privilege unavailable: %s' % exc)
+        if getattr(exc, 'winerror', None) != 1314:
+            raise
+        pytest.skip(
+            'Windows symlink privilege unavailable (WinError 1314): %s' % exc
+        )
     assert not restore_db._cleanup_staging(link, target, state)
     assert outside.exists()
 
@@ -1798,7 +1806,11 @@ def test_b1_restore_lock_file_symlink_rejected(tmp_path):
     try:
         link.symlink_to(external)
     except OSError as exc:
-        pytest.skip('Windows symlink privilege unavailable: %s' % exc)
+        if getattr(exc, 'winerror', None) != 1314:
+            raise
+        pytest.skip(
+            'Windows symlink privilege unavailable (WinError 1314): %s' % exc
+        )
     with pytest.raises(restore_db.RestoreLockError):
         restore_db.RestoreLock(target, tmp_path / 'lock-registry').acquire()
     assert external.exists()
