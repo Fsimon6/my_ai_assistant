@@ -1,0 +1,215 @@
+name: Backup Restore Symlink Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backup-restore-symlink-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-symlink:
+    name: Windows file and directory symlink
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTEST_ADDOPTS: ""
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.10.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10.11"
+
+      - name: Record runner identity
+        shell: pwsh
+        run: |
+          Write-Host "runner.os=$env:RUNNER_OS"
+          Write-Host "runner.arch=$env:RUNNER_ARCH"
+          Write-Host "runner.name=$env:RUNNER_NAME"
+          Write-Host "identity=$(whoami)"
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "windows.caption=$($os.Caption)"
+          Write-Host "windows.version=$($os.Version)"
+          python --version
+          python -c "import platform, sys; print('python.executable=' + sys.executable); print('python.platform=' + platform.platform())"
+
+      - name: Install committed project dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+          python --version
+          python -m pytest --version
+
+      - name: Probe file and directory symlink capability
+        id: probe
+        shell: pwsh
+        run: |
+          $probe = @'
+          import json
+          import os
+          import shutil
+          import sys
+          import traceback
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "symlink-capability-probe"
+          if root.exists():
+              shutil.rmtree(root)
+          root.mkdir(parents=True)
+
+
+          def probe(kind):
+              is_directory = kind == "directory"
+              target = root / (kind + "-target")
+              link = root / (kind + "-link")
+              result = {
+                  "kind": kind,
+                  "status": "FAIL",
+                  "winerror": None,
+                  "errno": None,
+                  "exception_class": None,
+                  "exception": None,
+                  "target_length": len(str(target)),
+                  "link_length": len(str(link)),
+              }
+              try:
+                  if is_directory:
+                      target.mkdir()
+                  else:
+                      target.write_text("symlink capability probe", encoding="utf-8")
+                  link.symlink_to(target, target_is_directory=is_directory)
+                  if not link.is_symlink():
+                      raise RuntimeError("is_symlink() returned false")
+                  result["status"] = "PASS"
+              except OSError as exc:
+                  result["winerror"] = getattr(exc, "winerror", None)
+                  result["errno"] = getattr(exc, "errno", None)
+                  result["exception_class"] = type(exc).__name__
+                  result["exception"] = str(exc)
+                  result["status"] = "BLOCKED" if getattr(exc, "winerror", None) == 1314 else "FAIL"
+              except Exception as exc:
+                  result["exception_class"] = type(exc).__name__
+                  result["exception"] = str(exc)
+                  result["status"] = "FAIL"
+                  result["traceback"] = traceback.format_exc()
+              finally:
+                  try:
+                      if link.is_symlink():
+                          link.unlink()
+                  except OSError:
+                      pass
+                  try:
+                      if target.is_dir():
+                          shutil.rmtree(target)
+                      elif target.exists():
+                          target.unlink()
+                  except OSError:
+                      pass
+              return result
+
+
+          payload = {
+              "file": probe("file"),
+              "directory": probe("directory"),
+              "runner_os": os.environ.get("RUNNER_OS"),
+              "runner_arch": os.environ.get("RUNNER_ARCH"),
+              "runner_name": os.environ.get("RUNNER_NAME"),
+              "identity": os.environ.get("USERNAME"),
+              "python": sys.executable,
+              "platform": sys.platform,
+          }
+          report = Path(os.environ["RUNNER_TEMP"]) / "symlink-capability.json"
+          report.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+          print(json.dumps(payload, indent=2))
+          statuses = {payload["file"]["status"], payload["directory"]["status"]}
+          if statuses == {"PASS"}:
+              sys.exit(0)
+          if "BLOCKED" in statuses:
+              sys.exit(42)
+          sys.exit(43)
+          '@
+          $probe | python -
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Symlink capability probe failed with exit code $code. See the probe output above."
+            exit $code
+          }
+
+      - name: Run exact symlink regression nodes
+        id: symlink-tests
+        if: steps.probe.outcome == 'success'
+        shell: pwsh
+        run: |
+          $junit = Join-Path $env:RUNNER_TEMP "symlink-results.xml"
+          if (Test-Path $junit) { Remove-Item $junit -Force }
+          $nodes = @(
+            "tests/unit/test_backup_restore_isolation_e2e.py::test_symlink_privilege_classification_skips_only_winerror_1314",
+            "tests/unit/test_backup_restore_isolation_e2e.py::test_symlink_privilege_classification_rethrows_non_1314",
+            "tests/unit/test_backup_restore_isolation_e2e.py::test_symlink_privilege_classification_rethrows_posix_errors",
+            "tests/unit/test_backup_restore_isolation_e2e.py::test_b1_state_symlink_is_rejected",
+            "tests/unit/test_backup_restore_isolation_e2e.py::test_b1_cleanup_symlink_staging_is_rejected",
+            "tests/unit/test_backup_restore_isolation_e2e.py::test_b1_restore_lock_file_symlink_rejected"
+          )
+          python -m pytest -q -p no:cacheprovider -p no:cov -o addopts= --tb=short --junitxml="$junit" @nodes
+
+      - name: Enforce symlink validation result
+        if: always()
+        shell: pwsh
+        run: |
+          $probePath = Join-Path $env:RUNNER_TEMP "symlink-capability.json"
+          $junitPath = Join-Path $env:RUNNER_TEMP "symlink-results.xml"
+          $fileStatus = "MISSING"
+          $dirStatus = "MISSING"
+          if (Test-Path $probePath) {
+            $probe = Get-Content -Raw $probePath | ConvertFrom-Json
+            $fileStatus = [string]$probe.file.status
+            $dirStatus = [string]$probe.directory.status
+          }
+          $cases = @()
+          if (Test-Path $junitPath) {
+            [xml]$xml = Get-Content -Raw $junitPath
+            $cases = @($xml.SelectNodes("//testcase"))
+          }
+          function Get-Status([string]$name) {
+            $case = @($cases | Where-Object { $_.name -eq $name })[0]
+            if ($null -eq $case) { return "NOT_RUN" }
+            if ($case.SelectSingleNode("failure") -or $case.SelectSingleNode("error")) { return "FAIL" }
+            if ($case.SelectSingleNode("skipped")) { return "SKIPPED" }
+            return "PASS"
+          }
+          $state = Get-Status "test_b1_state_symlink_is_rejected"
+          $cleanup = Get-Status "test_b1_cleanup_symlink_staging_is_rejected"
+          $lock = Get-Status "test_b1_restore_lock_file_symlink_rejected"
+          $classificationNames = @(
+            "test_symlink_privilege_classification_skips_only_winerror_1314",
+            "test_symlink_privilege_classification_rethrows_non_1314",
+            "test_symlink_privilege_classification_rethrows_posix_errors"
+          )
+          $classificationStatuses = @($classificationNames | ForEach-Object { Get-Status $_ })
+          $classification = if (@($classificationStatuses | Where-Object { $_ -ne "PASS" }).Count -eq 0) { "3 PASS" } else { "FAIL" }
+          $passed = @($cases | Where-Object { -not $_.SelectSingleNode("failure") -and -not $_.SelectSingleNode("error") -and -not $_.SelectSingleNode("skipped") }).Count
+          $failed = @($cases | Where-Object { $_.SelectSingleNode("failure") -or $_.SelectSingleNode("error") }).Count
+          $skipped = @($cases | Where-Object { $_.SelectSingleNode("skipped") }).Count
+          $collected = $cases.Count
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Windows symlink validation"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- file symlink capability: $fileStatus"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- directory symlink capability: $dirStatus"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- classification tests: $classification"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- state file symlink: $state"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- staging directory symlink: $cleanup"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- legacy lock file symlink: $lock"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- JUnit: collected=$collected passed=$passed failed=$failed skipped=$skipped"
+          if ($fileStatus -ne "PASS" -or $dirStatus -ne "PASS" -or $state -ne "PASS" -or $cleanup -ne "PASS" -or $lock -ne "PASS" -or $classification -ne "3 PASS" -or $collected -ne 6 -or $passed -ne 6 -or $failed -ne 0 -or $skipped -ne 0) {
+            throw "Windows symlink validation is not PASS (probe/skip/test failure). See summary."
+          }
