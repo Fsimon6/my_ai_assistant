@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import errno
 import gc
 import importlib.util
 import json
@@ -1247,6 +1248,42 @@ def test_b1_missing_or_corrupt_state_blocks_restore(
     assert _business_snapshot(target) == before
 
 
+def _skip_if_symlink_privilege_unavailable(exc):
+    if getattr(exc, 'winerror', None) == 1314:
+        pytest.skip(
+            'Windows symlink privilege unavailable (WinError 1314): %s' % exc
+        )
+    raise exc
+
+
+def _oserror_with_winerror(winerror):
+    exc = OSError('synthetic symlink failure')
+    exc.winerror = winerror
+    return exc
+
+
+def test_symlink_privilege_classification_skips_only_winerror_1314():
+    exc = _oserror_with_winerror(1314)
+    with pytest.raises(pytest.skip.Exception, match='WinError 1314'):
+        _skip_if_symlink_privilege_unavailable(exc)
+
+
+def test_symlink_privilege_classification_rethrows_non_1314():
+    for winerror in (5, 3, 183, 267, 87, None):
+        exc = _oserror_with_winerror(winerror)
+        with pytest.raises(OSError) as caught:
+            _skip_if_symlink_privilege_unavailable(exc)
+        assert caught.value is exc
+
+
+def test_symlink_privilege_classification_rethrows_posix_errors():
+    for errno_value in (errno.EACCES, errno.EPERM):
+        exc = OSError(errno_value, 'synthetic symlink failure')
+        with pytest.raises(OSError) as caught:
+            _skip_if_symlink_privilege_unavailable(exc)
+        assert caught.value is exc
+
+
 def test_b1_state_symlink_is_rejected(tmp_path):
     target = _prepare_target(tmp_path)
     pre_root = tmp_path / 'pre_restore'
@@ -1259,11 +1296,7 @@ def test_b1_state_symlink_is_rejected(tmp_path):
     try:
         link.symlink_to(external)
     except OSError as exc:
-        if getattr(exc, 'winerror', None) != 1314:
-            raise
-        pytest.skip(
-            'Windows symlink privilege unavailable (WinError 1314): %s' % exc
-        )
+        _skip_if_symlink_privilege_unavailable(exc)
     problems = restore_db._scan_incomplete_runs(target, pre_root)
     assert any('符号链接' in problem for problem in problems)
 
@@ -1330,11 +1363,7 @@ def test_b1_cleanup_symlink_staging_is_rejected(tmp_path):
     try:
         link.symlink_to(outside, target_is_directory=True)
     except OSError as exc:
-        if getattr(exc, 'winerror', None) != 1314:
-            raise
-        pytest.skip(
-            'Windows symlink privilege unavailable (WinError 1314): %s' % exc
-        )
+        _skip_if_symlink_privilege_unavailable(exc)
     assert not restore_db._cleanup_staging(link, target, state)
     assert outside.exists()
 
@@ -1806,11 +1835,7 @@ def test_b1_restore_lock_file_symlink_rejected(tmp_path):
     try:
         link.symlink_to(external)
     except OSError as exc:
-        if getattr(exc, 'winerror', None) != 1314:
-            raise
-        pytest.skip(
-            'Windows symlink privilege unavailable (WinError 1314): %s' % exc
-        )
+        _skip_if_symlink_privilege_unavailable(exc)
     with pytest.raises(restore_db.RestoreLockError):
         restore_db.RestoreLock(target, tmp_path / 'lock-registry').acquire()
     assert external.exists()
