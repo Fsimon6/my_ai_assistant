@@ -151,6 +151,7 @@ jobs:
         if: steps.probe.outcome == 'success'
         shell: pwsh
         run: |
+          $env:JWT_SECRET = "ci-only-" + [guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")
           $junit = Join-Path $env:RUNNER_TEMP "symlink-results.xml"
           if (Test-Path $junit) { Remove-Item $junit -Force }
           $nodes = @(
@@ -197,7 +198,21 @@ jobs:
             "test_symlink_privilege_classification_rethrows_posix_errors"
           )
           $classificationStatuses = @($classificationNames | ForEach-Object { Get-Status $_ })
-          $classification = if (@($classificationStatuses | Where-Object { $_ -ne "PASS" }).Count -eq 0) { "3 PASS" } else { "FAIL" }
+          $classificationPass = @($classificationStatuses | Where-Object { $_ -eq "PASS" }).Count
+          $classificationFail = @($classificationStatuses | Where-Object { $_ -eq "FAIL" }).Count
+          $classificationSkipped = @($classificationStatuses | Where-Object { $_ -eq "SKIPPED" }).Count
+          $classificationNotRun = @($classificationStatuses | Where-Object { $_ -eq "NOT_RUN" }).Count
+          if ($classificationPass -eq 3) {
+            $classification = "3 PASS"
+          } elseif ($classificationFail -gt 0) {
+            $classification = "FAIL"
+          } elseif ($classificationSkipped -gt 0) {
+            $classification = "SKIPPED"
+          } elseif ($classificationNotRun -eq 3) {
+            $classification = "NOT_RUN"
+          } else {
+            $classification = "MIXED(PASS=$classificationPass,SKIPPED=$classificationSkipped,NOT_RUN=$classificationNotRun)"
+          }
           $passed = @($cases | Where-Object { -not $_.SelectSingleNode("failure") -and -not $_.SelectSingleNode("error") -and -not $_.SelectSingleNode("skipped") }).Count
           $failed = @($cases | Where-Object { $_.SelectSingleNode("failure") -or $_.SelectSingleNode("error") }).Count
           $skipped = @($cases | Where-Object { $_.SelectSingleNode("skipped") }).Count
