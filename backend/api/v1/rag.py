@@ -71,6 +71,9 @@ class QueryWithHistoryRequest(BaseModel):
     context_count: int = 3
     character_id: Optional[str] = None  # 可选：传入则使用角色专属 model+api_key
     document_id: Optional[str] = None  # 可选：限定只在该文档内检索
+    # S17-C：仅 regenerate 时提供；两者必须同时出现，后端会做归属/角色/来源校验。
+    target_user_message_id: Optional[int] = None
+    target_assistant_message_id: Optional[int] = None
 
 
 @router.post('/upload')
@@ -331,16 +334,50 @@ async def query_with_history(
         # ===== 对话历史持久化（与 main.py:/speak/stream 同一策略）=====
         # character_id 缺失时 conv_id 为 None → 全部跳过，保持旧行为（向后兼容）。
         # 失败时只标记当前 user 消息 failed，不写 assistant 失败占位。
-        conv_id = _resolve_rag_conversation_id(req.character_id, current_user.id)
+        target_user_id = req.target_user_message_id
+        target_assistant_id = req.target_assistant_message_id
+        has_target_user = target_user_id is not None
+        has_target_assistant = target_assistant_id is not None
+        if has_target_user != has_target_assistant:
+            raise HTTPException(status_code=400, detail='regenerate 目标消息参数不完整')
+
+        regenerate_target = None
+        if has_target_user:
+            if not req.character_id:
+                raise HTTPException(status_code=400, detail='regenerate 缺少角色')
+            try:
+                character_id_int = int(req.character_id)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail='regenerate 角色无效')
+            regenerate_target = conversation_service.get_regenerate_target(
+                current_user.id,
+                character_id_int,
+                target_user_id,
+                target_assistant_id,
+                SOURCE_RAG,
+            )
+            if regenerate_target is None or regenerate_target['user_content'] != req.query:
+                raise HTTPException(status_code=400, detail='regenerate 目标消息无效或不属于当前会话')
+            conv_id = regenerate_target['conversation_id']
+        else:
+            conv_id = _resolve_rag_conversation_id(req.character_id, current_user.id)
         effective_model = char_model if (char_model and char_api_key) else settings.LLM_MODEL
 
         # 有 character_id 时以服务端历史为权威，排除 failed 与 Excel 工具轮次；
         # 无 character_id 时保持旧行为，使用调用方传入 history。
+        # regenerate 时截止到目标 user 之前，排除目标 user/assistant 及未来消息。
         history_for_rag = req.history
         if conv_id is not None:
             try:
-                history_for_rag = conversation_service.get_history(
-                    conv_id, exclude_sources=[SOURCE_EXCEL])
+                if regenerate_target is not None:
+                    history_for_rag = conversation_service.get_history(
+                        conv_id,
+                        exclude_sources=[SOURCE_EXCEL],
+                        before_message_id=regenerate_target['user_id'],
+                    )
+                else:
+                    history_for_rag = conversation_service.get_history(
+                        conv_id, exclude_sources=[SOURCE_EXCEL])
             except Exception as he:
                 logger.warning('读取 RAG 服务端历史失败，使用空历史：%s', he)
                 history_for_rag = []
@@ -381,14 +418,19 @@ async def query_with_history(
                 sources = []
                 error = {}
                 assistant_saved = False
-                user_result = _persist_message('user', req.query)
-                if user_result.status is PersistStatus.FAILED:
-                    yield _error_event('保存用户消息失败')
-                    return
-                user_message_id = user_result.message_id
+                if regenerate_target is not None:
+                    user_message_id = None
+                    query_text = regenerate_target['user_content']
+                else:
+                    user_result = _persist_message('user', req.query)
+                    if user_result.status is PersistStatus.FAILED:
+                        yield _error_event('保存用户消息失败')
+                        return
+                    user_message_id = user_result.message_id
+                    query_text = req.query
                 try:
                     async for chunk in rag_service.query_with_history(
-                        query=req.query,
+                        query=query_text,
                         history=history_for_rag,
                         context_count=req.context_count,
                         user_id=current_user.id,
@@ -415,13 +457,38 @@ async def query_with_history(
                         return
 
                     # 流式完整结束后写一次 AI 回复（不按 chunk 写库）。
-                    # 只有真实 SAVED 才能设置 assistant_saved 并发送 complete。
-                    assistant_result = _persist_message('assistant', full_response)
-                    if assistant_result.status is PersistStatus.FAILED:
-                        _mark_failed(user_message_id, assistant_saved)
-                        yield _error_event('保存助手消息失败')
-                        return
-                    assistant_saved = assistant_result.status is PersistStatus.SAVED
+                    # regenerate：只更新原 assistant；首次：INSERT 新 assistant。
+                    if regenerate_target is not None:
+                        if not full_response:
+                            yield _error_event('重新生成结果为空')
+                            return
+                        try:
+                            replaced = conversation_service.replace_assistant_message(
+                                current_user.id,
+                                character_id_int,
+                                regenerate_target['user_id'],
+                                regenerate_target['assistant_id'],
+                                SOURCE_RAG,
+                                regenerate_target['assistant_content'],
+                                full_response,
+                                effective_model,
+                            )
+                        except Exception as replace_error:
+                            logger.warning('更新 RAG regenerate 原助手消息失败：%s', replace_error)
+                            yield _error_event('更新原助手消息失败')
+                            return
+                        if not replaced:
+                            yield _error_event('更新原助手消息失败或目标已变更')
+                            return
+                        assistant_saved = True
+                    else:
+                        # 只有真实 SAVED 才能设置 assistant_saved 并发送 complete。
+                        assistant_result = _persist_message('assistant', full_response)
+                        if assistant_result.status is PersistStatus.FAILED:
+                            _mark_failed(user_message_id, assistant_saved)
+                            yield _error_event('保存助手消息失败')
+                            return
+                        assistant_saved = assistant_result.status is PersistStatus.SAVED
 
                     # 与普通 Chat 流式协议保持一致：末尾补 complete 帧（携带完整内容）
                     yield json.dumps({
@@ -447,20 +514,25 @@ async def query_with_history(
             response_text = ''
             sources = []
             error = {}
-            user_result = _persist_message('user', req.query)
-            if user_result.status is PersistStatus.FAILED:
-                return {
-                    'success': False,
-                    'response': response_text,
-                    'sources': [],
-                    'error': '保存用户消息失败',
-                    'query': req.query,
-                    'timestamp': datetime.now().isoformat()
-                }
-            user_message_id = user_result.message_id
+            if regenerate_target is not None:
+                user_message_id = None
+                query_text = regenerate_target['user_content']
+            else:
+                user_result = _persist_message('user', req.query)
+                if user_result.status is PersistStatus.FAILED:
+                    return {
+                        'success': False,
+                        'response': response_text,
+                        'sources': [],
+                        'error': '保存用户消息失败',
+                        'query': req.query,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                user_message_id = user_result.message_id
+                query_text = req.query
             try:
                 async for chunk in rag_service.query_with_history(
-                    query=req.query,
+                    query=query_text,
                     history=history_for_rag,
                     context_count=req.context_count,
                     user_id=current_user.id,
@@ -481,17 +553,47 @@ async def query_with_history(
                         'query': req.query,
                         'timestamp': datetime.now().isoformat()
                     }
-                assistant_result = _persist_message('assistant', response_text)
-                if assistant_result.status is PersistStatus.FAILED:
-                    _mark_failed(user_message_id)
-                    return {
-                        'success': False,
-                        'response': response_text,
-                        'sources': [],
-                        'error': '保存助手消息失败',
-                        'query': req.query,
-                        'timestamp': datetime.now().isoformat()
-                    }
+                if regenerate_target is not None:
+                    if not response_text:
+                        return {
+                            'success': False,
+                            'response': response_text,
+                            'sources': [],
+                            'error': '重新生成结果为空',
+                            'query': req.query,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                    replaced = conversation_service.replace_assistant_message(
+                        current_user.id,
+                        character_id_int,
+                        regenerate_target['user_id'],
+                        regenerate_target['assistant_id'],
+                        SOURCE_RAG,
+                        regenerate_target['assistant_content'],
+                        response_text,
+                        effective_model,
+                    )
+                    if not replaced:
+                        return {
+                            'success': False,
+                            'response': response_text,
+                            'sources': [],
+                            'error': '更新原助手消息失败或目标已变更',
+                            'query': req.query,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                else:
+                    assistant_result = _persist_message('assistant', response_text)
+                    if assistant_result.status is PersistStatus.FAILED:
+                        _mark_failed(user_message_id)
+                        return {
+                            'success': False,
+                            'response': response_text,
+                            'sources': [],
+                            'error': '保存助手消息失败',
+                            'query': req.query,
+                            'timestamp': datetime.now().isoformat()
+                        }
             except (asyncio.CancelledError, GeneratorExit):
                 _mark_failed(user_message_id)
                 raise

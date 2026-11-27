@@ -25,6 +25,8 @@ export interface CharacterUpdate {
 
 export interface SpeakRequest {
   message: string
+  target_user_message_id?: number
+  target_assistant_message_id?: number
 }
 
 export interface SpeakResponse {
@@ -35,10 +37,12 @@ export interface SpeakResponse {
 }
 
 export interface ConversationRecord {
-  timestamp: string
-  user: string
-  assistant: string
-  model: string
+  id: number
+  conversation_id: number
+  role: 'user' | 'assistant'
+  content: string
+  created_at?: string | null
+  meta_info?: Record<string, any> | null
 }
 
 export interface ApiResponse<T = any> {

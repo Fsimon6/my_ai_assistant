@@ -79,9 +79,12 @@ class ConversationService:
             self,
             conversation_id: int,
             exclude_sources: Optional[List[str]] = None,
+            before_message_id: Optional[int] = None,
     ) -> List[Dict]:
-        """按时间顺序返回对话消息 [{'role','content','created_at','meta_info'}]
+        """按时间顺序返回对话消息。
 
+        返回字段：id / conversation_id / role / content / created_at / meta_info。
+        before_message_id 是排除边界（仅取 Text.id < 该消息的历史）；默认不截断。
         exclude_sources: 需要整体丢弃的消息来源列表（按 meta_info['source'] 判定）。
             用于隔离独立工具能力——例如普通聊天传入 [SOURCE_EXCEL]，则 Excel 表格
             查询的整轮（user + assistant）都不会进入 LLM 上下文。
@@ -89,9 +92,12 @@ class ConversationService:
         """
         db = SessionLocal()
         try:
-            texts = db.query(Text).filter(
+            query = db.query(Text).filter(
                 Text.conversation_id == conversation_id
-            ).order_by(Text.id.asc()).all()
+            )
+            if before_message_id is not None:
+                query = query.filter(Text.id < before_message_id)
+            texts = query.order_by(Text.id.asc()).all()
             excluded = set(exclude_sources or [])
             messages: List[Dict] = []
             for t in texts:
@@ -106,12 +112,150 @@ class ConversationService:
                         and (t.content or '').strip() == LEGACY_FAILED_ASSISTANT_CONTENT):
                     continue
                 messages.append({
+                    'id': t.id,
+                    'conversation_id': t.conversation_id,
                     'role': t.role,
                     'content': t.content,
                     'created_at': t.created_at.isoformat() if t.created_at else None,
                     'meta_info': meta,
                 })
             return messages
+        finally:
+            db.close()
+
+    def get_regenerate_target(
+            self,
+            user_id: int,
+            character_id: int,
+            target_user_message_id: int,
+            target_assistant_message_id: int,
+            expected_source: str,
+    ) -> Optional[Dict]:
+        """读取并验证 regenerate 目标对；任何归属/角色/来源/顺序异常均返回 None。"""
+        db = SessionLocal()
+        try:
+            conversation = db.query(Conversation).filter(
+                Conversation.user_id == user_id,
+                Conversation.character_id == character_id,
+            ).first()
+            if conversation is None:
+                return None
+
+            user_message = db.query(Text).filter(
+                Text.id == target_user_message_id,
+                Text.conversation_id == conversation.id,
+                Text.role == 'user',
+            ).first()
+            assistant_message = db.query(Text).filter(
+                Text.id == target_assistant_message_id,
+                Text.conversation_id == conversation.id,
+                Text.role == 'assistant',
+            ).first()
+            if user_message is None or assistant_message is None:
+                return None
+            if user_message.id >= assistant_message.id:
+                return None
+            # 只允许相邻的目标对，禁止跨轮次猜测关联。
+            between = db.query(Text.id).filter(
+                Text.conversation_id == conversation.id,
+                Text.id > user_message.id,
+                Text.id < assistant_message.id,
+            ).first()
+            if between is not None:
+                return None
+
+            user_meta = user_message.meta_info if isinstance(user_message.meta_info, dict) else {}
+            assistant_meta = assistant_message.meta_info if isinstance(assistant_message.meta_info, dict) else {}
+            if user_meta.get('source') != expected_source:
+                return None
+            if assistant_meta.get('source') != expected_source:
+                return None
+            if not (user_message.content or '').strip() or not (assistant_message.content or '').strip():
+                return None
+
+            return {
+                'conversation_id': conversation.id,
+                'user_id': user_message.id,
+                'user_content': user_message.content,
+                'assistant_id': assistant_message.id,
+                'assistant_content': assistant_message.content,
+                'source': expected_source,
+            }
+        finally:
+            db.close()
+
+    def replace_assistant_message(
+            self,
+            user_id: int,
+            character_id: int,
+            target_user_message_id: int,
+            target_assistant_message_id: int,
+            expected_source: str,
+            expected_old_content: str,
+            new_content: str,
+            model: Optional[str] = None,
+    ) -> bool:
+        """原子替换 assistant 正文；失败/冲突 rollback，绝不删除旧记录。"""
+        if not new_content:
+            return False
+        db = SessionLocal()
+        try:
+            conversation = db.query(Conversation).filter(
+                Conversation.user_id == user_id,
+                Conversation.character_id == character_id,
+            ).first()
+            if conversation is None:
+                return False
+
+            user_message = db.query(Text).filter(
+                Text.id == target_user_message_id,
+                Text.conversation_id == conversation.id,
+                Text.role == 'user',
+            ).first()
+            assistant_message = db.query(Text).filter(
+                Text.id == target_assistant_message_id,
+                Text.conversation_id == conversation.id,
+                Text.role == 'assistant',
+            ).first()
+            if user_message is None or assistant_message is None:
+                return False
+            if user_message.id >= assistant_message.id:
+                return False
+            between = db.query(Text.id).filter(
+                Text.conversation_id == conversation.id,
+                Text.id > user_message.id,
+                Text.id < assistant_message.id,
+            ).first()
+            if between is not None:
+                return False
+
+            user_meta = user_message.meta_info if isinstance(user_message.meta_info, dict) else {}
+            assistant_meta = assistant_message.meta_info if isinstance(assistant_message.meta_info, dict) else {}
+            if user_meta.get('source') != expected_source:
+                return False
+            if assistant_meta.get('source') != expected_source:
+                return False
+            if assistant_message.content != expected_old_content:
+                return False
+
+            # 条件 UPDATE：只有旧正文未被并发请求改写时才成功。
+            updated = db.query(Text).filter(
+                Text.id == target_assistant_message_id,
+                Text.conversation_id == conversation.id,
+                Text.role == 'assistant',
+                Text.content == expected_old_content,
+            ).update({
+                Text.content: new_content,
+                Text.model: model,
+            }, synchronize_session=False)
+            if updated != 1:
+                db.rollback()
+                return False
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 

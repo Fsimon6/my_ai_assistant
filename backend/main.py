@@ -221,6 +221,9 @@ async def log_request(request: Request, call_next):
 class SpeakRequest(BaseModel):
     message: str
     stream: Optional[bool] = False
+    # S17-C：仅 regenerate 时提供；两者必须同时出现，后端会做归属/角色/来源校验。
+    target_user_message_id: Optional[int] = None
+    target_assistant_message_id: Optional[int] = None
 
 # ======== Characters API 路由 ========
 @app.post("/api/v1/characters/{character_id}/speak/stream")
@@ -255,6 +258,7 @@ async def speak_to_character_stream(
         conv_id = None
         user_message_id = None
         assistant_saved = False
+        regenerate_target = None
         effective_model = settings.LLM_MODEL  # 默认全局模型；保证异常分支始终有定义，避免 UnboundLocalError
 
         def _mark_failed() -> None:
@@ -299,29 +303,77 @@ async def speak_to_character_stream(
                 llm = get_llm()
             logger.info(f'普通 Chat 使用模型：{effective_model}（角色级={bool(character_model and character_api_key)}）')
 
-            if character is not None and cid_int is not None:
-                conv_id = conversation_service.get_or_create_conversation_id(
-                    current_user.id, cid_int
+            target_user_id = request.target_user_message_id
+            target_assistant_id = request.target_assistant_message_id
+            has_target_user = target_user_id is not None
+            has_target_assistant = target_assistant_id is not None
+            if has_target_user != has_target_assistant:
+                yield json.dumps({
+                    'type': 'error',
+                    'error': 'regenerate 目标消息参数不完整',
+                    'timestamp': datetime.now().isoformat(),
+                }) + '\n'
+                return
+
+            if has_target_user:
+                if cid_int is None:
+                    yield json.dumps({
+                        'type': 'error',
+                        'error': 'regenerate 目标角色无效',
+                        'timestamp': datetime.now().isoformat(),
+                    }) + '\n'
+                    return
+                regenerate_target = conversation_service.get_regenerate_target(
+                    current_user.id, cid_int, target_user_id, target_assistant_id,
+                    SOURCE_CHAT,
                 )
+                if regenerate_target is None or regenerate_target['user_content'] != request.message:
+                    yield json.dumps({
+                        'type': 'error',
+                        'error': 'regenerate 目标消息无效或不属于当前会话',
+                        'timestamp': datetime.now().isoformat(),
+                    }) + '\n'
+                    return
+                conv_id = regenerate_target['conversation_id']
+
+            if character is not None and cid_int is not None:
+                if conv_id is None:
+                    conv_id = conversation_service.get_or_create_conversation_id(
+                        current_user.id, cid_int
+                    )
                 # 同一对话的并发流式串行化：避免 user/assistant 历史交错或上下文串线
                 lock = conv_locks.setdefault(conv_id, asyncio.Lock())
                 await lock.acquire()
-                # 先落库用户消息（来源标记 = 普通聊天）
-                user_message_id = conversation_service.append_message(
-                    conv_id, 'user', request.message, effective_model,
-                    meta_info={'source': SOURCE_CHAT},
-                )
-                # 加载历史（已含刚写入的用户消息），注入 LLM 多轮上下文。
-                # 来源隔离（P-2）：Excel 表格查询（工具产物）与知识库问答（RAG）都属
-                # **独立能力**，其整轮（user + assistant）一律不进入普通聊天上下文。
-                # 目的：关闭某项能力后，该能力历史产生的内容不得继续影响普通聊天。
-                history = conversation_service.get_history(
-                    conv_id, exclude_sources=[SOURCE_EXCEL, SOURCE_RAG],
-                )
+
+                if regenerate_target is not None:
+                    # regenerate：原 user 已存在，上下文截止到目标 user 之前。
+                    history = conversation_service.get_history(
+                        conv_id,
+                        exclude_sources=[SOURCE_EXCEL, SOURCE_RAG],
+                        before_message_id=regenerate_target['user_id'],
+                    )
+                else:
+                    # 首次/普通新一轮：先落库用户消息，再加载包含它的历史。
+                    user_message_id = conversation_service.append_message(
+                        conv_id, 'user', request.message, effective_model,
+                        meta_info={'source': SOURCE_CHAT},
+                    )
+                    # 来源隔离（P-2）：Excel 表格查询（工具产物）与知识库问答（RAG）都属
+                    # **独立能力**，其整轮（user + assistant）一律不进入普通聊天上下文。
+                    history = conversation_service.get_history(
+                        conv_id, exclude_sources=[SOURCE_EXCEL, SOURCE_RAG],
+                    )
             else:
                 history = []
 
-            messages = [{"role": "system", "content": system_prompt}] + history
+            if regenerate_target is not None:
+                messages = (
+                    [{"role": "system", "content": system_prompt}]
+                    + history
+                    + [{"role": "user", "content": regenerate_target['user_content']}]
+                )
+            else:
+                messages = [{"role": "system", "content": system_prompt}] + history
 
             async for chunk in llm.chat_completion(messages=messages, stream=True):
                 full_response += chunk
@@ -332,7 +384,33 @@ async def speak_to_character_stream(
                 }) + "\n"
 
             # AI 回复在完整流式结束后写入一次（不按 chunk 写库）
-            if conv_id is not None and full_response:
+            if regenerate_target is not None:
+                if not full_response:
+                    yield json.dumps({
+                        'type': 'error',
+                        'error': '重新生成结果为空',
+                        'timestamp': datetime.now().isoformat(),
+                    }) + '\n'
+                    return
+                replaced = conversation_service.replace_assistant_message(
+                    current_user.id,
+                    cid_int,
+                    regenerate_target['user_id'],
+                    regenerate_target['assistant_id'],
+                    SOURCE_CHAT,
+                    regenerate_target['assistant_content'],
+                    full_response,
+                    effective_model,
+                )
+                if not replaced:
+                    yield json.dumps({
+                        'type': 'error',
+                        'error': '更新原助手消息失败或目标已变更',
+                        'timestamp': datetime.now().isoformat(),
+                    }) + '\n'
+                    return
+                assistant_saved = True
+            elif conv_id is not None and full_response:
                 conversation_service.append_message(
                     conv_id, 'assistant', full_response, effective_model,
                     meta_info={'source': SOURCE_CHAT},
