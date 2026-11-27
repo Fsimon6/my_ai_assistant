@@ -718,3 +718,325 @@ def test_f2b_frontend_created_then_launcher_throws(tmp_path: Path) -> None:
 
     assert len(cleanup) == 2, "test-owned fakes were not recorded"
     assert all(item["status"] in {"CLEANED", "ALREADY_EXITED"} for item in cleanup), cleanup
+
+
+# ---------------------------------------------------------------------------
+# F1 W1-W7: controlled PowerShell objects for identity-completion failures.
+# These tests call the real Update-OwnedRecord / Stop-Owned implementations.
+# They do not create real processes and do not touch formal services or data.
+# ---------------------------------------------------------------------------
+
+_F1_PROBE = r"""
+$ErrorActionPreference = 'Stop'
+$repo = '__REPO__'
+. (Join-Path $repo 'scripts/formal_start_lib.ps1')
+$resultPath = '__RESULT__'
+$Scenario = '__SCENARIO__'
+$script:cimCalls = 0
+$script:cimFilters = @()
+$script:getProcessCalls = 0
+$script:stopProcessCalls = 0
+
+Add-Type -TypeDefinition @'
+public sealed class F1ProcessNameThrows {
+    public int Id { get; set; }
+    public System.DateTime StartTime { get; set; }
+    public string ProcessName { get { throw new System.Exception("f1-processname-failure"); } }
+}
+public sealed class F1StartTimeThrows {
+    public int Id { get; set; }
+    public string ProcessName { get; set; }
+    public System.DateTime StartTime { get { throw new System.Exception("f1-starttime-failure"); } }
+}
+public sealed class F1IdThrows {
+    public string ProcessName { get; set; }
+    public System.DateTime StartTime { get; set; }
+    public int Id { get { throw new System.Exception("f1-id-failure"); } }
+}
+'@
+
+function Get-CimInstance {
+    [CmdletBinding()]
+    param($ClassName, $Filter)
+    $script:cimCalls++
+    $script:cimFilters += [string]$Filter
+    switch ($Scenario) {
+        'w1' { return [pscustomobject]@{ CreationDate = [datetime]::UtcNow; CommandLine = 'f1-command-line' } }
+        'w2' { return [pscustomobject]@{ CreationDate = [datetime]::UtcNow; CommandLine = 'f1-command-line' } }
+        'w3' { return $null }
+        'w4' {
+            if ($script:cimCalls -eq 1) { throw 'f1-cim-first-failure' }
+            return [pscustomobject]@{ CreationDate = [datetime]::UtcNow; CommandLine = 'f1-command-line' }
+        }
+        'w5-null' { return $null }
+        'w5-empty' { return [pscustomobject]@{ CommandLine = '' } }
+        'w5-whitespace' { return [pscustomobject]@{ CommandLine = '   ' } }
+        'w5-cim-error' { throw 'f1-cim-commandline-failure' }
+        'w5-commandline-getter-error' {
+            $o = [pscustomobject]@{}
+            $o | Add-Member -MemberType ScriptProperty -Name CommandLine -Value {
+                throw 'f1-commandline-getter-failure'
+            }
+            return $o
+        }
+        'w6' { return $null }
+        default { return $null }
+    }
+}
+
+function Get-Process {
+    [CmdletBinding()]
+    param([int]$Id)
+    $script:getProcessCalls++
+    return [pscustomobject]@{
+        Id = $Id
+        ProcessName = 'f1-controlled'
+        StartTime = [datetime]::UtcNow
+        HasExited = $false
+    }
+}
+
+function Stop-Process {
+    [CmdletBinding()]
+    param([int]$Id, [switch]$Force)
+    $script:stopProcessCalls++
+}
+
+function New-F1Record($mockProcess) {
+    # New-PendingOwnedRecord has a [System.Diagnostics.Process] parameter and
+    # cannot accept the controlled object. Mirror its exact field shape here.
+    return [pscustomobject]@{
+        Process = $mockProcess
+        Id = $null
+        Name = $null
+        StartTime = $null
+        CommandLine = $null
+        Identity = 'PENDING'
+    }
+}
+
+$record = $null
+$mock = $null
+$stopResult = $null
+$result = [ordered]@{
+    scenario = $Scenario
+    identity = $null
+    id = $null
+    name = $null
+    start_time = $null
+    command_line = $null
+    cim_calls = 0
+    cim_filters = @()
+    get_process_calls = 0
+    stop_process_calls = 0
+    stop_result = $null
+    error = $null
+}
+
+try {
+    switch ($Scenario) {
+        'w1' {
+            $mock = [F1ProcessNameThrows]::new()
+            $mock.Id = 424242
+            $mock.StartTime = [datetime]::UtcNow
+        }
+        'w2' {
+            $mock = [F1StartTimeThrows]::new()
+            $mock.Id = 424242
+            $mock.ProcessName = 'powershell'
+        }
+        'w3' {
+            $mock = [F1StartTimeThrows]::new()
+            $mock.Id = 424242
+            $mock.ProcessName = 'powershell'
+        }
+        'w4' {
+            $mock = [F1StartTimeThrows]::new()
+            $mock.Id = 424242
+            $mock.ProcessName = 'powershell'
+        }
+        { $_ -in @('w5-null', 'w5-empty', 'w5-whitespace', 'w5-cim-error', 'w5-commandline-getter-error') } {
+            $mock = [pscustomobject]@{ Id = 424242; ProcessName = 'powershell'; StartTime = [datetime]::UtcNow }
+        }
+        'w6' {
+            $mock = [F1IdThrows]::new()
+            $mock.ProcessName = 'powershell'
+            $mock.StartTime = [datetime]::UtcNow
+        }
+        'w7' {
+            $mock = [pscustomobject]@{ Id = 424242; ProcessName = 'powershell'; StartTime = [datetime]::UtcNow }
+        }
+        default { throw "unknown F1 scenario: $Scenario" }
+    }
+
+    $record = New-F1Record $mock
+    if ($Scenario -eq 'w7') {
+        $record.Id = 424242
+        $stopResult = Stop-Owned $record
+    }
+    else {
+        Update-OwnedRecord $record
+        if ($Scenario -eq 'w6') {
+            $stopResult = Stop-Owned $record
+        }
+    }
+
+    $result.identity = if ($null -eq $record) { $null } else { [string]$record.Identity }
+    $result.id = if ($null -eq $record) { $null } else { $record.Id }
+    $result.name = if ($null -eq $record -or $null -eq $record.Name) { $null } else { [string]$record.Name }
+    $result.start_time = if ($null -eq $record -or $null -eq $record.StartTime) { $null } else { $record.StartTime.ToString('o') }
+    $result.command_line = if ($null -eq $record -or $null -eq $record.CommandLine) { $null } else { [string]$record.CommandLine }
+    $result.cim_calls = $script:cimCalls
+    $result.cim_filters = @($script:cimFilters)
+    $result.get_process_calls = $script:getProcessCalls
+    $result.stop_process_calls = $script:stopProcessCalls
+    $result.stop_result = @($stopResult) | Select-Object -Last 1
+}
+catch {
+    $result.error = $_.Exception.Message
+}
+finally {
+    $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $resultPath -Encoding UTF8
+}
+"""
+
+
+def _run_f1_probe(tmp_path: Path, scenario: str) -> dict:
+    result_path = tmp_path / f"f1-{scenario}-result.json"
+    script = (
+        _F1_PROBE.replace("__REPO__", _ps_quote(str(ROOT)))
+        .replace("__RESULT__", _ps_quote(str(result_path)))
+        .replace("__SCENARIO__", scenario)
+    )
+    proc = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert result_path.is_file(), (
+        f"F1 probe did not write {result_path}; "
+        f"stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+    )
+    assert proc.returncode == 0, (
+        f"F1 probe exit={proc.returncode}; "
+        f"stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert result["error"] is None, result
+    return result
+
+
+def test_f1_w1_processname_failure_keeps_pending(tmp_path: Path) -> None:
+    result = _run_f1_probe(tmp_path, "w1")
+
+    assert result["id"] == 424242
+    assert result["name"] in (None, "")
+    assert result["start_time"]
+    assert result["command_line"] == "f1-command-line"
+    assert result["identity"] == "PENDING"
+    assert result["cim_calls"] == 1
+    assert result["stop_process_calls"] == 0
+
+
+@pytest.mark.skip(
+    reason="F1 W2 blocked: PowerShell property-getter errors are non-terminating; "
+    "the production StartTime fallback is not reached without production changes"
+)
+def test_f1_w2_starttime_fallback_success(tmp_path: Path) -> None:
+    result = _run_f1_probe(tmp_path, "w2")
+
+    assert result["id"] == 424242
+    assert result["name"] == "powershell"
+    assert result["start_time"]
+    assert result["command_line"] == "f1-command-line"
+    assert result["identity"] == "COMPLETE"
+    assert result["cim_calls"] == 2
+    assert result["cim_filters"] == ["ProcessId=424242", "ProcessId=424242"]
+    assert result["stop_process_calls"] == 0
+
+
+@pytest.mark.skip(
+    reason="F1 W3 blocked: PowerShell property-getter errors are non-terminating; "
+    "the production StartTime fallback is not reached without production changes"
+)
+def test_f1_w3_starttime_fallback_null(tmp_path: Path) -> None:
+    result = _run_f1_probe(tmp_path, "w3")
+
+    assert result["id"] == 424242
+    assert result["start_time"] is None
+    assert result["command_line"] is None
+    assert result["identity"] == "PENDING"
+    assert result["cim_calls"] == 2
+    assert result["stop_process_calls"] == 0
+
+
+@pytest.mark.skip(
+    reason="F1 W4 blocked: PowerShell property-getter errors are non-terminating; "
+    "the production StartTime fallback is not reached without production changes"
+)
+def test_f1_w4_starttime_fallback_throws_commandline_succeeds(
+    tmp_path: Path,
+) -> None:
+    result = _run_f1_probe(tmp_path, "w4")
+
+    assert result["id"] == 424242
+    assert result["start_time"] is None
+    assert result["command_line"] == "f1-command-line"
+    assert result["identity"] == "PENDING"
+    assert result["cim_calls"] == 2
+    assert result["stop_process_calls"] == 0
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_command_line"),
+    [
+        ("w5-null", None),
+        ("w5-empty", ""),
+        ("w5-whitespace", "   "),
+        ("w5-cim-error", None),
+        ("w5-commandline-getter-error", None),
+    ],
+    ids=["null", "empty", "whitespace", "cim-error", "getter-error"],
+)
+def test_f1_w5_commandline_variants(
+    tmp_path: Path, scenario: str, expected_command_line: str | None
+) -> None:
+    result = _run_f1_probe(tmp_path, scenario)
+
+    assert result["id"] == 424242
+    assert result["identity"] == "PENDING"
+    assert result["command_line"] == expected_command_line
+    assert result["cim_calls"] == 1
+    assert result["stop_process_calls"] == 0
+
+
+def test_f1_w6_id_failure_skips_without_getprocess(tmp_path: Path) -> None:
+    result = _run_f1_probe(tmp_path, "w6")
+
+    assert result["id"] is None
+    assert result["identity"] == "PENDING"
+    assert result["cim_filters"] == ["ProcessId="]
+    assert result["stop_result"] == "SKIPPED_IDENTITY_UNVERIFIABLE"
+    assert result["get_process_calls"] == 0
+    assert result["stop_process_calls"] == 0
+
+
+def test_f1_w7_stop_pending_skips_without_stop(tmp_path: Path) -> None:
+    result = _run_f1_probe(tmp_path, "w7")
+
+    assert result["identity"] == "PENDING"
+    assert result["stop_result"] == "SKIPPED_IDENTITY_UNVERIFIABLE"
+    assert result["get_process_calls"] == 1
+    assert result["stop_process_calls"] == 0
+    assert result["cim_calls"] == 0
